@@ -82,20 +82,36 @@ Pin mappings are automatically selected by firmware.
 
 
 
-##Configuration File
+## Configuration File
 
 Default Config below. 
-Location: /wardriver.cfg on SD card
-XIAO Wardriver config (key=value)
-wigleBasicToken="Encoded for Use Wigle Api Token"
-homeSsid=YourSSID
-homePsk=YourPSK
-wardriverSsid=WarHam
-wardriverPsk=wardrive1234
-gpsBaud=9600
-scanMode=aggressive
-board=C6
 
+Location: /wardriver.cfg on SD card
+
+XIAO Wardriver config (key=value)
+
+wigleBasicToken="Encoded for Use Wigle Api Token"
+
+homeSsid=YourSSID
+
+homePsk=YourPSK
+
+wardriverSsid=WarHam
+
+wardriverPsk=wardrive1234
+
+gpsBaud=9600
+
+scanMode=aggressive
+
+board=auto
+
+
+## Button Functions
+
+### Single Press - Stop/Start scanning
+### Long Press - DeepSleep
+### Single Press - Exit Deepsleep
 
 ## Building Firmware
 
