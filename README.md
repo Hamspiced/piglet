@@ -45,12 +45,13 @@ Designed for **Seeed XIAO ESP32-S3, ESP32-C5, and ESP32-C6**, Piglet focuses on:
 - I2C SD card module
 - Optional LiPo battery connected to XIAO battery inputs
 
-### Peripheral Sourcing
+### Peripheral Sourcing  
 You can get everything on Amazon but its pricey.  if you dont mind waiting on aliexpress heres the build list.
-Xiao-C5 - 7$ [SeedStudio](https://www.seeedstudio.com/Seeed-Studio-XIAO-ESP32C5-p-6609.html)
-SSD1306 128x63 OLED - $2 [aliexpress](https://www.aliexpress.us/item/3256805954920554.html)
-ATGM-336h - $3.39 [aliexpress](https://www.aliexpress.us/item/3256809330278648.html)
-SD-Card Module - $1.33 [aliexpress](https://www.aliexpress.us/item/3256808167816573.html)
+- Xiao-C5 - 7$ [SeedStudio](https://www.seeedstudio.com/Seeed-Studio-XIAO-ESP32C5-p-6609.html)
+- SSD1306 128x63 OLED - $2 [aliexpress](https://www.aliexpress.us/item/3256805954920554.html)
+- ATGM-336h - $3.39 [aliexpress](https://www.aliexpress.us/item/3256809330278648.html)
+- SD-Card Module - $1.33 [aliexpress](https://www.aliexpress.us/item/3256808167816573.html)
+
 $14 if you wanted to breadboard it yourself.
 
 
