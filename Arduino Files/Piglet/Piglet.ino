@@ -36,6 +36,9 @@
 #include "WigleUpload.h"
 #include "WebUI.h"
 
+// -------- Battery Test (uncomment to enable) --------
+// #include "battery_test.h"
+
 // ---------------- Deep Sleep ----------------
 static const uint32_t LONG_PRESS_MS = 2000;
 
@@ -351,6 +354,9 @@ void setup() {
     Serial.println("[SD] Log file create skipped (SD FAIL).");
   }
 
+  // Battery test (uncomment to enable)
+  // if (sdOk) batteryTestInit();
+
   updateOLED(0);
 
   Serial.println("=== Boot complete ===");
@@ -454,5 +460,9 @@ void loop() {
   if (allowScan) {
     doScanOnce();
   }
+
+  // Battery test tick (uncomment to enable)
+  // batteryTestTick();
+
   delay(10);
 }
