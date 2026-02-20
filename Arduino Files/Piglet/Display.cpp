@@ -142,9 +142,114 @@ void oledProgressBar(int x, int y, int w, int h, float pct) {
   if (fill > 0) display.fillRect(x + 1, y + 1, fill, h - 2, SSD1306_WHITE);
 }
 
-// ---- Main OLED update ----
+// ---- Pig animation state ----
+PigAnim pig;
 
-void updateOLED(float speedValue) {
+static const int16_t PIG_W = 44;
+static const int16_t PIG_H = 26;
+
+static void drawPig(int16_t x, int16_t y, uint8_t phase) {
+  // Filled cartoon pig (side view, facing LEFT)
+  // Bounding box: PIG_W x PIG_H.  Filled white with black details.
+
+  // ---- BODY (big rounded oval) ----
+  display.fillRoundRect(x + 14, y + 3, 22, 15, 7, SSD1306_WHITE);
+
+  // ---- HEAD (overlapping circle) ----
+  display.fillCircle(x + 14, y + 10, 7, SSD1306_WHITE);
+
+  // ---- SNOUT (protruding from head) ----
+  display.fillRoundRect(x + 2, y + 8, 9, 7, 3, SSD1306_WHITE);
+
+  // ---- NOSTRILS (black dots on white snout) ----
+  display.drawPixel(x + 4, y + 11, SSD1306_BLACK);
+  display.drawPixel(x + 6, y + 11, SSD1306_BLACK);
+
+  // ---- EYE (black square with white catchlight) ----
+  display.fillRect(x + 9, y + 7, 3, 3, SSD1306_BLACK);
+  display.drawPixel(x + 10, y + 7, SSD1306_WHITE);
+
+  // ---- EAR (filled triangle on top of head) ----
+  display.fillTriangle(x + 12, y + 4, x + 18, y + 5, x + 15, y + 0, SSD1306_WHITE);
+  display.drawLine(x + 14, y + 2, x + 16, y + 4, SSD1306_BLACK);  // inner ear fold
+
+  // ---- MOUTH ----
+  display.drawLine(x + 6, y + 14, x + 9, y + 15, SSD1306_BLACK);
+
+  // ---- TAIL (curly pigtail, pixel art) ----
+  display.drawPixel(x + 36, y + 6,  SSD1306_WHITE);
+  display.drawPixel(x + 37, y + 5,  SSD1306_WHITE);
+  display.drawPixel(x + 38, y + 5,  SSD1306_WHITE);
+  display.drawPixel(x + 39, y + 6,  SSD1306_WHITE);
+  display.drawPixel(x + 39, y + 7,  SSD1306_WHITE);
+  display.drawPixel(x + 38, y + 8,  SSD1306_WHITE);
+  display.drawPixel(x + 39, y + 9,  SSD1306_WHITE);
+  display.drawPixel(x + 40, y + 9,  SSD1306_WHITE);
+  display.drawPixel(x + 41, y + 8,  SSD1306_WHITE);
+
+  // ---- BELLY LINE ----
+  display.drawFastHLine(x + 15, y + 18, 20, SSD1306_WHITE);
+
+  // ---- LEGS (2-phase walk cycle) ----
+  const bool liftA = (phase & 1);
+  const bool liftB = !liftA;
+  const int16_t legTop = y + 18;
+  const int16_t lx[4] = {
+    (int16_t)(x + 16), (int16_t)(x + 22),
+    (int16_t)(x + 28), (int16_t)(x + 33)
+  };
+
+  for (int i = 0; i < 4; i++) {
+    bool lift = (i == 0 || i == 3) ? liftA : liftB;
+    int16_t lxi = lx[i];
+    if (lift) {
+      // Leg angled forward
+      display.drawLine(lxi, legTop, lxi - 2, legTop + 5, SSD1306_WHITE);
+      display.drawLine(lxi - 2, legTop + 5, lxi,     legTop + 5, SSD1306_WHITE);
+    } else {
+      // Leg planted straight down
+      display.drawLine(lxi, legTop, lxi,     legTop + 5, SSD1306_WHITE);
+      display.drawLine(lxi, legTop + 5, lxi + 2, legTop + 5, SSD1306_WHITE);
+    }
+  }
+}
+
+void pigAnimTick() {
+  uint32_t now = millis();
+  if (now - pig.lastMs < pig.frameMs) return;
+  pig.lastMs = now;
+
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+
+  // Header
+  display.setTextSize(2);
+  display.setCursor(0, 0);
+  display.print("Piglet");
+  display.drawFastHLine(0, OLED_YELLOW_H - 1, OLED_W, SSD1306_WHITE);
+
+  // Move + bounce
+  pig.x += pig.dx;
+  if (pig.x <= 0)              { pig.x = 0;              pig.dx =  1; }
+  if (pig.x >= (128 - PIG_W))  { pig.x = 128 - PIG_W;    pig.dx = -1; }
+
+  pig.phase = (pig.phase + 1) & 3;
+  int16_t bob = (pig.phase == 1 || pig.phase == 3) ? 1 : 0;
+
+  // Keep pig inside screen vertically
+  if (pig.y > (OLED_H - PIG_H)) {
+    pig.y = (OLED_H - PIG_H);
+  }
+
+  drawPig(pig.x, pig.y + bob, pig.phase);
+
+  display.display();
+}
+
+// ---- Page renderers ----
+
+// Page 0: Status (existing)
+static void drawPageStatus(float speedValue) {
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
 
@@ -316,8 +421,8 @@ void updateOLED(float speedValue) {
 
     // ---- Fixed compass geometry ----
     const int COMPASS_CX = 114;
-    const int COMPASS_CY = 46;
-    const int LABEL_Y    = 58;
+    const int COMPASS_CY = 40;
+    const int LABEL_Y    = 55;
 
     bool canUseFresh =
       gpsHasFix &&
@@ -365,6 +470,200 @@ void updateOLED(float speedValue) {
   }
 
   display.display();
+}
+
+// Page 1: Network counts (large text)
+static void drawPageNetworks() {
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+
+  // Yellow header
+  display.setTextSize(2);
+  display.setCursor(0, 0);
+  display.print("Networks");
+  display.drawFastHLine(0, OLED_YELLOW_H - 1, OLED_W, SSD1306_WHITE);
+
+  // 2.4G count
+  display.setTextSize(1);
+  display.setCursor(0, 18);
+  display.print("2.4G:");
+  display.setTextSize(2);
+  display.setCursor(36, 16);
+  display.print(networksFound2G);
+
+  // 5G count
+  display.setTextSize(1);
+  display.setCursor(0, 34);
+  display.print("5GHz:");
+  display.setTextSize(2);
+  display.setCursor(36, 32);
+  display.print(networksFound5G);
+
+  // Total
+  display.setTextSize(1);
+  display.setCursor(0, 50);
+  display.print("Total:");
+  display.setTextSize(2);
+  display.setCursor(36, 48);
+  display.print(networksFound2G + networksFound5G);
+
+  display.display();
+}
+
+// Page 2: Navigation — large compass arrow + direction + speed
+static void drawPageNavigation(float speedValue) {
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+
+  // Yellow header
+  display.setTextSize(2);
+  display.setCursor(0, 0);
+  display.print("Nav");
+
+  // GPS signal indicator in header (matches status page)
+  {
+    const int iconY  = 2;
+    const int meterX = 108;
+    const int barW   = 2;
+    const int barStep = 3;
+    const int meterH = 12;
+
+    if (!gpsHasFix) {
+      int x0 = meterX + 3;
+      display.drawLine(x0, iconY, x0 + 10, iconY + 12, SSD1306_WHITE);
+      display.drawLine(x0 + 10, iconY, x0, iconY + 12, SSD1306_WHITE);
+    } else {
+      int sats = 0;
+      if (gps.satellites.isValid()) sats = (int)gps.satellites.value();
+      if (sats < 0) sats = 0;
+      if (sats > 6) sats = 6;
+
+      for (int i = 0; i < 6; i++) {
+        int bh = 2 + (i * 2);
+        int bx = meterX + i * barStep;
+        int by = iconY + meterH - bh;
+        display.drawRect(bx, by, barW, bh, SSD1306_WHITE);
+        if (i < sats) {
+          display.fillRect(bx, by, barW, bh, SSD1306_WHITE);
+        }
+      }
+    }
+  }
+
+  display.drawFastHLine(0, OLED_YELLOW_H - 1, OLED_W, SSD1306_WHITE);
+
+  const uint32_t nowMs = millis();
+
+  bool canUseFresh =
+    gpsHasFix &&
+    gps.course.isValid() &&
+    (gps.course.age() < 2000) &&
+    gps.speed.isValid() &&
+    (gps.speed.kmph() >= HEADING_MIN_SPEED_KMPH);
+
+  if (canUseFresh) {
+    double h = headingSmoothedDeg();
+    if (isfinite(h)) {
+      lastGoodHeadingDeg = h;
+      lastGoodHeadingMs  = nowMs;
+    }
+  }
+
+  bool haveHeld = isfinite(lastGoodHeadingDeg) && ((nowMs - lastGoodHeadingMs) <= HEADING_HOLD_MS);
+
+  // Left side: compass arrow (centered in left half)
+  const int arrowCX = 32;
+  const int arrowCY = 33;
+
+  if (!haveHeld) {
+    drawCompassNoFix(arrowCX, arrowCY);
+    display.setTextSize(1);
+    display.setCursor(20, 50);
+    display.print("No Fix");
+  } else {
+    const char* dir = courseTo8way(lastGoodHeadingDeg);
+    drawFilledChevronArrowBig(arrowCX, arrowCY, dir);
+
+    // Direction label below arrow
+    display.setTextSize(2);
+    int16_t x1, y1;
+    uint16_t tw, th;
+    display.getTextBounds(dir, 0, 0, &x1, &y1, &tw, &th);
+    int labelX = arrowCX - ((int)tw / 2);
+    if (labelX < 0) labelX = 0;
+    display.setCursor(labelX, 48);
+    display.print(dir);
+  }
+
+  // Right side: speed (large)
+  display.setTextSize(1);
+  display.setCursor(68, 18);
+  display.print("Speed");
+
+  display.setTextSize(3);
+  // Format speed as integer for large display
+  int spd = (int)(speedValue + 0.5f);
+  char spdBuf[8];
+  snprintf(spdBuf, sizeof(spdBuf), "%d", spd);
+  // Right-align in the right half
+  int16_t sx1, sy1;
+  uint16_t sw, sh;
+  display.getTextBounds(spdBuf, 0, 0, &sx1, &sy1, &sw, &sh);
+  int spdX = 128 - (int)sw - 2;
+  if (spdX < 68) spdX = 68;
+  display.setCursor(spdX, 30);
+  display.print(spdBuf);
+
+  // Units label
+  display.setTextSize(1);
+  display.setCursor(68, 56);
+  display.print(cfg.speedUnits == "mph" ? "mph" : "km/h");
+
+  // Divider between compass and speed
+  display.drawFastVLine(63, OLED_YELLOW_H, OLED_H - OLED_YELLOW_H, SSD1306_WHITE);
+
+  display.display();
+}
+
+// Page 3: Pause scanning
+static void drawPagePaused() {
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+
+  // Yellow header
+  display.setTextSize(2);
+  display.setCursor(0, 0);
+  display.print("Paused");
+  display.drawFastHLine(0, OLED_YELLOW_H - 1, OLED_W, SSD1306_WHITE);
+
+  // Big pause icon (two bars)
+  display.fillRect(42, 24, 10, 30, SSD1306_WHITE);
+  display.fillRect(76, 24, 10, 30, SSD1306_WHITE);
+
+  display.setTextSize(1);
+  display.setCursor(24, 56);
+  display.print("Scan paused");
+
+  display.display();
+}
+
+// ---- Main OLED dispatch ----
+
+void updateOLED(float speedValue) {
+  // During upload, always show upload progress regardless of page
+  if (uploading) {
+    drawPageStatus(speedValue);
+    return;
+  }
+
+  switch (currentPage) {
+    case 0:  drawPageStatus(speedValue);     break;
+    case 1:  drawPageNetworks();             break;
+    case 2:  drawPageNavigation(speedValue); break;
+    case 3:  drawPagePaused();               break;
+    case 4:  /* pig handled by pigAnimTick in loop() */ break;
+    default: drawPageStatus(speedValue);     break;
+  }
 }
 
 // ---- Boot splash screen ----
