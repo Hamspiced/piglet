@@ -17,6 +17,10 @@ bool allowScanForOled = false;
 bool userScanOverride = false;
 bool autoPaused = false;
 
+// ---- OLED page system ----
+uint8_t currentPage = 0;
+bool statusPagePaused = false;
+
 // ---- AP state ----
 uint32_t apStartMs = 0;
 bool apClientSeen = false;

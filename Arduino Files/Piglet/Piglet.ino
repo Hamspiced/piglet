@@ -37,7 +37,7 @@
 #include "WebUI.h"
 
 // -------- Battery Test (uncomment to enable) --------
-// #include "battery_test.h"
+#include "battery_test.h"
 
 // ---------------- Deep Sleep ----------------
 static const uint32_t LONG_PRESS_MS = 2000;
@@ -82,12 +82,44 @@ static void enterDeepSleep() {
 }
 
 // ---------------- Button ----------------
+static void onPageChange(uint8_t oldPage, uint8_t newPage) {
+  if (newPage == 3) {
+    Serial.println("[PAGE] Entered pause page -> scanning paused");
+  } else if (oldPage == 3) {
+    Serial.println("[PAGE] Left pause page -> scanning resumed");
+  }
+
+  // Clear status-page pause when leaving page 0
+  if (oldPage == 0 && statusPagePaused) {
+    statusPagePaused = false;
+    Serial.println("[PAGE] Left status page -> status pause cleared");
+  }
+
+  // Entering pig page -> reset animation position
+  if (newPage == 4) {
+    pig.x = 0;
+    pig.dx = 1;
+    pig.phase = 0;
+  }
+
+  Serial.print("[PAGE] ");
+  Serial.print(oldPage);
+  Serial.print(" -> ");
+  Serial.println(newPage);
+}
+
+static const uint32_t DOUBLE_PRESS_MS = 350;  // max gap between presses for double-press
+
 static void pollButton() {
   static uint32_t lastDebounce = 0;
   static int lastState = HIGH;
   static bool latched = false;
   static uint32_t pressStartMs = 0;
   static bool longPressTriggered = false;
+
+  // Double-press detection
+  static uint8_t  clickCount = 0;
+  static uint32_t firstClickMs = 0;
 
   int s = digitalRead(pins.btn);
 
@@ -99,7 +131,6 @@ static void pollButton() {
   if ((millis() - lastDebounce) > 40) {
     if (s == LOW) {
       if (!latched) {
-        // Fresh press – record start time
         pressStartMs = millis();
         longPressTriggered = false;
         latched = true;
@@ -108,20 +139,36 @@ static void pollButton() {
       if (latched && !longPressTriggered &&
           (millis() - pressStartMs >= LONG_PRESS_MS)) {
         longPressTriggered = true;
+        clickCount = 0;  // cancel any pending click
         enterDeepSleep();  // never returns
       }
     } else {
       // Released
       if (latched && !longPressTriggered) {
-        // Short press → toggle scanning
-        scanningEnabled = !scanningEnabled;
-        userScanOverride = true;
-        Serial.print("[BTN] Scanning toggled -> ");
-        Serial.println(scanningEnabled ? "ACTIVE" : "PAUSED");
+        clickCount++;
+        if (clickCount == 1) {
+          firstClickMs = millis();
+        }
       }
       latched = false;
       longPressTriggered = false;
     }
+  }
+
+  // Evaluate click count after double-press window expires
+  if (clickCount > 0 && (millis() - firstClickMs) > DOUBLE_PRESS_MS) {
+    if (clickCount >= 2 && currentPage == 0) {
+      // Double press on status page -> toggle scan pause
+      statusPagePaused = !statusPagePaused;
+      Serial.print("[BTN] Double press -> status page scan ");
+      Serial.println(statusPagePaused ? "PAUSED" : "RESUMED");
+    } else {
+      // Single press -> cycle page (once, regardless of extra clicks)
+      uint8_t oldPage = currentPage;
+      currentPage = (currentPage + 1) % PAGE_COUNT;
+      onPageChange(oldPage, currentPage);
+    }
+    clickCount = 0;
   }
 }
 
@@ -355,7 +402,7 @@ void setup() {
   }
 
   // Battery test (uncomment to enable)
-  // if (sdOk) batteryTestInit();
+  if (sdOk) batteryTestInit();
 
   updateOLED(0);
 
@@ -440,21 +487,33 @@ void loop() {
 
   // OLED refresh
   static uint32_t lastOled = 0;
-  if (millis() - lastOled > 500) {
+  if (currentPage == 4) {
+    // Pig page: animation runs at its own framerate (~90ms)
+    pigAnimTick();
+  } else if (millis() - lastOled > 500) {
     lastOled = millis();
     updateOLED(speedDisplay);
   }
 
   handleStaTransitions();
 
-  // Scanning
+  // Scanning – page-aware logic
   autoPaused = shouldPauseScanning();
-
-  // Hard-stop scanning while AP is active (even if userScanOverride is true)
   wifi_mode_t m = WiFi.getMode();
   bool apActive = (m == WIFI_AP || m == WIFI_AP_STA);
 
-  bool allowScan = scanningEnabled && sdOk && !apActive && (userScanOverride || !autoPaused);
+  bool allowScan;
+  if (currentPage == 3) {
+    // Pause page: always stop scanning
+    allowScan = false;
+  } else if (currentPage == 0) {
+    // Status page: respect AP/STA pause + double-press pause
+    allowScan = scanningEnabled && sdOk && !statusPagePaused &&
+                !apActive && (userScanOverride || !autoPaused);
+  } else {
+    // Pages 1 (networks), 2 (nav), 4 (pig): always scan
+    allowScan = scanningEnabled && sdOk;
+  }
   allowScanForOled = allowScan;
 
   if (allowScan) {
@@ -462,7 +521,7 @@ void loop() {
   }
 
   // Battery test tick (uncomment to enable)
-  // batteryTestTick();
+  batteryTestTick();
 
   delay(10);
 }

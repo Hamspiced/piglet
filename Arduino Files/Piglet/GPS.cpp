@@ -7,7 +7,7 @@
 // ---- Heading smoothing ----
 
 static const uint8_t HEADING_AVG_N = 8; // samples in moving window (tune 5-12)
-const uint32_t HEADING_HOLD_MS = 4000UL;     // keep last good heading for this long if GPS drops
+const uint32_t HEADING_HOLD_MS = 20000UL;    // keep last good heading for 20s if GPS drops
 const float    HEADING_MIN_SPEED_KMPH = 3.0f; // below this, heading is usually noisy/unreliable
 
 static float headingSinBuf[8] = {0};
