@@ -126,25 +126,35 @@ board=auto
 
 ### Requirements
 
-- Arduino IDE or PlatformIO  
-- Latest **Arduino-ESP32** core  
-- Libraries:
-  - WiFi  
-  - WebServer  
-  - SD  
-  - TinyGPSPlus  
-  - Adafruit SSD1306  
-  - ArduinoJson  
+- **Arduino IDE 2.x** or **PlatformIO**  
+- **Arduino-ESP32 core** v3.0.0 or later  
+
+### Required Libraries
+
+Install these libraries via Arduino Library Manager or PlatformIO:
+
+- **WiFi** (built-in with ESP32 core)
+- **WebServer** (built-in with ESP32 core)
+- **WiFiClientSecure** (built-in with ESP32 core)
+- **HTTPClient** (built-in with ESP32 core)
+- **SD** (built-in with ESP32 core)
+- **SPI** (built-in with ESP32 core)
+- **Wire** (built-in with ESP32 core)
+- **TinyGPSPlus** by Mikal Hart - [Library Link](https://github.com/mikalhart/TinyGPSPlus)
+- **Adafruit GFX Library** - Required dependency for SSD1306
+- **Adafruit SSD1306** - OLED display driver
+- **ArduinoJson** by Benoit Blanchon - v6.x or v7.x
 
 ### Flash Steps
 
-1. Select the correct **XIAO ESP32 board**
-2. Enable **PSRAM** if available  
-3. Use a **large app partition scheme like NO OTA**
+1. Select the correct **XIAO ESP32 board** variant (S3, C5, or C6)
+2. **CRITICAL:** Enable **PSRAM** (required for TLS/HTTPS uploads)
+   - Tools → PSRAM → **OPI PSRAM** (C5/C6) or **QSPI PSRAM** (S3)
+3. Use a **large app partition scheme** → **Huge APP (3MB No OTA/1MB SPIFFS)**
 4. Upload firmware  
-5. Insert **FAT32 SD card**  
-6. add Default wardriver.cfg to SD card and include your Wigle Api Key and Network info If you want wigle uploads
-7. Restart Device with RST button or disconnect and reconnect power.
+5. Insert **FAT32-formatted SD card**  
+6. Add `/wardriver.cfg` to SD card root with your WiGLE API key and WiFi credentials
+7. Restart device with RST button or power cycle
 
 ## License
 

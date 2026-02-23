@@ -807,7 +807,7 @@ static bool uploadFileToWigle(const String& path) {
 
   WiFiClientSecure client;
   client.setInsecure();
-  client.setTimeout(30000);
+  client.setTimeout(25000);  // Reduced from 30s - most uploads complete much faster
 
   if (!client.connect(WIGLE_HOST, WIGLE_PORT)) {
     uploadLastResult = "TLS connect fail";
@@ -815,7 +815,7 @@ static bool uploadFileToWigle(const String& path) {
     return false;
   }
 
-  client.print(String("POST /api/v2/file/upload HTTP/1.1\r\n"));
+  client.print(String("POST /api/v2/file/upload HTTP/1.0\r\n"));
   client.print(String("Host: ") + WIGLE_HOST + "\r\n");
   client.print(String("Authorization: Basic ") + cfg.wigleBasicToken + "\r\n");
   client.print(String("Content-Type: multipart/form-data; boundary=") + boundary + "\r\n");
@@ -905,12 +905,9 @@ static uint32_t uploadAllCsvsToWigle() {
     return 0;
   }
 
-  bool tokenOk = wigleTestToken();
-  if (!tokenOk && wigleTokenStatus == -1) {
-    uploading = false;
-    scanningEnabled = uploadPausedScanWasEnabled;
-    return 0;
-  }
+  // Skip token pre-check to avoid 30-45s delay at start of batch upload.
+  // If token is invalid, first upload will fail with 401/403.
+  // Note: wigleTokenStatus may be stale; web UI still validates on demand.
 
   std::vector<String> paths;
   paths.reserve(uploadTotalFiles + 4);

@@ -46,6 +46,11 @@ String   uploadLastResult  = "";
 int      wigleTokenStatus  = 0;
 int      wigleLastHttpCode = 0;
 
+// ---- WiGLE upload history tracking ----
+WigleFileStats wigleHistory[WIGLE_HISTORY_MAX];
+uint8_t wigleHistoryCount = 0;
+uint32_t wigleHistoryLastLoadMs = 0;
+
 // ---- WiGLE constants ----
 const char* WIGLE_HOST = "api.wigle.net";
 const uint16_t WIGLE_PORT = 443;

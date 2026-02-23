@@ -371,25 +371,45 @@ void setup() {
     startAP();
   }
 
-  // Start web server only after WiFi is up in some form (STA or AP)
-  startWebServer();
-
   lastStaStatus = WiFi.status();
 
+  // IMPORTANT: Start web server AFTER WiGLE upload to avoid resource conflicts
+  // WiGLE upload happens first, then web server starts
+  if (staOk && sdOk && cfg.wigleBasicToken.length() > 0) {
+    Serial.println("[WiGLE] STA connected and token set.");
+    Serial.printf("[HEAP] Free: %d bytes\n", ESP.getFreeHeap());
+    
+    // Upload CSVs with limit from config
+    if (cfg.maxBootUploads > 0) {
+      Serial.printf("[WiGLE] Auto-uploading CSVs (max %d)...\n", cfg.maxBootUploads);
+      uint32_t uploaded = uploadAllCsvsToWigle(cfg.maxBootUploads);
+      Serial.printf("[WiGLE] Uploaded %d files\n", uploaded);
+      
+      // Load upload history after uploads complete
+      if (uploaded > 0) {
+        Serial.println("[WiGLE] Loading upload history...");
+        delay(2000);  // Brief delay to let WiGLE process uploads
+        wigleLoadHistory();
+        Serial.printf("[WiGLE] History loaded (%d files)\n", wigleHistoryCount);
+      }
+    } else {
+      Serial.println("[WiGLE] Auto-upload disabled (maxBootUploads=0). Use web UI.");
+    }
+  } else {
+    Serial.println("[WiGLE] Upload not attempted (STA/token/SD not ready).");
+  }
+
+  // Now start web server after WiGLE operations are complete
+  Serial.println("[WEB] Starting web server routes...");
+  startWebServer();
+  
   if (staOk) {
     Serial.print("[WEB] STA IP: ");
     Serial.println(WiFi.localIP());
-  } else {
+  } else if (apWindowActive) {
     Serial.print("[WEB] AP IP: ");
     Serial.println(WiFi.softAPIP());
     Serial.println("[WEB] AP UI: http://192.168.4.1/");
-  }
-
-  if (staOk && sdOk && cfg.wigleBasicToken.length() > 0) {
-    Serial.println("[WiGLE] STA connected and token set. Uploading previous CSVs...");
-    uploadAllCsvsToWigle();
-  } else {
-    Serial.println("[WiGLE] Upload not attempted (STA/token/SD not ready).");
   }
 
   // Create a fresh log for this run
@@ -511,8 +531,8 @@ void loop() {
     allowScan = scanningEnabled && sdOk && !statusPagePaused &&
                 !apActive && (userScanOverride || !autoPaused);
   } else {
-    // Pages 1 (networks), 2 (nav), 4 (pig): always scan
-    allowScan = scanningEnabled && sdOk;
+    // Pages 1 (networks), 2 (nav), 4 (pig): respect AP/STA pause, but ignore statusPagePaused
+    allowScan = scanningEnabled && sdOk && !apActive && (userScanOverride || !autoPaused);
   }
   allowScanForOled = allowScan;
 

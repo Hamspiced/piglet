@@ -109,6 +109,10 @@ void cfgAssignKV(const String& k, const String& v) {
     int p = v.toInt();
     cfg.battPin = (v == "0") ? 0 : (p > 0 ? p : -1);  // allow GPIO 0; treat non-numeric as disabled
   }
+  else if (k == "maxBootUploads") {
+    int n = v.toInt();
+    if (n >= 0) cfg.maxBootUploads = n;  // 0 = disable auto-upload
+  }
 }
 
 // ---------------- Load / Save ----------------
@@ -220,6 +224,7 @@ bool saveConfigToSD() {
   f.print("speedUnits=");     f.println(cfg.speedUnits);
   f.print("board=");          f.println(cfg.board);
   f.print("battPin=");        f.println(cfg.battPin);
+  f.print("maxBootUploads="); f.println(cfg.maxBootUploads);
 
   f.flush();
   f.close();

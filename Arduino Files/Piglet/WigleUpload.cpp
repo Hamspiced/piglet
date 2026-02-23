@@ -171,36 +171,44 @@ bool uploadFileToWigle(const String& path) {
   String post =
     "\r\n--" + boundary + "--\r\n";
 
-  uint32_t contentLen = (uint32_t)pre.length() + (uint32_t)f.size() + (uint32_t)post.length();
-
+  uint32_t fileSize = f.size();
+  uint32_t contentLen = (uint32_t)pre.length() + fileSize + (uint32_t)post.length();
+  
   WiFiClientSecure client;
   client.setInsecure();
-
-  // IMPORTANT: keep this generous; WiGLE can be slow to respond after upload.
-  client.setTimeout(60000);
-
-  // optional (safe no-op in your build unless you implement it)
+  client.setTimeout(25000);
   tlsMaybeSetBufferSizes(client, 512, 512);
 
-  // Retry TLS connect (helps after a few back-to-back uploads)
+  IPAddress ip;
+  if (!WiFi.hostByName(WIGLE_HOST, ip)) {
+    Serial.println("[WiGLE] DNS lookup failed");
+    uploadLastResult = "DNS fail";
+    f.close();
+    return false;
+  }
+  
+  // Retry TLS connect
   bool connected = false;
   for (int attempt = 1; attempt <= 3; attempt++) {
-    if (client.connect(WIGLE_HOST, WIGLE_PORT)) { connected = true; break; }
+    if (client.connect(WIGLE_HOST, WIGLE_PORT)) { 
+      connected = true;
+      break;
+    }
     Serial.printf("[WiGLE] TLS connect failed (attempt %d/3)\n", attempt);
     client.stop();
-    delay(250);
+    delay(500);
     yield();
   }
 
   if (!connected) {
-    Serial.println("[WiGLE] TLS connect failed");
+    Serial.println("[WiGLE] TLS connect failed after 3 attempts");
     uploadLastResult = "TLS connect fail";
     f.close();
     return false;
   }
 
   // HTTP headers
-  client.print("POST /api/v2/file/upload HTTP/1.1\r\n");
+  client.print("POST /api/v2/file/upload HTTP/1.0\r\n");
   client.print(String("Host: ") + WIGLE_HOST + "\r\n");
   client.print(String("Authorization: Basic ") + cfg.wigleBasicToken + "\r\n");
   client.print(String("Content-Type: multipart/form-data; boundary=") + boundary + "\r\n");
@@ -219,14 +227,20 @@ bool uploadFileToWigle(const String& path) {
     yield();
   }
   f.close();
-
   client.print(post);
+  client.flush();
 
-  // Wait for response bytes
+  // Wait for response
   uint32_t waitStart = millis();
-  while (!client.available() && client.connected() && (millis() - waitStart) < 15000) {
-    delay(10);
+  while (!client.available() && client.connected() && (millis() - waitStart) < 30000) {
+    delay(100);
     yield();
+  }
+  
+  if (!client.available()) {
+    client.stop();
+    uploadLastResult = "No response";
+    return false;
   }
 
   // Read status line
@@ -244,13 +258,10 @@ bool uploadFileToWigle(const String& path) {
 
   wigleLastHttpCode = code;
 
-  Serial.print("[WiGLE] HTTP status: ");
-  Serial.println(code);
-
-  // Eat headers quickly, then stop
-  while (client.connected()) {
+  // Drain headers
+  while (client.connected() || client.available()) {
     String line = client.readStringUntil('\n');
-    if (line == "\r" || line.length() == 0) break;
+    if (line.length() < 3) break;
   }
   client.stop();
 
@@ -265,7 +276,7 @@ bool uploadFileToWigle(const String& path) {
 
 // ---- Batch upload ----
 
-uint32_t uploadAllCsvsToWigle() {
+uint32_t uploadAllCsvsToWigle(int maxFiles) {
   if (!sdOk) { uploadLastResult = "SD not OK"; return 0; }
 
   // Pause scanning during upload to avoid SD contention + WiFi scan interference
@@ -300,14 +311,18 @@ uint32_t uploadAllCsvsToWigle() {
     return 0;
   }
 
-  // Optional: verify token once up front
-  bool tokenOk = wigleTestToken();
-  if (!tokenOk && wigleTokenStatus == -1) {
-    uploading = false;
-    scanningEnabled = uploadPausedScanWasEnabled;
-    return 0;
-  }
+  // Skip token pre-check to avoid 30-45s delay at start of batch upload.
+  // If token is invalid, first upload will fail with 401/403.
+  // Note: wigleTokenStatus may be stale; web UI still validates on demand.
 
+  // Apply maxFiles limit if specified
+  uint32_t filesToUpload = uploadTotalFiles;
+  if (maxFiles > 0 && (uint32_t)maxFiles < uploadTotalFiles) {
+    filesToUpload = (uint32_t)maxFiles;
+    Serial.printf("[WiGLE] Limiting upload to %d of %d files (maxBootUploads)\n", 
+                  filesToUpload, uploadTotalFiles);
+  }
+  
   // Second pass: collect file paths first (avoid rename while dir handle is open)
   std::vector<String> paths;
   paths.reserve(uploadTotalFiles + 4);
@@ -321,7 +336,11 @@ uint32_t uploadAllCsvsToWigle() {
       bool isCurrent = (currentCsvPath.length() && path == currentCsvPath);
       f.close();
 
-      if (isCsv && !isCurrent) paths.push_back(path);
+      if (isCsv && !isCurrent) {
+        paths.push_back(path);
+        // Stop collecting if we've hit the limit
+        if (maxFiles > 0 && paths.size() >= filesToUpload) break;
+      }
 
       f = root.openNextFile();
     }
@@ -342,7 +361,11 @@ uint32_t uploadAllCsvsToWigle() {
 
     uploadDoneFiles++;
     updateOLED(0);
-    delay(0);
+    
+    // Give TLS stack time to fully clean up between uploads
+    if (i < paths.size() - 1) {  // Don't delay after last file
+      delay(2000);  // Increased from 1.5s to 2s
+    }
   }
 
   uploading = false;
@@ -352,4 +375,195 @@ uint32_t uploadAllCsvsToWigle() {
 
   uploadLastResult = "Uploaded " + String(okCount) + "/" + String(uploadTotalFiles);
   return okCount;
+}
+
+// ---- Load upload history from WiGLE ----
+
+void wigleLoadHistory() {
+  // Cache results for 24 hours to avoid rate limiting
+  const uint32_t CACHE_DURATION_MS = 86400000;  // 24 hours
+  uint32_t now = millis();
+  
+  if (wigleHistoryLastLoadMs > 0 && (now - wigleHistoryLastLoadMs) < CACHE_DURATION_MS) {
+    Serial.printf("[WiGLE] History cached (%d entries, loaded %d ms ago)\n", 
+                  wigleHistoryCount, now - wigleHistoryLastLoadMs);
+    return;
+  }
+  
+  Serial.println("[WiGLE] Loading upload history from API...");
+  
+  wigleHistoryCount = 0;
+  
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[WiGLE] No STA WiFi - skipping history load");
+    return;
+  }
+  
+  if (cfg.wigleBasicToken.length() < 8) {
+    Serial.println("[WiGLE] No token - skipping history load");
+    return;
+  }
+
+  Serial.println("[WiGLE] History: Creating TLS client...");
+  WiFiClientSecure client;
+  client.setInsecure();
+  client.setTimeout(15000);  // Reduced from 20s to 15s
+
+  Serial.println("[WiGLE] History: Connecting to api.wigle.net:443...");
+  if (!client.connect(WIGLE_HOST, WIGLE_PORT)) {
+    Serial.println("[WiGLE] History: TLS connect failed");
+    return;
+  }
+  
+  Serial.println("[WiGLE] History: Connected, sending request...");
+
+  // Request up to 50 most recent transactions
+  client.print("GET /api/v2/file/transactions?pagestart=0&pageend=50 HTTP/1.0\r\n");
+  client.print(String("Host: ") + WIGLE_HOST + "\r\n");
+  client.print(String("Authorization: Basic ") + cfg.wigleBasicToken + "\r\n");
+  client.print("Connection: close\r\n\r\n");
+
+  // Wait for response
+  uint32_t waitStart = millis();
+  while (!client.available() && client.connected() && (millis() - waitStart) < 10000) {
+    delay(10);
+    yield();
+  }
+
+  // Skip headers
+  Serial.println("[WiGLE] History: Skipping HTTP headers...");
+  bool inHeaders = true;
+  while (client.connected() && inHeaders) {
+    String line = client.readStringUntil('\n');
+    if (line.length() < 3) inHeaders = false;
+  }
+  Serial.println("[WiGLE] History: Headers skipped, parsing JSON...");
+
+  // Parse JSON response incrementally
+  // Look for patterns like: {"transid":"...", "fileName":"WiGLE_...", "fileSize":123, 
+  // "discoveredGps":45, "totalGps":67, "wait":null}
+  
+  String buffer = "";
+  uint32_t parseStart = millis();
+  uint32_t lastActivity = millis();
+  uint32_t lastLogTime = millis();
+  uint32_t bytesRead = 0;
+  const uint32_t PARSE_TIMEOUT = 15000;  // 15s total timeout
+  const uint32_t IDLE_TIMEOUT = 5000;    // 5s idle timeout
+  
+  while ((client.connected() || client.available()) && 
+         (millis() - parseStart) < PARSE_TIMEOUT) {
+    if (client.available()) {
+      lastActivity = millis();  // Reset idle timer
+      char c = client.read();
+      bytesRead++;
+      buffer += c;
+      
+      // Log progress every 2 seconds
+      if ((millis() - lastLogTime) > 2000) {
+        Serial.printf("[WiGLE] History: Read %d bytes, found %d files\n", bytesRead, wigleHistoryCount);
+        lastLogTime = millis();
+      }
+      
+      // Process when we hit end of a transaction object
+      if (c == '}' && buffer.indexOf("fileName") > 0) {
+        
+        // Extract fileName
+        int fnStart = buffer.indexOf("\"fileName\":\"");
+        if (fnStart > 0) {
+          fnStart += 12; // length of "fileName":"
+          int fnEnd = buffer.indexOf("\"", fnStart);
+          if (fnEnd > fnStart) {
+            String fileName = buffer.substring(fnStart, fnEnd);
+            
+            // Extract fileSize
+            int fsStart = buffer.indexOf("\"fileSize\":", fnEnd);
+            uint32_t fileSize = 0;
+            if (fsStart > 0) {
+              fsStart += 11; // length of "fileSize":
+              int fsEnd = buffer.indexOf(",", fsStart);
+              if (fsEnd < 0) fsEnd = buffer.indexOf("}", fsStart);
+              if (fsEnd > fsStart) {
+                fileSize = buffer.substring(fsStart, fsEnd).toInt();
+              }
+            }
+            
+            // Extract discoveredGps
+            int dgStart = buffer.indexOf("\"discoveredGps\":");
+            uint32_t discovered = 0;
+            if (dgStart > 0) {
+              dgStart += 16; // length of "discoveredGps":
+              int dgEnd = buffer.indexOf(",", dgStart);
+              if (dgEnd < 0) dgEnd = buffer.indexOf("}", dgStart);
+              if (dgEnd > dgStart) {
+                discovered = buffer.substring(dgStart, dgEnd).toInt();
+              }
+            }
+            
+            // Extract totalGps
+            int tgStart = buffer.indexOf("\"totalGps\":");
+            uint32_t total = 0;
+            if (tgStart > 0) {
+              tgStart += 11; // length of "totalGps":
+              int tgEnd = buffer.indexOf(",", tgStart);
+              if (tgEnd < 0) tgEnd = buffer.indexOf("}", tgStart);
+              if (tgEnd > tgStart) {
+                total = buffer.substring(tgStart, tgEnd).toInt();
+              }
+            }
+            
+            // Check wait status (wait:null means processed, wait:"..." means still processing)
+            bool isWaiting = (buffer.indexOf("\"wait\":null") < 0);
+            
+            // Store in history array if we have space
+            if (wigleHistoryCount < WIGLE_HISTORY_MAX) {
+              wigleHistory[wigleHistoryCount].basename = fileName;
+              wigleHistory[wigleHistoryCount].fileSize = fileSize;
+              wigleHistory[wigleHistoryCount].discoveredGps = discovered;
+              wigleHistory[wigleHistoryCount].totalGps = total;
+              wigleHistory[wigleHistoryCount].wait = isWaiting;
+              wigleHistoryCount++;
+            }
+          }
+        }
+        
+        buffer = ""; // Reset for next object
+      }
+      
+      // Keep buffer from growing too large
+      if (buffer.length() > 1024) {
+        buffer = buffer.substring(buffer.length() - 512);
+      }
+    } else {
+      // No data available - check for idle timeout
+      if ((millis() - lastActivity) > IDLE_TIMEOUT) {
+        Serial.println("[WiGLE] History: Idle timeout - no data for 5s");
+        break;
+      }
+      delay(10);
+      yield();
+    }
+  }
+  
+  if ((millis() - parseStart) >= PARSE_TIMEOUT) {
+    Serial.println("[WiGLE] History: Parse timeout (15s)");
+  }
+  
+  // Ensure TLS connection is fully closed and resources freed
+  Serial.println("[WiGLE] History: Closing TLS connection...");
+  client.stop();
+  
+  // CRITICAL: ESP32-C5/C6 TLS stack needs time to fully release resources
+  // Without this, subsequent TLS connections will fail
+  Serial.println("[WiGLE] History: Waiting for TLS stack to release resources...");
+  delay(1000);  // Increased from 100ms
+  yield();
+  
+  // Force any pending cleanup
+  Serial.printf("[WiGLE] History: Heap after cleanup: %u bytes\n", ESP.getFreeHeap());
+  
+  // Update cache timestamp
+  wigleHistoryLastLoadMs = millis();
+  
+  Serial.printf("[WiGLE] History: Loaded %d file stats (cached for 24h)\n", wigleHistoryCount);
 }
