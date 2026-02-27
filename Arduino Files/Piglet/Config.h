@@ -13,6 +13,7 @@ struct Config {
   String board = "auto"; // auto | s3 | c5 | c6 | exp  (pins selected at boot; reboot required after change)
   String speedUnits  = "kmh"; // kmh | mph
   int battPin        = -1;    // GPIO for battery voltage ADC (-1 = disabled). Expects 1:2 voltage divider from LiPo.
+  bool batteryTest   = false; // Enable battery test (logs elapsed time to /battery_test.csv)
   
   // WiGLE API quota management: WiGLE allows 25 API calls/day per token.
   // Each CSV upload = 1 call. History API call is cached for 24h (only 1 call/day).

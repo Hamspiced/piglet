@@ -421,8 +421,11 @@ void setup() {
     Serial.println("[SD] Log file create skipped (SD FAIL).");
   }
 
-  // Battery test (uncomment to enable)
-  if (sdOk) batteryTestInit();
+  // Battery test (configurable)
+  if (sdOk && cfg.batteryTest) {
+    batteryTestInit();
+    Serial.println("[BATT] Battery test enabled");
+  }
 
   updateOLED(0);
 

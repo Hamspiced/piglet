@@ -109,6 +109,10 @@ void cfgAssignKV(const String& k, const String& v) {
     int p = v.toInt();
     cfg.battPin = (v == "0") ? 0 : (p > 0 ? p : -1);  // allow GPIO 0; treat non-numeric as disabled
   }
+  else if (k == "batteryTest") {
+    String vv = v; vv.toLowerCase();
+    cfg.batteryTest = (vv == "true" || vv == "1");
+  }
   else if (k == "maxBootUploads") {
     int n = v.toInt();
     if (n >= 0) cfg.maxBootUploads = n;  // 0 = disable auto-upload
@@ -214,16 +218,45 @@ bool saveConfigToSD() {
   f.println("# Lines starting with # are comments");
   f.println("");
 
+  f.println("# WiGLE API 'Encoded for use' token from wigle.net/account");
   f.print("wigleBasicToken="); f.println(cfg.wigleBasicToken);
+  f.println("");
+
+  f.println("# Home Wi-Fi credentials (for STA connection and uploads)");
   f.print("homeSsid=");        f.println(cfg.homeSsid);
   f.print("homePsk=");         f.println(cfg.homePsk);
+  f.println("");
+
+  f.println("# Device Access Point credentials (for web UI when home WiFi unavailable)");
   f.print("wardriverSsid=");   f.println(cfg.wardriverSsid);
   f.print("wardriverPsk=");    f.println(cfg.wardriverPsk);
+  f.println("");
+
+  f.println("# GPS UART baud rate (default: 9600)");
   f.print("gpsBaud=");         f.println(cfg.gpsBaud);
+  f.println("");
+
+  f.println("# Scan interval: aggressive (4.5s) or powersaving (12s)");
   f.print("scanMode=");        f.println(cfg.scanMode);
+  f.println("");
+
+  f.println("# Speed display: kmh or mph");
   f.print("speedUnits=");     f.println(cfg.speedUnits);
+  f.println("");
+
+  f.println("# Board type: auto, s3, c5, c6, exp (requires reboot)");
   f.print("board=");          f.println(cfg.board);
+  f.println("");
+
+  f.println("# Battery voltage ADC GPIO (-1 = disabled, requires 1:2 voltage divider)");
   f.print("battPin=");        f.println(cfg.battPin);
+  f.println("");
+
+  f.println("# Enable battery test (logs elapsed time to /battery_test.csv): true or false");
+  f.print("batteryTest=");    f.println(cfg.batteryTest ? "true" : "false");
+  f.println("");
+
+  f.println("# Max CSV files to auto-upload at boot (0-25, 0=disabled, WiGLE limit: 25 calls/day)");
   f.print("maxBootUploads="); f.println(cfg.maxBootUploads);
 
   f.flush();

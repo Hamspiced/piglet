@@ -348,6 +348,12 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
         </select>
       </div>
       <div><label>Battery ADC Pin (-1 = off)</label><input id="battPin" type="number" value="-1"></div>
+      <div><label>Battery Test (elapsed time log)</label>
+        <select id="batteryTest">
+          <option value="false">Disabled</option>
+          <option value="true">Enabled</option>
+        </select>
+      </div>
       <div><label>Max Auto-Upload at Boot (0-25)</label><input id="maxBootUploads" type="number" value="5" min="0" max="25"></div>
     </div>
     <div class="mt-md" style="max-width:220px">
@@ -436,7 +442,7 @@ async function loadStatus(){
     setText('vApSsid',j?.config?.wardriverSsid||'\u2014');
 
     // Fill config form — skip masked/secret values
-    for(const k of ['wigleBasicToken','board','gpsBaud','homeSsid','wardriverSsid','wardriverPsk','scanMode','speedUnits','battPin','maxBootUploads']){
+    for(const k of ['wigleBasicToken','board','gpsBaud','homeSsid','wardriverSsid','wardriverPsk','scanMode','speedUnits','battPin','batteryTest','maxBootUploads']){
       if(j.config&&(k in j.config)){
         const v=String(j.config[k]);
         if(maskedKeys.has(k)&&(v===''||v==='(set)'))continue;
@@ -503,7 +509,7 @@ async function delFile(name){
 }
 
 async function saveCfg(){
-  const keys=['board','wigleBasicToken','gpsBaud','homeSsid','homePsk','wardriverSsid','wardriverPsk','scanMode','speedUnits','battPin','maxBootUploads'];
+  const keys=['board','wigleBasicToken','gpsBaud','homeSsid','homePsk','wardriverSsid','wardriverPsk','scanMode','speedUnits','battPin','batteryTest','maxBootUploads'];
   let body='# Saved from Web UI\n# key=value\n';
   for(const k of keys){
     const el=$(k);
@@ -620,6 +626,7 @@ static void handleStatus() {
   c["board"] = cfg.board;
   c["speedUnits"] = cfg.speedUnits;
   c["battPin"] = cfg.battPin;
+  c["batteryTest"] = cfg.batteryTest;
   c["maxBootUploads"] = cfg.maxBootUploads;
 
   String output;
