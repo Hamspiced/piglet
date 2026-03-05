@@ -51,6 +51,7 @@ You can get everything on Amazon but its pricey.  if you dont mind waiting on al
 - SSD1306 128x63 OLED - $2 [aliexpress](https://www.aliexpress.us/item/3256805954920554.html)
 - ATGM-336h - $3.39 [aliexpress](https://www.aliexpress.us/item/3256809330278648.html)
 - SD-Card Module - $1.33 [aliexpress](https://www.aliexpress.us/item/3256808167816573.html)
+- User Button - $0.41 [Item:CS1211 From Digikey](https://www.digikey.com/en/products/detail/cit-relay-and-switch/CS1211/16607858)
 
 $14 if you wanted to breadboard it yourself.
 
@@ -89,6 +90,24 @@ Pin mappings are automatically selected by firmware.
 
 **Note:** Only the ESP32-C5 supports 5 GHz Wi-Fi scanning.
 
+
+## PCB Design
+
+Piglet includes custom PCB designs for compact, production-ready builds. KiCad project files and Gerber production files are available in the `PCB Files/` directory.
+
+### PCB Images
+
+| Board Front | Board Back | Board Close-up |
+|-------------|------------|----------------|
+| ![Board1](images/Board1.jpg) | ![Board2](images/Board2.jpg) | ![Board3](images/Board3.jpg) |
+
+### Assembled Piglet
+
+| Module Arrangement | Front View | Back View |
+|--------------------|------------|----------|
+| ![Module Arrangement](images/Module_Arrangement.png) | ![Built Piglet Front](images/BuiltPiglet.jpg) | ![Built Piglet Back](images/BackBuiltPiglet.jpg) |
+
+**Assembly Note:** When stacking modules, apply **Kapton tape** between components to prevent electrical shorts. Pay special attention to exposed pins and solder joints that may contact adjacent modules.
 
 
 ## Configuration File
