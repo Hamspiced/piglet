@@ -1,7 +1,6 @@
 #include "Scanner.h"
 #include "Globals.h"
 #include "Config.h"
-#include "Dedup.h"
 #include "GPS.h"
 #include "SDUtils.h"
 
@@ -101,12 +100,6 @@ void doScanOnce() {
 
     String ssid = WiFi.SSID(i);
     String mac  = WiFi.BSSIDstr(i);
-
-    uint64_t key = bssidStrToKey48(mac);
-    if (seenCheckOrInsert(key)) {
-      continue; // already logged this AP
-    }
-
     int rssi = WiFi.RSSI(i);
 
     wifi_auth_mode_t auth = WiFi.encryptionType(i);

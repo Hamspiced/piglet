@@ -3,6 +3,7 @@
 #include "GPS.h"
 #include "Config.h"
 #include "SDUtils.h"
+#include "MeshNode.h"
 #include <math.h>
 
 // ---- Splash slogans ----
@@ -662,6 +663,7 @@ void updateOLED(float speedValue) {
     case 2:  drawPageNavigation(speedValue); break;
     case 3:  drawPagePaused();               break;
     case 4:  /* pig handled by pigAnimTick in loop() */ break;
+    case 5:  drawPageMeshNode();             break;
     default: drawPageStatus(speedValue);     break;
   }
 }

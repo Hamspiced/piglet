@@ -99,13 +99,13 @@ Piglet includes custom PCB designs for compact, production-ready builds. KiCad p
 
 | Board Front | Board Back | Board Close-up |
 |-------------|------------|----------------|
-| ![Board1](images/Board1.jpg) | ![Board2](images/Board2.jpg) | ![Board3](images/Board3.jpg) |
+| ![Board1](Images/Board1.jpg) | ![Board2](Images/Board2.jpg) | ![Board3](Images/Board3.jpg) |
 
 ### Assembled Piglet
 
 | Module Arrangement | Front View | Back View |
 |--------------------|------------|----------|
-| ![Module Arrangement](images/Module_Arrangement.png) | ![Built Piglet Front](images/BuiltPiglet.jpg) | ![Built Piglet Back](images/BackBuiltPiglet.jpg) |
+| ![Module Arrangement](Images/Module_Arrangement.png) | ![Built Piglet Front](Images/BuiltPiglet.jpg) | ![Built Piglet Back](Images/BackBuiltPiglet.jpg) |
 
 **Assembly Note:** When stacking modules, apply **Kapton tape** between components to prevent electrical shorts. Pay special attention to exposed pins and solder joints that may contact adjacent modules.
 
