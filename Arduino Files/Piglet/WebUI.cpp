@@ -1,7 +1,6 @@
 #include "WebUI.h"
 #include "Globals.h"
 #include "Config.h"
-#include "Dedup.h"
 #include "SDUtils.h"
 #include "Display.h"
 #include "WigleUpload.h"
@@ -277,8 +276,7 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
       <div id="row5g"><span class="k">5 GHz Found</span><span class="v" id="vFound5g">—</span></div>
       <div><span class="k">STA IP</span><span class="v" id="vStaIp">—</span></div>
       <div><span class="k">AP Clients Seen</span><span class="v" id="vApSeen">—</span></div>
-      <div><span class="k">De-dupe Table</span><span class="v" id="vDedup">—</span></div>
-      <div><span class="k">Last Upload</span><span class="v" id="vLastUpload">—</span></div>
+      <div><span class="k">Last Upload</span>
     </div>
 
     <details class="mt-md">
@@ -431,7 +429,6 @@ async function loadStatus(){
     if(row5g)row5g.style.display=(j.c5Connected||j.found5g)?'':'none';
     setText('vStaIp',j.wifiConnected?(j.staIp||'\u2014'):'\u2014');
     setText('vApSeen',j.apClientsSeen?'Yes':'No');
-    setText('vDedup',(j.seenCount||0)+' seen, '+(j.seenCollisions||0)+' collisions');
 
     const lastUp=j.uploadLastResult?j.uploadLastResult+' (HTTP '+(j.wigleLastHttpCode||'\u2014')+')':'\u2014';
     setText('vLastUpload',lastUp);
@@ -604,9 +601,6 @@ static void handleStatus() {
   doc["wifiConnected"] = (WiFi.status() == WL_CONNECTED);
   doc["staIp"] = (WiFi.status() == WL_CONNECTED) ? WiFi.localIP().toString() : "";
   doc["apClientsSeen"] = apClientSeen;
-  doc["seenCount"] = seenCount;
-  doc["seenCollisions"] = seenCollisions;
-  doc["seenTableSize"] = SEEN_TABLE_SIZE;
   doc["uploading"] = uploading;
   doc["uploadTotalFiles"] = uploadTotalFiles;
   doc["uploadDoneFiles"] = uploadDoneFiles;

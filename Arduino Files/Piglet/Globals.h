@@ -31,8 +31,8 @@ extern bool userScanOverride;
 extern bool autoPaused;
 
 // ---- OLED page system ----
-// 0=Status, 1=Networks, 2=Navigation, 3=Pause, 4=Pig
-static const uint8_t PAGE_COUNT = 5;
+// 0=Status, 1=Networks, 2=Navigation, 3=Pause, 4=Pig, 5=MeshNode
+static const uint8_t PAGE_COUNT = 6;
 extern uint8_t currentPage;
 extern bool statusPagePaused;   // true when user double-pressed to pause on status page
 

@@ -27,7 +27,6 @@
 
 #include "Globals.h"
 #include "Config.h"
-#include "Dedup.h"
 #include "GPS.h"
 #include "SDUtils.h"
 #include "Display.h"
@@ -35,6 +34,7 @@
 #include "Scanner.h"
 #include "WigleUpload.h"
 #include "WebUI.h"
+#include "MeshNode.h"
 
 // -------- Battery Test (uncomment to enable) --------
 #include "battery_test.h"
@@ -101,6 +101,10 @@ static void onPageChange(uint8_t oldPage, uint8_t newPage) {
     pig.dx = 1;
     pig.phase = 0;
   }
+
+  // Mesh node page lifecycle
+  if (newPage == 5) enterNodeMode();
+  if (oldPage == 5) exitNodeMode();
 
   Serial.print("[PAGE] ");
   Serial.print(oldPage);
@@ -184,13 +188,6 @@ void setup() {
   esp_sleep_wakeup_cause_t wakeup = esp_sleep_get_wakeup_cause();
   if (wakeup == ESP_SLEEP_WAKEUP_EXT0 || wakeup == ESP_SLEEP_WAKEUP_GPIO) {
     Serial.println("[BOOT] Woke from deep sleep (button press)");
-  }
-
-  // Init de-dupe table once at boot
-  if (!initSeenTable()) {
-    Serial.println("[DEDUP] WARNING: seenTable disabled (allocation failed)");
-  } else {
-    resetSeenTable();
   }
 
   networksFound2G = 0;
@@ -515,32 +512,37 @@ void loop() {
     pigAnimTick();
   } else if (millis() - lastOled > 500) {
     lastOled = millis();
-    updateOLED(speedDisplay);
+    updateOLED(speedDisplay);  // also dispatches page 5 (mesh node)
   }
 
   handleStaTransitions();
 
   // Scanning – page-aware logic
-  autoPaused = shouldPauseScanning();
-  wifi_mode_t m = WiFi.getMode();
-  bool apActive = (m == WIFI_AP || m == WIFI_AP_STA);
-
-  bool allowScan;
-  if (currentPage == 3) {
-    // Pause page: always stop scanning
-    allowScan = false;
-  } else if (currentPage == 0) {
-    // Status page: respect AP/STA pause + double-press pause
-    allowScan = scanningEnabled && sdOk && !statusPagePaused &&
-                !apActive && (userScanOverride || !autoPaused);
+  // Mesh node page handles its own scan via nodeModeTick(); skip normal path.
+  if (currentPage == 5) {
+    nodeModeTick();
   } else {
-    // Pages 1 (networks), 2 (nav), 4 (pig): respect AP/STA pause, but ignore statusPagePaused
-    allowScan = scanningEnabled && sdOk && !apActive && (userScanOverride || !autoPaused);
-  }
-  allowScanForOled = allowScan;
+    autoPaused = shouldPauseScanning();
+    wifi_mode_t m = WiFi.getMode();
+    bool apActive = (m == WIFI_AP || m == WIFI_AP_STA);
 
-  if (allowScan) {
-    doScanOnce();
+    bool allowScan;
+    if (currentPage == 3) {
+      // Pause page: always stop scanning
+      allowScan = false;
+    } else if (currentPage == 0) {
+      // Status page: respect AP/STA pause + double-press pause
+      allowScan = scanningEnabled && sdOk && !statusPagePaused &&
+                  !apActive && (userScanOverride || !autoPaused);
+    } else {
+      // Pages 1 (networks), 2 (nav), 4 (pig): respect AP/STA pause
+      allowScan = scanningEnabled && sdOk && !apActive && (userScanOverride || !autoPaused);
+    }
+    allowScanForOled = allowScan;
+
+    if (allowScan) {
+      doScanOnce();
+    }
   }
 
   // Battery test tick (uncomment to enable)
