@@ -28,6 +28,63 @@ Designed for **Seeed XIAO ESP32-S3, ESP32-C5, and ESP32-C6**, Piglet focuses on:
 - Automatic STA connect with AP fallback  
 - Network de-duplication  
 - Optimized for mobile wardriving or warWalking!
+- **ESP-Now Mesh Node mode** — pair with a coordinator device for multi-node wardriving
+
+
+## ESP-Now Mesh Network Node Mode
+
+Piglet includes a built-in **Mesh Node mode** that lets it act as a wireless wardriving node alongside a compatible coordinator device. In this mode, Piglet scans Wi-Fi networks and forwards results over ESP-Now — no SD card or GPS fix required on Piglet itself. The coordinator handles GPS stamping and data logging.
+
+### Compatible Coordinator Devices
+
+- **Biscuit Pro** by [Hedge / Biscuit Shop](https://biscuitshop.us)
+- **JCMK C5 Wardriver** by JustCallMeKoko
+
+### How to Use
+
+1. Power on your coordinator device (Biscuit Pro or JCMK C5 Wardriver)
+2. On Piglet, press the button to cycle pages until you reach **Mesh Node** (the last page after the pig animation)
+3. Piglet automatically searches for a coordinator on ESP-Now channel 6
+4. Once connected, it receives a channel range assignment and begins forwarding scan data
+5. Press the button again to exit Mesh Node mode and return to normal wardriving
+
+### Mesh Node Display
+
+While in Mesh Node mode the OLED shows:
+- Link status (Searching / Core linked)
+- Coordinator MAC address
+- Assigned channel range
+- Total networks discovered
+- Records forwarded to the coordinator
+
+> **Note:** Entering Mesh Node mode suspends normal WiGLE CSV logging. All data is sent live to the coordinator. Exiting the page restores normal scanning automatically.
+
+
+## T-Dongle C5 Variant
+
+A standalone firmware port is available for the **LilyGo T-Dongle C5** in the `TDongleC5_Piglet/` folder. This variant is a self-contained single-file sketch with its own display driver, LED control, and web UI — no external OLED required.
+
+**Hardware:** LilyGo T-Dongle C5 (ESP32-C5, built-in ST7735 0.96" TFT, APA102 LED, TF card slot)
+
+**Additional GPS:** Connect any UART GPS module via the Qwiic/JST connector (RX=GPIO12, TX=GPIO11)
+
+**Pages:** Status · Networks · Navigation · Pig animation · Mesh Node
+
+### T-Dongle C5 Required Libraries
+
+Install via Arduino Library Manager (`Sketch → Include Library → Manage Libraries`):
+
+| Library | Author |
+|---------|--------|
+| Adafruit ST7735 and ST7789 Library | Adafruit |
+| Adafruit GFX Library | Adafruit |
+| Adafruit BusIO | Adafruit |
+| TinyGPSPlus | Mikal Hart |
+| ArduinoJson | Benoit Blanchon |
+
+All networking, SPI, SD, ESP-Now, and ESP-IDF headers are included in the ESP32 Arduino core — no separate install needed.
+
+**Board setup:** Add `https://espressif.github.io/arduino-esp32/package_esp32_dev_index.json` to Additional Boards Manager URLs, install **esp32 by Espressif v3.x or later**, and select **ESP32C5 Dev Module**.
 
 
 ## Supported Hardware
@@ -37,6 +94,7 @@ Designed for **Seeed XIAO ESP32-S3, ESP32-C5, and ESP32-C6**, Piglet focuses on:
 - Seeed XIAO ESP32-S3  
 - Seeed XIAO ESP32-C5 *(required for 5 GHz scanning)*  
 - Seeed XIAO ESP32-C6  
+- LilyGo T-Dongle C5 *(standalone variant — see above)*  
 
 ### Required Peripherals
 
@@ -89,6 +147,23 @@ Pin mappings are automatically selected by firmware.
 | SD SCK | GPIO 8 |
 
 **Note:** Only the ESP32-C5 supports 5 GHz Wi-Fi scanning.
+
+
+## 3D Printed Cases
+
+Print-ready STL files are available in the `Case Files/` directory. These cases are designed specifically for the Piglet PCB and module stack.
+
+| File | Description |
+|------|-------------|
+| `Piglet Face.STL` | Front panel / lid |
+| `Piglet Butt.STL` | Rear enclosure |
+| `Piglet Butt with SMA hole.STL` | Rear enclosure with external antenna cutout |
+| `Piglet Midboard.STL` | Internal standoff / mid-layer |
+| `Piglet Features.stl` | Feature plate / accessory mount |
+
+For the **T-Dongle C5** variant, GPS antenna mount STLs are included in `TDongleC5_Piglet/GPS STL/`.
+
+> Print with standard PLA or PETG. No supports required on most parts. Recommend 0.2 mm layer height, 3 perimeters.
 
 
 ## PCB Design
