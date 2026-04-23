@@ -212,32 +212,79 @@ board=auto
 
 ## Button Functions
 
-### Single Press - Stop/Start scanning
-### Long Press - DeepSleep
-### Single Press - Exit Deepsleep
+### Press Types
+
+| Press | Timing | Action |
+|-------|--------|--------|
+| **Single press** | Quick tap | Advance to next page |
+| **Double press** | Two taps within 350 ms | Toggle scan pause *(Status page only)* |
+| **Long press** | Hold ≥ 2 seconds | Enter deep sleep |
+| **Single press** *(while sleeping)* | Any | Wake from deep sleep / reboot |
+
+### Pages (Single Press cycles through these)
+
+| Page | Name | What it Shows | Scanning |
+|------|------|---------------|----------|
+| 0 | **Status** | Scan state, SD, GPS fix, WiFi, network counts, speed, IP, upload status | ✅ Active |
+| 1 | **Networks** | Large display of 2.4 GHz, 5 GHz, and total network counts | ✅ Active |
+| 2 | **Navigation** | Compass arrow, heading direction, current speed | ✅ Active |
+| 3 | **Paused** | Pause icon — scanning fully stopped | ❌ Paused |
+| 4 | **Pig** | Walking pig animation 🐷 | ✅ Active |
+| 5 | **Mesh Node** | ESP-Now link state, coordinator MAC, channel range, Found/Sent counts | ↔ Forwarded via ESP-Now |
+
+### Double Press — Status Page Only
+
+When on the **Status page**, double-pressing toggles a scan pause without leaving the page. Useful for a quick stop without navigating to the Pause page.
+
+- **Double press →** Scanning paused on status page
+- **Double press again →** Scanning resumed
+- **Single press (page change) →** Pause automatically cleared when leaving page 0
+
+### Long Press — Deep Sleep
+
+Hold the button for **2 seconds** from any page:
+- Active log file is flushed and closed before sleeping
+- OLED displays `Sleep...` then powers off
+- A single button press wakes the device (full reboot)
+
+### Mesh Node Page
+
+Entering **page 5** automatically starts ESP-Now node mode. Leaving it (single press to advance) automatically restores normal wardriving. See the [ESP-Now Mesh Network Node Mode](#esp-now-mesh-network-node-mode) section above for details.
 
 ## Building Firmware
 
 ### Requirements
 
-- **Arduino IDE 2.x** or **PlatformIO**  
-- **Arduino-ESP32 core** v3.0.0 or later  
+- **Arduino IDE 2.x** or **PlatformIO**
+- **Arduino-ESP32 core** v3.0.0 or later
 
-### Required Libraries
+### Required Libraries — XIAO Variant (S3 / C5 / C6)
 
-Install these libraries via Arduino Library Manager or PlatformIO:
+Install via Arduino Library Manager (`Sketch → Include Library → Manage Libraries`):
 
-- **WiFi** (built-in with ESP32 core)
-- **WebServer** (built-in with ESP32 core)
-- **WiFiClientSecure** (built-in with ESP32 core)
-- **HTTPClient** (built-in with ESP32 core)
-- **SD** (built-in with ESP32 core)
-- **SPI** (built-in with ESP32 core)
-- **Wire** (built-in with ESP32 core)
-- **TinyGPSPlus** by Mikal Hart - [Library Link](https://github.com/mikalhart/TinyGPSPlus)
-- **Adafruit GFX Library** - Required dependency for SSD1306
-- **Adafruit SSD1306** - OLED display driver
-- **ArduinoJson** by Benoit Blanchon - v6.x or v7.x
+| Library | Author | Notes |
+|---------|--------|-------|
+| TinyGPSPlus | Mikal Hart | GPS NMEA parsing |
+| Adafruit GFX Library | Adafruit | Graphics dependency |
+| Adafruit SSD1306 | Adafruit | OLED display driver |
+| Adafruit BusIO | Adafruit | Required by SSD1306 |
+| ArduinoJson | Benoit Blanchon | v6.x or v7.x |
+
+All other headers (`WiFi`, `WebServer`, `WiFiClientSecure`, `HTTPClient`, `SD`, `SPI`, `Wire`, `esp_now.h`, `esp_wifi.h`) are included in the ESP32 Arduino core — no separate install needed.
+
+### Required Libraries — T-Dongle C5 Variant
+
+Install via Arduino Library Manager:
+
+| Library | Author | Notes |
+|---------|--------|-------|
+| Adafruit ST7735 and ST7789 Library | Adafruit | TFT display driver |
+| Adafruit GFX Library | Adafruit | Graphics dependency |
+| Adafruit BusIO | Adafruit | Required by ST7735 |
+| TinyGPSPlus | Mikal Hart | GPS NMEA parsing |
+| ArduinoJson | Benoit Blanchon | v6.x or v7.x |
+
+All networking, SPI, SD, ESP-Now, and ESP-IDF headers are built into the ESP32 core.
 
 ### Flash Steps
 
