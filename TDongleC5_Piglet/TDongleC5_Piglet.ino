@@ -126,6 +126,10 @@ struct Config {
   uint32_t gpsBaud     = 9600;
   String scanMode      = "aggressive";
   String speedUnits    = "kmh";
+  // WDGoWars API key from https://wdgwars.pl/profile
+  String wdgwarsApiKey;
+  // Boot auto-upload limit: -1=all, 0=disabled, 1+=capped
+  int maxBootUploads   = 25;
 };
 
 Config cfg;
@@ -179,10 +183,15 @@ static bool     uploading = false;
 static bool     uploadPausedScanWasEnabled = false;
 static uint32_t uploadTotalFiles = 0;
 static uint32_t uploadDoneFiles  = 0;
+static uint32_t uploadFailedFiles = 0;
 static String   uploadCurrentFile = "";
 static String   uploadLastResult  = "";
+static String   uploadTargetName  = "";  // shown on TFT during upload
 static int      wigleTokenStatus  = 0;
 static int      wigleLastHttpCode = 0;
+
+static const char* WDGWARS_HOST = "wdgwars.pl";
+static const uint16_t WDGWARS_PORT = 443;
 
 static const char* WIGLE_HOST = "api.wigle.net";
 static const uint16_t WIGLE_PORT = 443;
@@ -342,6 +351,8 @@ static void cfgAssignKV(const String& k, const String& v) {
   else if (k == "gpsBaud") { uint32_t b = (uint32_t)v.toInt(); if (b > 0) cfg.gpsBaud = b; }
   else if (k == "scanMode") { if (v == "aggressive" || v == "powersaving") cfg.scanMode = v; }
   else if (k == "speedUnits") { String vv = v; vv.toLowerCase(); if (vv == "kmh" || vv == "mph") cfg.speedUnits = vv; }
+  else if (k == "wdgwarsApiKey")   cfg.wdgwarsApiKey = v;
+  else if (k == "maxBootUploads") { int n = v.toInt(); if (n >= -1) cfg.maxBootUploads = n; }
 }
 
 static bool saveConfigToSD() {
@@ -361,6 +372,9 @@ static bool saveConfigToSD() {
   f.print("gpsBaud=");         f.println(cfg.gpsBaud);
   f.print("scanMode=");        f.println(cfg.scanMode);
   f.print("speedUnits=");      f.println(cfg.speedUnits);
+  f.print("wdgwarsApiKey=");   f.println(cfg.wdgwarsApiKey);
+  f.println("# Boot auto-upload limit: -1=all, 0=disabled, 1+=capped");
+  f.print("maxBootUploads=");  f.println(cfg.maxBootUploads);
 
   f.flush(); f.close();
   Serial.println("[CFG] Saved OK");
@@ -481,6 +495,171 @@ static void appendWigleRow(const String& mac, const String& ssid, const String& 
   }
 }
 
+// ---- WDGoWars API key test — GET /api/me ----
+static bool wdgwarsTestKey() {
+  uploadLastResult = "";
+  if (WiFi.status() != WL_CONNECTED) { uploadLastResult = "No STA WiFi"; return false; }
+  if (cfg.wdgwarsApiKey.length() < 8) { uploadLastResult = "No API key set"; return false; }
+
+  WiFiClientSecure client;
+  client.setInsecure(); client.setTimeout(15000);
+  if (!client.connect(WDGWARS_HOST, WDGWARS_PORT)) { uploadLastResult = "TLS connect fail"; return false; }
+
+  client.print("GET /api/me HTTP/1.0\r\n");
+  client.print(String("Host: ") + WDGWARS_HOST + "\r\n");
+  client.print(String("X-API-Key: ") + cfg.wdgwarsApiKey + "\r\n");
+  client.print("Connection: close\r\n\r\n");
+
+  uint32_t ws = millis();
+  while (!client.available() && client.connected() && (millis()-ws)<10000) { delay(10); yield(); }
+
+  String status = client.readStringUntil('\n'); status.trim();
+  int code = 0;
+  if (status.startsWith("HTTP/")) {
+    int s1 = status.indexOf(' ');
+    if (s1>0) { int s2=status.indexOf(' ',s1+1); if(s2>s1) code=status.substring(s1+1,s2).toInt(); }
+  }
+
+  // Collect body to extract username
+  String body = "";
+  bool inBody = false;
+  while (client.connected() || client.available()) {
+    String line = client.readStringUntil('\n'); line.trim();
+    if (!inBody) { if (line.length()==0) inBody=true; }
+    else { body+=line; if(body.length()>512) break; }
+  }
+  client.stop();
+
+  if (code == 200) {
+    String user = "";
+    int ui = body.indexOf("\"username\":");
+    if (ui>=0) { int q1=body.indexOf('"',ui+11); int q2=(q1>=0)?body.indexOf('"',q1+1):-1; if(q1>=0&&q2>q1) user=body.substring(q1+1,q2); }
+    uploadLastResult = user.length() ? "Key valid — "+user : "Key valid (200)";
+    return true;
+  }
+  if (code==401||code==403) { uploadLastResult="Key invalid ("+String(code)+")"; }
+  else { uploadLastResult="Unexpected response ("+String(code)+")"; }
+  return false;
+}
+
+// ---- WDGoWars single-file upload — POST /api/upload-csv ----
+static bool uploadFileToWdgwars(const String& path) {
+  if (WiFi.status() != WL_CONNECTED) return false;
+  if (cfg.wdgwarsApiKey.length() < 8) return false;
+  digitalWrite(PINS.tft_cs, HIGH);
+  if (!SD.exists(path)) return false;
+
+  File f = SD.open(path, FILE_READ);
+  if (!f) return false;
+
+  String boundary = "----Piglet-WDGWARS-BOUNDARY";
+  String filename = pathBasename(path);
+  String pre = "--"+boundary+"\r\nContent-Disposition: form-data; name=\"file\"; filename=\""+filename+"\"\r\nContent-Type: text/csv\r\n\r\n";
+  String post = "\r\n--"+boundary+"--\r\n";
+  uint32_t contentLen = (uint32_t)pre.length()+(uint32_t)f.size()+(uint32_t)post.length();
+
+  WiFiClientSecure client;
+  client.setInsecure(); client.setTimeout(25000);
+  bool connected = false;
+  for (int att=1; att<=3; att++) {
+    if (client.connect(WDGWARS_HOST, WDGWARS_PORT)) { connected=true; break; }
+    client.stop(); delay(500); yield();
+  }
+  if (!connected) { f.close(); return false; }
+
+  client.print("POST /api/upload-csv HTTP/1.0\r\n");
+  client.print(String("Host: ")+WDGWARS_HOST+"\r\n");
+  client.print(String("X-API-Key: ")+cfg.wdgwarsApiKey+"\r\n");
+  client.print(String("Content-Type: multipart/form-data; boundary=")+boundary+"\r\n");
+  client.print(String("Content-Length: ")+String(contentLen)+"\r\nConnection: close\r\n\r\n");
+  client.print(pre);
+  uint8_t buf[1024];
+  while (true) { int n=f.read(buf,sizeof(buf)); if(n<=0) break; client.write(buf,n); yield(); }
+  f.close();
+  client.print(post); client.flush();
+
+  uint32_t ws = millis();
+  while (!client.available() && client.connected() && (millis()-ws)<30000) { delay(100); yield(); }
+  if (!client.available()) { client.stop(); return false; }
+
+  String status = client.readStringUntil('\n'); status.trim();
+  int code = 0;
+  if (status.startsWith("HTTP/")) {
+    int s1=status.indexOf(' '); if(s1>0){int s2=status.indexOf(' ',s1+1);if(s2>s1) code=status.substring(s1+1,s2).toInt();}
+  }
+  // Read body for server message
+  String body=""; bool inBody=false;
+  while (client.connected()||client.available()) {
+    String line=client.readStringUntil('\n'); line.trim();
+    if (!inBody){if(line.length()==0) inBody=true;} else{body+=line;if(body.length()>512) break;}
+  }
+  client.stop();
+  Serial.printf("[WDGWars] HTTP %d  %s\n", code, body.c_str());
+  if (code==200) {
+    int idx=body.indexOf("merged_samples");
+    if (idx>=0) {
+      int col=body.indexOf(':',idx); int start=col+1;
+      while(start<(int)body.length()&&!isDigit(body[start])) start++;
+      int end=start; while(end<(int)body.length()&&isDigit(body[end])) end++;
+      if(end>start) Serial.printf("[WDGWars] Upload accepted — merged_samples: %d\n",body.substring(start,end).toInt());
+    } else { Serial.println("[WDGWars] Upload accepted"); }
+    return true;
+  }
+  return false;
+}
+
+// ---- Empty-file guard: true if file has any data beyond the 2 header lines ----
+static bool csvHasDataRows(const String& path) {
+  File f = SD.open(path, FILE_READ);
+  if (!f) return false;
+  for (int i=0; i<2; i++) { if(!f.available()){f.close();return false;} f.readStringUntil('\n'); }
+  bool hasData = f.available()>0;
+  f.close();
+  return hasData;
+}
+
+// ---- WDGoWars-only batch upload (web UI button) ----
+static uint32_t uploadAllCsvsToWdgwars() {
+  if (!sdOk) { uploadLastResult="SD not OK"; return 0; }
+  if (cfg.wdgwarsApiKey.length()<8) { uploadLastResult="No API key"; return 0; }
+
+  uploadPausedScanWasEnabled=scanningEnabled; scanningEnabled=false;
+  uploading=true; uploadTargetName="WDGW UL";
+  uploadDoneFiles=0; uploadFailedFiles=0; uploadTotalFiles=0; uploadCurrentFile="";
+  ledBlue();
+
+  digitalWrite(PINS.tft_cs, HIGH);
+  File root=SD.open("/logs");
+  if (root){File f=root.openNextFile();while(f){String name=normalizeSdPath("/logs",f.name());
+    if(name.endsWith(".csv")&&!(currentCsvPath.length()&&name==currentCsvPath)) uploadTotalFiles++;
+    f.close();f=root.openNextFile();}root.close();}
+
+  if (uploadTotalFiles==0){uploading=false;uploadTargetName="";scanningEnabled=uploadPausedScanWasEnabled;uploadLastResult="No CSVs to upload";ledOff();return 0;}
+
+  std::vector<String> paths; paths.reserve(uploadTotalFiles+2);
+  root=SD.open("/logs");
+  if(root){File f=root.openNextFile();while(f){
+    String path=normalizeSdPath("/logs",f.name()); f.close();
+    if(path.endsWith(".csv")&&!(currentCsvPath.length()&&path==currentCsvPath)) paths.push_back(path);
+    f=root.openNextFile();}root.close();}
+
+  uint32_t okCount=0;
+  for(size_t i=0;i<paths.size();i++){
+    uploadCurrentFile=paths[i];
+    tftWigleUploadScreen(uploadDoneFiles,uploadTotalFiles,pathBasename(uploadCurrentFile));
+    if(!csvHasDataRows(paths[i])){Serial.printf("[UPLOAD] Empty CSV, deleting: %s\n",pathBasename(paths[i]).c_str());SD.remove(paths[i]);uploadDoneFiles++;continue;}
+    bool ok=uploadFileToWdgwars(paths[i]);
+    if(ok){okCount++;moveToUploaded(paths[i]);}else{uploadFailedFiles++;}
+    uploadDoneFiles++;
+    tftWigleUploadScreen(uploadDoneFiles,uploadTotalFiles,pathBasename(uploadCurrentFile));
+    if(i<paths.size()-1) delay(1500);
+  }
+  uploading=false; uploadTargetName=""; scanningEnabled=uploadPausedScanWasEnabled;
+  uploadCurrentFile=""; uploadLastResult="WDGWars: "+String(okCount)+"/"+String(uploadTotalFiles);
+  ledOff(); forceStatusFullRedraw();
+  return okCount;
+}
+
 // ---------------- WiGLE Upload ----------------
 static bool moveToUploaded(const String& srcPath) {
   if (!sdOk) return false;
@@ -592,16 +771,17 @@ static bool uploadFileToWigle(const String& path) {
 static void tftWigleUploadScreen(uint32_t done, uint32_t total, const String& filename);
 static void forceStatusFullRedraw();
 
-static uint32_t uploadAllCsvsToWigle() {
+// uploadAllCsvsToWigle: maxFiles=-1=all, 0=disabled(shouldn't be called), 1+=capped
+static uint32_t uploadAllCsvsToWigle(int maxFiles = -1) {
   if (!sdOk) { uploadLastResult = "SD not OK"; return 0; }
 
   uploadPausedScanWasEnabled = scanningEnabled;
   scanningEnabled = false;
   uploading = true;
   uploadDoneFiles = 0;
+  uploadFailedFiles = 0;
   uploadTotalFiles = 0;
   uploadCurrentFile = "";
-
   ledBlue();
 
   digitalWrite(PINS.tft_cs, HIGH);
@@ -610,9 +790,7 @@ static uint32_t uploadAllCsvsToWigle() {
     File f = root.openNextFile();
     while (f) {
       String name = normalizeSdPath("/logs", f.name());
-      bool isCsv = name.endsWith(".csv");
-      bool isCurrent = (currentCsvPath.length() && name == currentCsvPath);
-      if (isCsv && !isCurrent) uploadTotalFiles++;
+      if (name.endsWith(".csv") && !(currentCsvPath.length() && name == currentCsvPath)) uploadTotalFiles++;
       f.close(); f = root.openNextFile();
     }
     root.close();
@@ -623,9 +801,11 @@ static uint32_t uploadAllCsvsToWigle() {
     uploadLastResult = "No CSVs to upload"; ledOff(); return 0;
   }
 
-  std::vector<String> paths;
-  paths.reserve(uploadTotalFiles + 4);
+  uint32_t filesToUpload = uploadTotalFiles;
+  if (maxFiles > 0 && (uint32_t)maxFiles < uploadTotalFiles) filesToUpload = (uint32_t)maxFiles;
 
+  std::vector<String> paths;
+  paths.reserve(filesToUpload + 4);
   root = SD.open("/logs");
   if (root) {
     File f = root.openNextFile();
@@ -634,7 +814,10 @@ static uint32_t uploadAllCsvsToWigle() {
       bool isCsv = path.endsWith(".csv");
       bool isCurrent = (currentCsvPath.length() && path == currentCsvPath);
       f.close();
-      if (isCsv && !isCurrent) paths.push_back(path);
+      if (isCsv && !isCurrent) {
+        paths.push_back(path);
+        if (maxFiles > 0 && paths.size() >= filesToUpload) break;
+      }
       f = root.openNextFile();
     }
     root.close();
@@ -643,17 +826,42 @@ static uint32_t uploadAllCsvsToWigle() {
   uint32_t okCount = 0;
   for (size_t i = 0; i < paths.size(); i++) {
     uploadCurrentFile = paths[i];
-    tftWigleUploadScreen(uploadDoneFiles, uploadTotalFiles, pathBasename(uploadCurrentFile));
 
-    bool ok = uploadFileToWigle(paths[i]);
-    if (ok) { okCount++; moveToUploaded(paths[i]); }
+    // Skip and delete header-only files
+    if (!csvHasDataRows(paths[i])) {
+      Serial.printf("[UPLOAD] Empty CSV, deleting: %s\n", pathBasename(paths[i]).c_str());
+      SD.remove(paths[i]);
+      uploadDoneFiles++;
+      continue;
+    }
+
+    // Step 1: WDGoWars first (if configured)
+    bool wdgOk = false;
+    if (cfg.wdgwarsApiKey.length() >= 8) {
+      uploadTargetName = "WDGW UL";
+      tftWigleUploadScreen(uploadDoneFiles, uploadTotalFiles, pathBasename(paths[i]));
+      wdgOk = uploadFileToWdgwars(paths[i]);
+      if (!wdgOk) uploadFailedFiles++;
+      if (i < paths.size()-1 || cfg.wigleBasicToken.length() >= 8) delay(1500);
+    }
+
+    // Step 2: WiGLE (if configured)
+    bool wigleOk = false;
+    if (cfg.wigleBasicToken.length() >= 8) {
+      uploadTargetName = "WiGLE UL";
+      tftWigleUploadScreen(uploadDoneFiles, uploadTotalFiles, pathBasename(paths[i]));
+      wigleOk = uploadFileToWigle(paths[i]);
+      if (!wigleOk) uploadFailedFiles++;
+    }
+
+    if (wigleOk || wdgOk) { okCount++; moveToUploaded(paths[i]); }
     uploadDoneFiles++;
-
     tftWigleUploadScreen(uploadDoneFiles, uploadTotalFiles, pathBasename(uploadCurrentFile));
-    delay(0);
+    if (i < paths.size()-1) delay(2000);
   }
 
   uploading = false;
+  uploadTargetName = "";
   scanningEnabled = uploadPausedScanWasEnabled;
   uploadCurrentFile = "";
   uploadLastResult = "Uploaded " + String(okCount) + "/" + String(uploadTotalFiles);
@@ -761,11 +969,22 @@ static void tftWigleUploadScreen(uint32_t done, uint32_t total, const String& fi
   tft.setTextColor(WHITE, BLACK);
 
   tftDrawCentered(10, "Piglet", 2);
-  tftDrawCentered(40, "WiGLE Upload", 1);
 
+  // Service label: use uploadTargetName if set, otherwise generic
+  const char* label = uploadTargetName.length() ? uploadTargetName.c_str() : "Uploading";
+  tftDrawCentered(40, label, 1);
+
+  // File count + right-aligned fail counter
   char buf[32];
   snprintf(buf, sizeof(buf), "%lu / %lu", (unsigned long)done, (unsigned long)total);
   tftDrawCentered(60, buf, 1);
+  if (uploadFailedFiles > 0) {
+    tft.setTextSize(1);
+    char fbuf[10];
+    snprintf(fbuf, sizeof(fbuf), "F:%lu", (unsigned long)uploadFailedFiles);
+    tft.setCursor(W - (int)strlen(fbuf)*6 - 2, 60);
+    tft.print(fbuf);
+  }
 
   tft.drawRect(BAR_X, BAR_Y, BAR_W, BAR_H, WHITE);
   int fillW = (int)((BAR_W - 2) * pct);
@@ -1390,22 +1609,27 @@ static void enterNodeMode() {
   jcmkEndIdx            = JCMK_NUM_CHANNELS - 1;
   jcmkAssignVer         = 0;
 
-  // Drop any existing WiFi connections
+  // Soft WiFi reset — do NOT erase NVS credentials (eraseap=false)
   WiFi.softAPdisconnect(true);
-  WiFi.disconnect(true, true);
+  WiFi.disconnect(true, false);
   delay(100);
   WiFi.mode(WIFI_STA);
-  delay(100);
+  delay(150);  // let the driver settle before touching the channel
 
-  // Lock radio to JCMK ESP-Now channel
-  jcmkSetChannel(JCMK_ESPNOW_CH);
-
+  // Init ESP-Now FIRST, then lock the home channel.
+  // Calling setChannel before esp_now_init() risks the driver
+  // resetting the channel back during its own initialisation.
   esp_err_t err = esp_now_init();
   if (err != ESP_OK) {
     Serial.printf("[MESH] esp_now_init failed: %d\n", (int)err);
     return;
   }
   esp_now_register_recv_cb(jcmkOnRecv);
+
+  // Lock radio to JCMK ESP-Now home channel AFTER init (matches JCMK pattern)
+  delay(50);
+  jcmkSetChannel(JCMK_ESPNOW_CH);
+
   jcmkAddPeer(JCMK_BCAST);
 
   meshNodeActive = true;
@@ -1617,11 +1841,13 @@ static void handleStatus() {
   doc["uploadTotalFiles"] = uploadTotalFiles;
   doc["uploadDoneFiles"] = uploadDoneFiles;
   doc["uploadLastResult"] = uploadLastResult;
+  doc["uploadFailedFiles"] = uploadFailedFiles;
   doc["wigleTokenStatus"] = wigleTokenStatus;
   doc["wigleLastHttpCode"] = wigleLastHttpCode;
 
   JsonObject c = doc.createNestedObject("config");
-  c["wigleBasicToken"] = cfg.wigleBasicToken.length() ? "(set)" : "";
+  c["wigleBasicToken"] = cfg.wigleBasicToken;
+  c["wdgwarsApiKey"]   = cfg.wdgwarsApiKey;
   c["homeSsid"] = cfg.homeSsid;
   c["homePsk"] = cfg.homePsk.length() ? "(set)" : "";
   c["wardriverSsid"] = cfg.wardriverSsid;
@@ -1629,6 +1855,7 @@ static void handleStatus() {
   c["gpsBaud"] = cfg.gpsBaud;
   c["scanMode"] = cfg.scanMode;
   c["speedUnits"] = cfg.speedUnits;
+  c["maxBootUploads"] = cfg.maxBootUploads;
 
   String out; serializeJson(doc, out);
   server.send(200, "application/json", out);
@@ -1713,10 +1940,39 @@ static void handleWigleTest() {
   server.send(ok ? 200 : 400, "application/json", out);
 }
 
+static void handleWdgwarsTest() {
+  if (WiFi.status() != WL_CONNECTED) { server.send(400,"application/json","{\"ok\":false,\"message\":\"STA WiFi not connected\"}"); return; }
+  if (cfg.wdgwarsApiKey.length() < 8)  { server.send(400,"application/json","{\"ok\":false,\"message\":\"No API key configured\"}"); return; }
+  bool ok = wdgwarsTestKey();
+  DynamicJsonDocument doc(256);
+  doc["ok"] = ok; doc["message"] = uploadLastResult;
+  String out; serializeJson(doc, out);
+  server.send(ok ? 200 : 400, "application/json", out);
+}
+
+static void handleWdgwarsUploadAll() {
+  if (!sdOk) { server.send(500,"text/plain","SD not available"); return; }
+  if (WiFi.status() != WL_CONNECTED) { server.send(400,"text/plain","Not connected"); return; }
+  if (cfg.wdgwarsApiKey.length() < 8)  { server.send(400,"text/plain","No API key configured"); return; }
+  uint32_t okCount = uploadAllCsvsToWdgwars();
+  DynamicJsonDocument doc(256);
+  doc["ok"]=(okCount>0); doc["uploaded"]=okCount; doc["total"]=uploadTotalFiles; doc["message"]=uploadLastResult;
+  String out; serializeJson(doc, out);
+  server.send(200, "application/json", out);
+}
+
+static void handleReboot() {
+  closeLogFile();                       // flush active CSV log cleanly
+  server.send(200, "text/plain", "OK");
+  server.client().stop();
+  delay(200);
+  ESP.restart();
+}
+
 static void handleWigleUploadAll() {
   if (!sdOk) { server.send(500, "text/plain", "SD not available"); return; }
   if (WiFi.status() != WL_CONNECTED) { server.send(400, "text/plain", "Not connected"); return; }
-  uint32_t okCount = uploadAllCsvsToWigle();
+  uint32_t okCount = uploadAllCsvsToWigle(-1);  // web always uploads all
   DynamicJsonDocument doc(384);
   doc["ok"] = (okCount > 0); doc["uploaded"] = okCount;
   doc["total"] = uploadTotalFiles; doc["message"] = uploadLastResult;
@@ -1758,9 +2014,12 @@ static void startWebServer() {
   server.on("/stop",     HTTP_POST, handleStop);
   server.on("/nextpage", HTTP_POST, handleNextPage);
   server.on("/saveConfig", HTTP_POST, handleSaveConfig);
-  server.on("/wigle/test", HTTP_POST, handleWigleTest);
+  server.on("/wigle/test",      HTTP_POST, handleWigleTest);
   server.on("/wigle/uploadAll", HTTP_POST, handleWigleUploadAll);
-  server.on("/wigle/upload", HTTP_POST, handleWigleUploadOne);
+  server.on("/wigle/upload",    HTTP_POST, handleWigleUploadOne);
+  server.on("/wdgwars/test",    HTTP_POST, handleWdgwarsTest);
+  server.on("/wdgwars/uploadAll",HTTP_POST, handleWdgwarsUploadAll);
+  server.on("/reboot",          HTTP_POST, handleReboot);
   server.begin();
   Serial.println("[WEB] Server started");
 }
@@ -2040,10 +2299,22 @@ void setup() {
     Serial.print("[WEB] AP IP: "); Serial.println(WiFi.softAPIP());
   }
 
-  // WiGLE upload on boot if STA connected
-  if (staOk && sdOk && cfg.wigleBasicToken.length() > 0) {
-    Serial.println("[WiGLE] Uploading previous CSVs...");
-    uploadAllCsvsToWigle();
+  // Boot upload: WDGoWars first (if key set), then WiGLE (if token set).
+  // maxBootUploads: -1=all, 0=disabled, 1+=capped.
+  {
+    bool hasWigle = cfg.wigleBasicToken.length() > 0;
+    bool hasWdg   = cfg.wdgwarsApiKey.length()   > 0;
+    if (staOk && sdOk && (hasWigle || hasWdg) && cfg.maxBootUploads != 0) {
+      Serial.print("[UPLOAD] Services: ");
+      if (hasWdg)   Serial.print("WDGoWars ");
+      if (hasWigle) Serial.print("WiGLE");
+      Serial.println();
+      uploadAllCsvsToWigle(cfg.maxBootUploads);
+    } else if (!staOk || !sdOk) {
+      Serial.println("[UPLOAD] Skipped (STA/SD not ready).");
+    } else if (cfg.maxBootUploads == 0) {
+      Serial.println("[UPLOAD] Disabled (maxBootUploads=0).");
+    }
   }
 
   // Open fresh log

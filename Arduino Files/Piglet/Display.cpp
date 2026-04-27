@@ -259,7 +259,11 @@ static void drawPageStatus(float speedValue) {
   display.setCursor(0, 0);
 
   if (uploading) {
-    display.print("Uploading");
+    // Show the active upload service (set by WigleUpload.cpp before each upload)
+    if (uploadTargetName.length() > 0)
+      display.print(uploadTargetName);
+    else
+      display.print("Uploading");
     display.setTextSize(1);
   } else {
     // Match the real scan eligibility logic from loop()
@@ -324,16 +328,25 @@ static void drawPageStatus(float speedValue) {
   int y = OLED_YELLOW_H;
 
   if (uploading) {
+    // Row 1: progress count + fail counter on the right
     display.setCursor(0, y);
     display.print(uploadDoneFiles);
     display.print("/");
     display.print(uploadTotalFiles);
     display.print(" files");
+    if (uploadFailedFiles > 0) {
+      // Right-align the fail count — each size-1 char is 6px wide
+      String failTxt = String("F:") + String(uploadFailedFiles);
+      display.setCursor(OLED_W - (int)failTxt.length() * 6, y);
+      display.print(failTxt);
+    }
 
     y += 10;
     String name = uploadCurrentFile.length() ? pathBasename(uploadCurrentFile) : "";
     if (name.length() > 0) {
-      if (name.length() > 21) name = name.substring(0, 21);
+      // Shorten filename if fail counter is shown to avoid overlap
+      int maxChars = (uploadFailedFiles > 0) ? 16 : 21;
+      if ((int)name.length() > maxChars) name = name.substring(0, maxChars);
       display.setCursor(0, y);
       display.print(name);
       y += 10;

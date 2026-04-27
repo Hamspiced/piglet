@@ -15,11 +15,17 @@ struct Config {
   int battPin        = -1;    // GPIO for battery voltage ADC (-1 = disabled). Expects 1:2 voltage divider from LiPo.
   bool batteryTest   = false; // Enable battery test (logs elapsed time to /battery_test.csv)
   
-  // WiGLE API quota management: WiGLE allows 25 API calls/day per token.
-  // Each CSV upload = 1 call. History API call is cached for 24h (only 1 call/day).
+  // Boot auto-upload limit:
+  //  -1 = upload ALL files at boot (no limit)
+  //   0 = disabled (no auto-upload at boot)
+  //  1+ = upload up to N files at boot (WiGLE allows 25 API calls/day)
   // IMPORTANT: Requires PSRAM enabled in Arduino IDE for reliable TLS connections.
-  // Default: 25 (upload all files at boot). Set to 0 to disable auto-upload.
   int maxBootUploads = 25;
+
+  // WDGoWars API key from https://wdgwars.pl/profile -> "Generate API key".
+  // If set, CSVs are uploaded to WDGoWars BEFORE WiGLE at every boot.
+  // Leave empty to disable WDGoWars uploads.
+  String wdgwarsApiKey;
 };
 
 const PinMap& detectPinsByChip();

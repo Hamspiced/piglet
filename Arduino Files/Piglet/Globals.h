@@ -58,6 +58,8 @@ extern uint32_t uploadTotalFiles;
 extern uint32_t uploadDoneFiles;
 extern String   uploadCurrentFile;
 extern String   uploadLastResult;
+extern String   uploadTargetName;   // service label shown on OLED (e.g. "WDGW UL" / "WiGLE UL")
+extern uint32_t uploadFailedFiles;  // failed upload attempts in the current batch
 extern int      wigleTokenStatus;
 extern int      wigleLastHttpCode;
 

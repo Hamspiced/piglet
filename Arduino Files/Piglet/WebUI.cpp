@@ -309,6 +309,16 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
         <button class="btn-primary" onclick="wigleUploadAll()">Upload All CSVs</button>
       </div>
     </div>
+
+    <!-- WDGoWars section -->
+    <div class="inner-card">
+      <h4>WDGoWars</h4>
+      <div id="wdgwarsMsg" class="muted" style="font-size:14px">—</div>
+      <div class="row mt-sm">
+        <button onclick="wdgwarsTest()">Test API Key</button>
+        <button class="btn-primary" onclick="wdgwarsUploadAll()">Upload All CSVs</button>
+      </div>
+    </div>
   </div>
 
   <!-- ============ CONFIG ============ -->
@@ -318,6 +328,10 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
       <div>
         <label>WiGLE Basic Token</label>
         <input id="wigleBasicToken" placeholder="Enter 'Encoded for use' token from wigle.net/account">
+      </div>
+      <div>
+        <label>WDGoWars API Key</label>
+        <input id="wdgwarsApiKey" placeholder="API key from wdgwars.pl/profile (leave empty to disable)">
       </div>
       <div><label>GPS Baud Rate</label><input id="gpsBaud" type="number" value="9600"></div>
       <div><label>Home SSID</label><input id="homeSsid" placeholder="Your home Wi-Fi"></div>
@@ -352,13 +366,15 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
           <option value="true">Enabled</option>
         </select>
       </div>
-      <div><label>Max Auto-Upload at Boot (0-25)</label><input id="maxBootUploads" type="number" value="5" min="0" max="25"></div>
+      <div><label>Max Files to Auto-Upload at Boot (-1=all, 0=off)</label><input id="maxBootUploads" type="number" value="25" min="-1" max="999"></div>
     </div>
-    <div class="mt-md" style="max-width:220px">
+    <div class="row mt-md">
       <button class="btn-primary" onclick="saveCfg()">Save Config</button>
+      <button onclick="saveAndReboot()" title="Save config then restart the device">Save &amp; Reboot</button>
     </div>
     <p style="margin-top:12px;font-size:13px;color:var(--muted)">Stored at <code>/wardriver.cfg</code> on the SD card. WiFi &amp; GPS changes require a reboot.<br>
-    <strong>Max Auto-Upload:</strong> WiGLE allows 25 API calls/day. Set to 5 (default) to conserve quota, or 0 to disable auto-upload.</p>
+    <strong>Max Files at Boot:</strong> <code>-1</code> = upload all files every boot &bull; <code>0</code> = disabled (use web buttons manually) &bull; <code>1+</code> = upload up to N files (WiGLE allows 25 API calls/day).
+    <strong>Upload All CSVs</strong> buttons above always upload every file regardless of this setting.</p>
   </div>
 
   <!-- ============ FILES ============ -->
@@ -366,6 +382,15 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
     <h3>SD Card Files</h3>
     <div id="files" style="font-size:14px">Loading&hellip;</div>
   </div>
+
+<!-- Reboot overlay (hidden until saveAndReboot() is triggered) -->
+<div id="rebootOverlay" style="display:none;position:fixed;inset:0;background:rgba(10,14,19,.97);z-index:9999;flex-direction:column;align-items:center;justify-content:center;text-align:center;gap:14px;padding:32px">
+  <div style="font-size:48px">&#x1f437;</div>
+  <h2 style="margin:0;font-size:22px">Rebooting...</h2>
+  <p id="rebootMsg" style="color:var(--muted);margin:0;font-size:15px">Config saved &mdash; device is restarting.</p>
+  <p id="rebootCountdown" style="font-size:44px;font-weight:700;color:var(--accent);margin:0"></p>
+  <p style="color:var(--muted);font-size:13px;margin-top:6px">Reconnect and refresh once the device comes back online.</p>
+</div>
 
 <script>
 /* ---- Helpers ---- */
@@ -439,7 +464,7 @@ async function loadStatus(){
     setText('vApSsid',j?.config?.wardriverSsid||'\u2014');
 
     // Fill config form — skip masked/secret values
-    for(const k of ['wigleBasicToken','board','gpsBaud','homeSsid','wardriverSsid','wardriverPsk','scanMode','speedUnits','battPin','batteryTest','maxBootUploads']){
+    for(const k of ['wigleBasicToken','wdgwarsApiKey','board','gpsBaud','homeSsid','wardriverSsid','wardriverPsk','scanMode','speedUnits','battPin','batteryTest','maxBootUploads']){
       if(j.config&&(k in j.config)){
         const v=String(j.config[k]);
         if(maskedKeys.has(k)&&(v===''||v==='(set)'))continue;
@@ -505,19 +530,79 @@ async function delFile(name){
   loadFiles();
 }
 
-async function saveCfg(){
-  const keys=['board','wigleBasicToken','gpsBaud','homeSsid','homePsk','wardriverSsid','wardriverPsk','scanMode','speedUnits','battPin','batteryTest','maxBootUploads'];
+/* ---- Shared save logic used by both Save and Save+Reboot ---- */
+async function doSave(){
+  const keys=['board','wigleBasicToken','wdgwarsApiKey','gpsBaud','homeSsid','homePsk','wardriverSsid','wardriverPsk','scanMode','speedUnits','battPin','batteryTest','maxBootUploads'];
   let body='# Saved from Web UI\n# key=value\n';
   for(const k of keys){
     const el=$(k);
     const v=el?(el.value??''):'';
-    // Don't write empty secret fields (user didn't change them)
     if(maskedKeys.has(k)&&v==='')continue;
     body+=k+'='+String(v).replace(/\r?\n/g,' ')+'\n';
   }
-  await fetch('/saveConfig',{method:'POST',headers:{'Content-Type':'text/plain'},body});
+  const r=await fetch('/saveConfig',{method:'POST',headers:{'Content-Type':'text/plain'},body});
   await loadStatus();
-  alert('Saved. Reboot to apply WiFi/GPS changes.');
+  return r;
+}
+
+async function saveCfg(){
+  try{
+    await doSave();
+    alert('Config saved. Reboot the device to apply WiFi / GPS changes.');
+  }catch(e){alert('Save failed: '+e);}
+}
+
+async function saveAndReboot(){
+  try{ await doSave(); }catch(e){ alert('Save failed: '+e); return; }
+
+  // Show the reboot overlay
+  const ov=$('rebootOverlay');
+  ov.style.display='flex';
+
+  // Ask the device to reboot (fire-and-forget; it will restart before responding)
+  try{ await fetch('/reboot',{method:'POST'}); }catch(e){}
+
+  // Count down while the device restarts (~10 s)
+  let t=12;
+  $('rebootCountdown').textContent=t+'s';
+  const iv=setInterval(()=>{
+    t--;
+    $('rebootCountdown').textContent=t>0?t+'s':'';
+    if(t<=0){
+      clearInterval(iv);
+      $('rebootMsg').textContent='Device rebooted. Reconnect and refresh this page.';
+      // Attempt to auto-reload after a further 2 s
+      setTimeout(()=>location.reload(),2000);
+    }
+  },1000);
+}
+
+function setWdgwarsMsg(t,cls){
+  const el=$('wdgwarsMsg');
+  el.textContent=t;
+  el.className=cls||'muted';
+}
+
+async function wdgwarsTest(){
+  setWdgwarsMsg('Testing key\u2026');
+  try{
+    const r=await fetch('/wdgwars/test',{method:'POST'});
+    const j=await r.json().catch(()=>({ok:false,message:'Bad response'}));
+    setWdgwarsMsg(j.message||(j.ok?'Key valid':'Key invalid'),j.ok?'ok-text':'bad-text');
+  }catch(e){setWdgwarsMsg('Request failed','bad-text')}
+}
+
+async function wdgwarsUploadAll(){
+  setWdgwarsMsg('Uploading all CSVs to WDGoWars\u2026');
+  try{
+    const r=await fetch('/wdgwars/uploadAll',{method:'POST'});
+    const j=await r.json().catch(()=>null);
+    if(j){
+      const msg=j.message||(j.ok?j.uploaded+' file(s) uploaded':'Upload failed');
+      setWdgwarsMsg(msg,j.ok?'ok-text':'bad-text');
+    }
+  }catch(e){setWdgwarsMsg('Upload request failed','bad-text')}
+  await loadFiles();
 }
 
 async function wigleTest(){
@@ -610,7 +695,8 @@ static void handleStatus() {
   doc["wigleLastHttpCode"] = wigleLastHttpCode;
 
   JsonObject c = doc.createNestedObject("config");
-  c["wigleBasicToken"] = cfg.wigleBasicToken;  // Show actual token, not masked
+  c["wigleBasicToken"] = cfg.wigleBasicToken;
+  c["wdgwarsApiKey"]   = cfg.wdgwarsApiKey;
   c["homeSsid"] = cfg.homeSsid;
   c["homePsk"] = cfg.homePsk.length() ? "(set)" : "";
   c["wardriverSsid"] = cfg.wardriverSsid;
@@ -795,6 +881,14 @@ static void handleSaveConfig() {
   server.send(ok ? 200 : 500, "text/plain", ok ? "OK" : "FAIL");
 }
 
+static void handleReboot() {
+  closeLogFile();                      // flush & close active CSV log cleanly
+  server.send(200, "text/plain", "OK");
+  server.client().stop();
+  delay(200);
+  ESP.restart();                       // never returns
+}
+
 static void handleWigleTest() {
   bool ok = wigleTestToken();
 
@@ -809,12 +903,56 @@ static void handleWigleTest() {
   server.send(ok ? 200 : 400, "application/json", out);
 }
 
+static void handleWdgwarsTest() {
+  if (WiFi.status() != WL_CONNECTED) {
+    server.send(400, "application/json",
+                "{\"ok\":false,\"message\":\"STA WiFi not connected\"}");
+    return;
+  }
+  if (cfg.wdgwarsApiKey.length() < 8) {
+    server.send(400, "application/json",
+                "{\"ok\":false,\"message\":\"No API key configured\"}");
+    return;
+  }
+
+  bool ok = wdgwarsTestKey();
+
+  DynamicJsonDocument doc(256);
+  doc["ok"]      = ok;
+  doc["message"] = uploadLastResult;
+
+  String out;
+  serializeJson(doc, out);
+  server.send(ok ? 200 : 400, "application/json", out);
+}
+
+static void handleWdgwarsUploadAll() {
+  if (!sdOk) { server.send(500, "text/plain", "SD not available"); return; }
+  if (WiFi.status() != WL_CONNECTED) { server.send(400, "text/plain", "STA WiFi not connected"); return; }
+  if (cfg.wdgwarsApiKey.length() < 8) { server.send(400, "text/plain", "No API key configured"); return; }
+
+  // Pass -1 explicitly: web-triggered uploads bypass the maxBootUploads cap.
+  uint32_t okCount = uploadAllCsvsToWdgwars(-1);
+
+  DynamicJsonDocument doc(256);
+  doc["ok"]       = (okCount > 0);
+  doc["uploaded"] = okCount;
+  doc["total"]    = uploadTotalFiles;
+  doc["message"]  = uploadLastResult;
+
+  String out;
+  serializeJson(doc, out);
+  server.send(200, "application/json", out);
+}
+
 static void handleWigleUploadAll() {
   if (!sdOk) { server.send(500, "text/plain", "SD not available"); return; }
   if (WiFi.status() != WL_CONNECTED) { server.send(400, "text/plain", "STA WiFi not connected"); return; }
 
-  uint32_t okCount = uploadAllCsvsToWigle();
-  
+  // Pass -1 explicitly: web-triggered uploads are always unlimited,
+  // bypassing the maxBootUploads cap which applies only at boot.
+  uint32_t okCount = uploadAllCsvsToWigle(-1);
+
   // History will auto-refresh when user next accesses /files.json
   
   DynamicJsonDocument doc(384);
@@ -884,9 +1022,12 @@ void startWebServer() {
   server.on("/stop",   HTTP_POST, handleStop);
   server.on("/saveConfig", HTTP_POST, handleSaveConfig);
 
-  server.on("/wigle/test", HTTP_POST, handleWigleTest);
+  server.on("/reboot",          HTTP_POST, handleReboot);
+  server.on("/wigle/test",      HTTP_POST, handleWigleTest);
   server.on("/wigle/uploadAll", HTTP_POST, handleWigleUploadAll);
-  server.on("/wigle/upload", HTTP_POST, handleWigleUploadOne);
+  server.on("/wigle/upload",    HTTP_POST, handleWigleUploadOne);
+  server.on("/wdgwars/test",      HTTP_POST, handleWdgwarsTest);
+  server.on("/wdgwars/uploadAll", HTTP_POST, handleWdgwarsUploadAll);
 
   server.begin();
   Serial.println("[WEB] Server started");

@@ -115,8 +115,9 @@ void cfgAssignKV(const String& k, const String& v) {
   }
   else if (k == "maxBootUploads") {
     int n = v.toInt();
-    if (n >= 0) cfg.maxBootUploads = n;  // 0 = disable auto-upload
+    if (n >= -1) cfg.maxBootUploads = n;  // -1=all, 0=disabled, 1+=limited
   }
+  else if (k == "wdgwarsApiKey") cfg.wdgwarsApiKey = v;
 }
 
 // ---------------- Load / Save ----------------
@@ -256,8 +257,12 @@ bool saveConfigToSD() {
   f.print("batteryTest=");    f.println(cfg.batteryTest ? "true" : "false");
   f.println("");
 
-  f.println("# Max CSV files to auto-upload at boot (0-25, 0=disabled, WiGLE limit: 25 calls/day)");
+  f.println("# Max CSV files to auto-upload at boot (-1=all, 0=disabled, 1-25=limited)");
   f.print("maxBootUploads="); f.println(cfg.maxBootUploads);
+
+  f.println("");
+  f.println("# WDGoWars API key from https://wdgwars.pl/profile (leave empty to disable)");
+  f.print("wdgwarsApiKey="); f.println(cfg.wdgwarsApiKey);
 
   f.flush();
   f.close();

@@ -228,22 +228,27 @@ void enterNodeMode() {
   jcmkEndIdx            = JCMK_NUM_CHANNELS - 1;
   jcmkAssignVer         = 0;
 
-  // Drop any existing WiFi connections
+  // Soft WiFi reset — do NOT erase NVS credentials (eraseap=false)
   WiFi.softAPdisconnect(true);
-  WiFi.disconnect(true, true);
+  WiFi.disconnect(true, false);
   delay(100);
   WiFi.mode(WIFI_STA);
-  delay(100);
+  delay(150);  // let the driver settle before touching the channel
 
-  // Lock radio to JCMK ESP-Now home channel
-  jcmkSetChannel(JCMK_ESPNOW_CH);
-
+  // Init ESP-Now FIRST, then lock the home channel.
+  // Calling setChannel before esp_now_init() risks the driver
+  // resetting the channel back during its own initialisation.
   esp_err_t err = esp_now_init();
   if (err != ESP_OK) {
     Serial.printf("[MESH] esp_now_init failed: %d\n", (int)err);
     return;
   }
   esp_now_register_recv_cb(jcmkOnRecv);
+
+  // Lock radio to JCMK ESP-Now home channel AFTER init (matches JCMK pattern)
+  delay(50);
+  jcmkSetChannel(JCMK_ESPNOW_CH);
+
   jcmkAddPeer(JCMK_BCAST);
 
   meshNodeActive = true;

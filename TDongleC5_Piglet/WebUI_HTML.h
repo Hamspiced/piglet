@@ -83,12 +83,21 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
         <button class="btn-primary" onclick="wigleUploadAll()">Upload All CSVs</button>
       </div>
     </div>
+    <div class="inner-card">
+      <h3 style="margin:0 0 6px 0">WDGoWars</h3>
+      <div id="wdgwarsMsg" class="muted" style="font-size:13px">—</div>
+      <div class="row mt-sm">
+        <button onclick="wdgwarsTest()">Test API Key</button>
+        <button class="btn-primary" onclick="wdgwarsUploadAll()">Upload All CSVs</button>
+      </div>
+    </div>
   </div>
 
   <div class="card">
     <h3>Configuration</h3>
     <div class="cfg-grid">
-      <div><label>WiGLE Basic Token</label><input id="wigleBasicToken" placeholder="Encoded token"></div>
+      <div><label>WiGLE Basic Token</label><input id="wigleBasicToken" placeholder="Encoded token from wigle.net"></div>
+      <div><label>WDGoWars API Key</label><input id="wdgwarsApiKey" placeholder="Key from wdgwars.pl/profile"></div>
       <div><label>GPS Baud</label><input id="gpsBaud" type="number" value="9600"></div>
       <div><label>Home SSID</label><input id="homeSsid"></div>
       <div><label>Home PSK</label><input id="homePsk" type="password"></div>
@@ -96,9 +105,14 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
       <div><label>Wardriver PSK</label><input id="wardriverPsk" type="password"></div>
       <div><label>Scan Mode</label><select id="scanMode"><option value="aggressive">Aggressive</option><option value="powersaving">Power Saving</option></select></div>
       <div><label>Speed Units</label><select id="speedUnits"><option value="kmh">km/h</option><option value="mph">mph</option></select></div>
+      <div><label>Max Boot Uploads (-1=all, 0=off)</label><input id="maxBootUploads" type="number" value="25" min="-1"></div>
     </div>
-    <div class="mt-md" style="max-width:180px"><button class="btn-primary" onclick="saveCfg()">Save Config</button></div>
-    <p style="margin-top:10px;font-size:12px;color:var(--muted)">Stored at <code>/wardriver.cfg</code>. Reboot to apply WiFi/GPS changes.</p>
+    <div class="row mt-md">
+      <button class="btn-primary" onclick="saveCfg()">Save Config</button>
+      <button onclick="saveAndReboot()" title="Save and restart device">Save &amp; Reboot</button>
+    </div>
+    <p style="margin-top:10px;font-size:12px;color:var(--muted)">Stored at <code>/wardriver.cfg</code>. WiFi/GPS changes need a reboot.<br>
+    <strong>Max Boot Uploads:</strong> <code>-1</code>=all &bull; <code>0</code>=disabled &bull; <code>1+</code>=capped. Upload All buttons above are always unlimited.</p>
   </div>
 
   <div class="card">
@@ -106,13 +120,23 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
     <div id="files" style="font-size:13px">Loading&hellip;</div>
   </div>
 
+<!-- Reboot overlay -->
+<div id="rebootOverlay" style="display:none;position:fixed;inset:0;background:rgba(10,14,19,.97);z-index:9999;flex-direction:column;align-items:center;justify-content:center;text-align:center;gap:12px;padding:24px">
+  <div style="font-size:40px">&#x1f437;</div>
+  <h2 style="margin:0;color:#e2eaf4">Rebooting...</h2>
+  <p id="rebootMsg" style="color:#8899ab;margin:0">Config saved &mdash; device is restarting.</p>
+  <p id="rebootCountdown" style="font-size:36px;font-weight:700;color:#2dd4bf;margin:0"></p>
+  <p style="color:#8899ab;font-size:12px">Reconnect and refresh once the device comes back online.</p>
+</div>
+
 <script>
 function $(id){return document.getElementById(id)}
 function setPill(id,text,cls){const el=$(id);if(!el)return;el.classList.remove('ok','bad','warn');if(cls)el.classList.add(cls);const dot=el.querySelector('.dot');el.textContent='';if(dot)el.appendChild(dot);el.appendChild(document.createTextNode(' '+text))}
 function setText(id,val){const el=$(id);if(el)el.textContent=(val===undefined||val===null||val==='')?'\u2014':String(val)}
 function setWigleMsg(t,cls){const el=$('wigleMsg');el.textContent=t;el.className=cls||'muted'}
 function formatBytes(b){if(b<1024)return b+' B';if(b<1048576)return(b/1024).toFixed(1)+' KB';return(b/1048576).toFixed(1)+' MB'}
-const maskedKeys=new Set(['wigleBasicToken','homePsk']);
+const maskedKeys=new Set(['homePsk']);
+function setWdgwarsMsg(t,cls){const el=$('wdgwarsMsg');el.textContent=t;el.className=cls||'muted'}
 
 async function loadStatus(){try{
   const r=await fetch('/status.json');const j=await r.json();
@@ -127,7 +151,7 @@ async function loadStatus(){try{
   setText('vApSeen',j.apClientsSeen?'Yes':'No');
   const lu=j.uploadLastResult?j.uploadLastResult+' (HTTP '+(j.wigleLastHttpCode||'\u2014')+')':'\u2014';
   setText('vLastUpload',lu);
-  for(const k of ['gpsBaud','homeSsid','wardriverSsid','wardriverPsk','scanMode','speedUnits']){
+  for(const k of ['wigleBasicToken','wdgwarsApiKey','gpsBaud','homeSsid','wardriverSsid','wardriverPsk','scanMode','speedUnits','maxBootUploads']){
     if(j.config&&(k in j.config)){const v=String(j.config[k]);if(maskedKeys.has(k)&&(v===''||v==='(set)'))continue;const el=$(k);if(el)el.value=v}}
 }catch(e){console.error(e)}}
 
@@ -148,15 +172,28 @@ async function loadFiles(){try{
 async function doStart(){await fetch('/start',{method:'POST'});await loadStatus()}
 async function doStop(){await fetch('/stop',{method:'POST'});await loadStatus()}
 async function delFile(name){if(!confirm('Delete '+name+'?'))return;await fetch('/delete?name='+encodeURIComponent(name),{method:'POST'});loadFiles()}
-async function saveCfg(){
-  const keys=['wigleBasicToken','gpsBaud','homeSsid','homePsk','wardriverSsid','wardriverPsk','scanMode','speedUnits'];
+
+async function doSave(){
+  const keys=['wigleBasicToken','wdgwarsApiKey','gpsBaud','homeSsid','homePsk','wardriverSsid','wardriverPsk','scanMode','speedUnits','maxBootUploads'];
   let body='# Saved from Web UI\n';
   for(const k of keys){const el=$(k);const v=el?(el.value??''):'';if(maskedKeys.has(k)&&v==='')continue;body+=k+'='+String(v).replace(/\r?\n/g,' ')+'\n'}
-  await fetch('/saveConfig',{method:'POST',headers:{'Content-Type':'text/plain'},body});await loadStatus();alert('Saved. Reboot to apply.')}
+  await fetch('/saveConfig',{method:'POST',headers:{'Content-Type':'text/plain'},body});
+  await loadStatus();
+}
+async function saveCfg(){try{await doSave();alert('Config saved. Reboot to apply WiFi/GPS changes.')}catch(e){alert('Save failed: '+e)}}
+async function saveAndReboot(){
+  try{await doSave();}catch(e){alert('Save failed: '+e);return;}
+  const ov=$('rebootOverlay');ov.style.display='flex';
+  try{await fetch('/reboot',{method:'POST'});}catch(e){}
+  let t=12;$('rebootCountdown').textContent=t+'s';
+  const iv=setInterval(()=>{t--;$('rebootCountdown').textContent=t>0?t+'s':'';if(t<=0){clearInterval(iv);$('rebootMsg').textContent='Device rebooted. Reconnect and refresh.';setTimeout(()=>location.reload(),2000);}},1000);
+}
 async function wigleTest(){setWigleMsg('Testing...');try{const r=await fetch('/wigle/test',{method:'POST'});const j=await r.json().catch(()=>({ok:false,message:'Bad response'}));setWigleMsg(j.message||(j.ok?'Valid':'Invalid'),j.ok?'ok-text':'bad-text')}catch(e){setWigleMsg('Failed','bad-text')}await loadStatus()}
 async function wigleUploadAll(){setWigleMsg('Uploading...');try{const r=await fetch('/wigle/uploadAll',{method:'POST'});const j=await r.json().catch(()=>null);if(j){setWigleMsg(j.message||(j.ok?j.uploaded+' uploaded':'Failed'),j.ok?'ok-text':'bad-text')}}catch(e){setWigleMsg('Failed','bad-text')}await loadFiles();await loadStatus()}
-async function wigleUploadOne(name){setWigleMsg('Uploading...');try{const r=await fetch('/wigle/upload?name='+encodeURIComponent(name),{method:'POST'});const j=await r.json().catch(()=>null);if(j)setWigleMsg(j.message||(j.ok?'OK':'Failed'),j.ok?'ok-text':'bad-text')}catch(e){setWigleMsg('Failed','bad-text')}await loadFiles();await loadStatus()}
-async function pollUpload(){try{const r=await fetch('/status.json');const j=await r.json();const up=!!j.uploading;const done=j.uploadDoneFiles||0;const total=j.uploadTotalFiles||0;const pct=total>0?Math.round((done/total)*100):0;const bar=$('wigleBar');bar.style.width=pct+'%';bar.classList.toggle('active',up);if(up)setWigleMsg('Uploading '+done+'/'+total+' ('+pct+'%)')}catch(e){}}
+async function wigleUploadOne(name){setWigleMsg('Uploading '+name+'...');try{const r=await fetch('/wigle/upload?name='+encodeURIComponent(name),{method:'POST'});const j=await r.json().catch(()=>null);if(j)setWigleMsg(j.message||(j.ok?'OK':'Failed'),j.ok?'ok-text':'bad-text')}catch(e){setWigleMsg('Failed','bad-text')}await loadFiles();await loadStatus()}
+async function wdgwarsTest(){setWdgwarsMsg('Testing...');try{const r=await fetch('/wdgwars/test',{method:'POST'});const j=await r.json().catch(()=>({ok:false,message:'Bad response'}));setWdgwarsMsg(j.message||(j.ok?'Key valid':'Key invalid'),j.ok?'ok-text':'bad-text')}catch(e){setWdgwarsMsg('Failed','bad-text')}}
+async function wdgwarsUploadAll(){setWdgwarsMsg('Uploading...');try{const r=await fetch('/wdgwars/uploadAll',{method:'POST'});const j=await r.json().catch(()=>null);if(j){setWdgwarsMsg(j.message||(j.ok?j.uploaded+' uploaded':'Failed'),j.ok?'ok-text':'bad-text')}}catch(e){setWdgwarsMsg('Failed','bad-text')}await loadFiles();}
+async function pollUpload(){try{const r=await fetch('/status.json');const j=await r.json();const up=!!j.uploading;const done=j.uploadDoneFiles||0;const total=j.uploadTotalFiles||0;const pct=total>0?Math.round((done/total)*100):0;const bar=$('wigleBar');bar.style.width=pct+'%';bar.classList.toggle('active',up);if(up){const fail=j.uploadFailedFiles||0;const failStr=fail>0?' F:'+fail:'';setWigleMsg('Uploading '+done+'/'+total+' ('+pct+'%)'+failStr)}}catch(e){}}
 setInterval(pollUpload,1500);loadStatus();loadFiles();
 </script>
 </body>

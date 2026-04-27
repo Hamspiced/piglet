@@ -370,30 +370,43 @@ void setup() {
 
   lastStaStatus = WiFi.status();
 
-  // IMPORTANT: Start web server AFTER WiGLE upload to avoid resource conflicts
-  // WiGLE upload happens first, then web server starts
-  if (staOk && sdOk && cfg.wigleBasicToken.length() > 0) {
-    Serial.println("[WiGLE] STA connected and token set.");
-    Serial.printf("[HEAP] Free: %d bytes\n", ESP.getFreeHeap());
-    
-    // Upload CSVs with limit from config
-    if (cfg.maxBootUploads > 0) {
-      Serial.printf("[WiGLE] Auto-uploading CSVs (max %d)...\n", cfg.maxBootUploads);
-      uint32_t uploaded = uploadAllCsvsToWigle(cfg.maxBootUploads);
-      Serial.printf("[WiGLE] Uploaded %d files\n", uploaded);
-      
-      // Load upload history after uploads complete
-      if (uploaded > 0) {
-        Serial.println("[WiGLE] Loading upload history...");
-        delay(2000);  // Brief delay to let WiGLE process uploads
-        wigleLoadHistory();
-        Serial.printf("[WiGLE] History loaded (%d files)\n", wigleHistoryCount);
+  // Boot upload: WDGoWars first (if key set), then WiGLE (if token set),
+  // then move files. Requires STA connection and SD card.
+  {
+    bool hasWigle = cfg.wigleBasicToken.length() > 0;
+    bool hasWdg   = cfg.wdgwarsApiKey.length()   > 0;
+
+    if (staOk && sdOk && (hasWigle || hasWdg)) {
+      Serial.print("[UPLOAD] STA connected. Services: ");
+      if (hasWdg)   Serial.print("WDGoWars ");
+      if (hasWigle) Serial.print("WiGLE ");
+      Serial.println();
+      Serial.printf("[HEAP] Free: %d bytes\n", ESP.getFreeHeap());
+
+      if (cfg.maxBootUploads != 0) {
+        // -1 = no limit, positive = capped; pass directly (uploadAllCsvsToWigle treats -1 as unlimited)
+        int limit = cfg.maxBootUploads;  // -1 or positive
+        if (limit == -1)
+          Serial.println("[UPLOAD] Auto-uploading ALL CSVs (no limit)...");
+        else
+          Serial.printf("[UPLOAD] Auto-uploading CSVs (max %d)...\n", limit);
+
+        uint32_t uploaded = uploadAllCsvsToWigle(limit);
+        Serial.printf("[UPLOAD] Done: %d files moved\n", uploaded);
+
+        // Reload WiGLE history if WiGLE was active and uploads occurred
+        if (uploaded > 0 && hasWigle) {
+          Serial.println("[WiGLE] Loading upload history...");
+          delay(2000);
+          wigleLoadHistory();
+          Serial.printf("[WiGLE] History loaded (%d files)\n", wigleHistoryCount);
+        }
+      } else {
+        Serial.println("[UPLOAD] Auto-upload disabled (maxBootUploads=0). Use web UI.");
       }
     } else {
-      Serial.println("[WiGLE] Auto-upload disabled (maxBootUploads=0). Use web UI.");
+      Serial.println("[UPLOAD] Upload not attempted (STA/SD not ready or no tokens set).");
     }
-  } else {
-    Serial.println("[WiGLE] Upload not attempted (STA/token/SD not ready).");
   }
 
   // Now start web server after WiGLE operations are complete

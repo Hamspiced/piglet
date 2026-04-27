@@ -43,6 +43,8 @@ uint32_t uploadTotalFiles = 0;
 uint32_t uploadDoneFiles  = 0;
 String   uploadCurrentFile = "";
 String   uploadLastResult  = "";
+String   uploadTargetName  = "";
+uint32_t uploadFailedFiles = 0;
 int      wigleTokenStatus  = 0;
 int      wigleLastHttpCode = 0;
 
