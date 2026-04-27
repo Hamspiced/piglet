@@ -185,29 +185,96 @@ Piglet includes custom PCB designs for compact, production-ready builds. KiCad p
 **Assembly Note:** When stacking modules, apply **Kapton tape** between components to prevent electrical shorts. Pay special attention to exposed pins and solder joints that may contact adjacent modules.
 
 
-## Configuration File
+## First Time Run Initialization
 
-Default Config below. 
+The Wardriver functions using a config file located on the root of a FAT32-formatted SD card. On first boot the device will start its own access point (`Piglet-WARDRIVE` / `wardrive1234`) so you can connect and fill in your settings via the web interface — or you can place the config file on the SD card manually before powering on.
 
-Location: /wardriver.cfg on SD card
+**Location:** `/wardriver.cfg` on the SD card root
 
-XIAO Wardriver config (key=value)
+A sample config file is included in `Arduino Files/Piglet/wardriver.cfg`. The full default config with all available keys is shown below:
 
-wigleBasicToken="Encoded for Use Wigle Api Token"
+```ini
+# ============================================================
+# Piglet Wardriver Configuration
+# Format: key=value
+# Lines starting with # are comments and ignored.
+# ============================================================
 
-homeSsid=YourSSID
+# ------------------------------------------------------------
+# WiGLE Upload
+# ------------------------------------------------------------
+# Use only the "Encoded for Use" token from wigle.net/account
+# Leave empty to disable WiGLE uploads.
 
-homePsk=YourPSK
+wigleBasicToken=EnterWigleTokenHere
 
-wardriverSsid=WarHam
+# ------------------------------------------------------------
+# WDGoWars
+# ------------------------------------------------------------
+# Get your API key at: https://wdgwars.pl/profile/
+# Leave empty to disable WDGoWars uploads.
 
+wdgwarsApiKey=EnterWDGoWarsAPIKeyHere
+
+# ------------------------------------------------------------
+# Max Automatic Uploads at Boot
+# ------------------------------------------------------------
+# -1 = Upload ALL pending files every boot
+#  0 = Disabled — no auto-upload at boot (use web UI manually)
+# 1+ = Upload up to N files per boot
+
+maxBootUploads=-1
+
+# ------------------------------------------------------------
+# Home Wi-Fi (STA mode)
+# ------------------------------------------------------------
+# If provided, device connects on boot.
+# If connection fails, falls back to SoftAP for 60 seconds.
+
+homeSsid=EnterWifiHere
+homePsk=EnterWifiPasswordHere
+
+# ------------------------------------------------------------
+# Wardriver Access Point (SoftAP fallback)
+# ------------------------------------------------------------
+# SSID and password for the temporary config AP.
+# Password must be 8+ characters or AP becomes open.
+
+wardriverSsid=Piglet-WARDRIVE
 wardriverPsk=wardrive1234
+
+# ------------------------------------------------------------
+# GPS Settings
+# ------------------------------------------------------------
+# UART baud rate for the GPS module.
+# Common values: 9600, 38400, 115200
 
 gpsBaud=9600
 
+# ------------------------------------------------------------
+# Wi-Fi Scan Mode
+# ------------------------------------------------------------
+# aggressive  — scans every ~4.5 seconds (faster, more power)
+# powersaving — scans every ~12 seconds (slower, less power)
+
 scanMode=aggressive
 
-board=auto
+# ------------------------------------------------------------
+# Speed Units (display only)
+# ------------------------------------------------------------
+# kmh = kilometers per hour
+# mph = miles per hour
+
+speedUnits=mph
+
+# ------------------------------------------------------------
+# Battery Test
+# ------------------------------------------------------------
+# true = logs elapsed time on battery to /battery_test.csv
+# false = disabled
+
+batteryTest=false
+```
 
 
 ## Button Functions
