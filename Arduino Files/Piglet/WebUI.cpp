@@ -328,10 +328,12 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
       <div>
         <label>WiGLE Basic Token</label>
         <input id="wigleBasicToken" placeholder="Enter 'Encoded for use' token from wigle.net/account">
+        <a href="https://wigle.net/account" target="_blank" rel="noopener" style="font-size:12px;margin-top:5px;display:inline-block">&rarr; Get your API Key here</a>
       </div>
       <div>
         <label>WDGoWars API Key</label>
         <input id="wdgwarsApiKey" placeholder="API key from wdgwars.pl/profile (leave empty to disable)">
+        <a href="https://wdgwars.pl/profile/" target="_blank" rel="noopener" style="font-size:12px;margin-top:5px;display:inline-block">&rarr; Get your API Key here</a>
       </div>
       <div><label>GPS Baud Rate</label><input id="gpsBaud" type="number" value="9600"></div>
       <div><label>Home SSID</label><input id="homeSsid" placeholder="Your home Wi-Fi"></div>

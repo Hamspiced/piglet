@@ -96,8 +96,8 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
   <div class="card">
     <h3>Configuration</h3>
     <div class="cfg-grid">
-      <div><label>WiGLE Basic Token</label><input id="wigleBasicToken" placeholder="Encoded token from wigle.net"></div>
-      <div><label>WDGoWars API Key</label><input id="wdgwarsApiKey" placeholder="Key from wdgwars.pl/profile"></div>
+      <div><label>WiGLE Basic Token</label><input id="wigleBasicToken" placeholder="Encoded token from wigle.net"><a href="https://wigle.net/account" target="_blank" rel="noopener" style="font-size:11px;margin-top:4px;display:inline-block;color:#2dd4bf">&rarr; Get your API Key here</a></div>
+      <div><label>WDGoWars API Key</label><input id="wdgwarsApiKey" placeholder="Key from wdgwars.pl/profile"><a href="https://wdgwars.pl/profile/" target="_blank" rel="noopener" style="font-size:11px;margin-top:4px;display:inline-block;color:#2dd4bf">&rarr; Get your API Key here</a></div>
       <div><label>GPS Baud</label><input id="gpsBaud" type="number" value="9600"></div>
       <div><label>Home SSID</label><input id="homeSsid"></div>
       <div><label>Home PSK</label><input id="homePsk" type="password"></div>

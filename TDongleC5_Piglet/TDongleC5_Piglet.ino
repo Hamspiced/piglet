@@ -495,6 +495,10 @@ static void appendWigleRow(const String& mac, const String& ssid, const String& 
   }
 }
 
+// Forward declarations needed by WDGoWars and WiGLE batch functions
+static void tftWigleUploadScreen(uint32_t done, uint32_t total, const String& filename);
+static void forceStatusFullRedraw();
+
 // ---- WDGoWars API key test — GET /api/me ----
 static bool wdgwarsTestKey() {
   uploadLastResult = "";
@@ -767,11 +771,7 @@ static bool uploadFileToWigle(const String& path) {
   return false;
 }
 
-// Forward declarations for TFT
-static void tftWigleUploadScreen(uint32_t done, uint32_t total, const String& filename);
-static void forceStatusFullRedraw();
-
-// uploadAllCsvsToWigle: maxFiles=-1=all, 0=disabled(shouldn't be called), 1+=capped
+// uploadAllCsvsToWigle:
 static uint32_t uploadAllCsvsToWigle(int maxFiles = -1) {
   if (!sdOk) { uploadLastResult = "SD not OK"; return 0; }
 
