@@ -1961,6 +1961,34 @@ static void handleWdgwarsUploadAll() {
   server.send(200, "application/json", out);
 }
 
+static void handleCleanup() {
+  if (!sdOk) { server.send(500, "text/plain", "SD not available"); return; }
+  // Scan /logs and delete header-only CSV files
+  if (SD.exists("/logs")) {
+    File root = SD.open("/logs");
+    std::vector<String> toDelete;
+    if (root) {
+      File f = root.openNextFile();
+      while (f) {
+        String path = normalizeSdPath("/logs", f.name());
+        bool isCsv     = path.endsWith(".csv");
+        bool isCurrent = (currentCsvPath.length() && path == currentCsvPath);
+        f.close();
+        if (isCsv && !isCurrent) toDelete.push_back(path);
+        f = root.openNextFile();
+      }
+      root.close();
+    }
+    for (const String& path : toDelete) {
+      if (!csvHasDataRows(path)) {
+        Serial.printf("[CLEANUP] Deleting empty CSV: %s\n", pathBasename(path).c_str());
+        SD.remove(path);
+      }
+    }
+  }
+  server.send(200, "text/plain", "OK");
+}
+
 static void handleReboot() {
   closeLogFile();                       // flush active CSV log cleanly
   server.send(200, "text/plain", "OK");
@@ -2020,6 +2048,7 @@ static void startWebServer() {
   server.on("/wdgwars/test",    HTTP_POST, handleWdgwarsTest);
   server.on("/wdgwars/uploadAll",HTTP_POST, handleWdgwarsUploadAll);
   server.on("/reboot",          HTTP_POST, handleReboot);
+  server.on("/cleanup",         HTTP_POST, handleCleanup);
   server.begin();
   Serial.println("[WEB] Server started");
 }
@@ -2297,6 +2326,27 @@ void setup() {
     Serial.print("[WEB] STA IP: "); Serial.println(WiFi.localIP());
   } else {
     Serial.print("[WEB] AP IP: "); Serial.println(WiFi.softAPIP());
+  }
+
+  // Purge header-only CSVs before scanning or uploading
+  if (sdOk) {
+    Serial.println("[SD] Cleaning up empty CSVs...");
+    // inline cleanup for T-Dongle (no shared WigleUpload module)
+    if (SD.exists("/logs")) {
+      File root = SD.open("/logs");
+      std::vector<String> toDelete;
+      if (root) {
+        File f = root.openNextFile();
+        while (f) {
+          String path = normalizeSdPath("/logs", f.name());
+          if (path.endsWith(".csv")) toDelete.push_back(path);
+          f.close(); f = root.openNextFile();
+        }
+        root.close();
+      }
+      for (const String& path : toDelete)
+        if (!csvHasDataRows(path)) { Serial.printf("[CLEANUP] Deleting: %s\n", pathBasename(path).c_str()); SD.remove(path); }
+    }
   }
 
   // Boot upload: WDGoWars first (if key set), then WiGLE (if token set).

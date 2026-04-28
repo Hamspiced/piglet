@@ -171,7 +171,19 @@ async function loadFiles(){try{
 
 async function doStart(){await fetch('/start',{method:'POST'});await loadStatus()}
 async function doStop(){await fetch('/stop',{method:'POST'});await loadStatus()}
-async function delFile(name){if(!confirm('Delete '+name+'?'))return;await fetch('/delete?name='+encodeURIComponent(name),{method:'POST'});loadFiles()}
+async function delFile(name){
+  if(!confirm('Delete '+name+'?'))return;
+  const el=$('files');
+  el.innerHTML='<span style="color:#8899ab">Deleting...</span>';
+  try{
+    const r=await fetch('/delete?name='+encodeURIComponent(name),{method:'POST'});
+    if(!r.ok){el.innerHTML='<span style="color:#fb7185">Delete failed ('+r.status+')</span>';return;}
+  }catch(e){
+    el.innerHTML='<span style="color:#fb7185">Delete error: '+e+'</span>';
+    return;
+  }
+  await loadFiles();
+}
 
 async function doSave(){
   const keys=['wigleBasicToken','wdgwarsApiKey','gpsBaud','homeSsid','homePsk','wardriverSsid','wardriverPsk','scanMode','speedUnits','maxBootUploads'];

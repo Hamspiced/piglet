@@ -422,6 +422,12 @@ void setup() {
     Serial.println("[WEB] AP UI: http://192.168.4.1/");
   }
 
+  // Purge any header-only CSVs left over from previous sessions
+  if (sdOk) {
+    Serial.println("[SD] Cleaning up empty CSVs...");
+    deleteEmptyCsvs();
+  }
+
   // Create a fresh log for this run
   if (sdOk) {
     bool lfOk = openLogFile();

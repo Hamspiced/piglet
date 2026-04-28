@@ -522,6 +522,34 @@ bool uploadFileToWdgwars(const String& path) {
   return false;
 }
 
+// ---- Standalone empty-CSV cleanup ----
+// Scans /logs and deletes any CSV that has no data rows (header-only).
+// Called at boot and available via /cleanup endpoint.
+void deleteEmptyCsvs() {
+  if (!sdOk) return;
+  File root = SD.open("/logs");
+  if (!root) return;
+
+  std::vector<String> toDelete;
+  File f = root.openNextFile();
+  while (f) {
+    String path = normalizeSdPath("/logs", f.name());
+    bool isCsv    = path.endsWith(".csv");
+    bool isCurrent = (currentCsvPath.length() && path == currentCsvPath);
+    f.close();
+    if (isCsv && !isCurrent) toDelete.push_back(path);
+    f = root.openNextFile();
+  }
+  root.close();
+
+  for (const String& path : toDelete) {
+    if (!csvHasDataRows(path)) {
+      Serial.printf("[CLEANUP] Empty CSV, deleting: %s\n", pathBasename(path).c_str());
+      SD.remove(path);
+    }
+  }
+}
+
 // ---- Empty-file guard ----
 // Returns true if the CSV contains at least one data row beyond the two
 // mandatory WiGLE header lines.  Opens, reads two lines, checks for more.
@@ -790,22 +818,25 @@ void wigleLoadHistory() {
   
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("[WiGLE] No STA WiFi - skipping history load");
+    wigleHistoryLastLoadMs = millis();  // back off; don't retry every request
     return;
   }
   
   if (cfg.wigleBasicToken.length() < 8) {
     Serial.println("[WiGLE] No token - skipping history load");
+    wigleHistoryLastLoadMs = millis();
     return;
   }
 
   Serial.println("[WiGLE] History: Creating TLS client...");
   WiFiClientSecure client;
   client.setInsecure();
-  client.setTimeout(15000);  // Reduced from 20s to 15s
+  client.setTimeout(15000);
 
   Serial.println("[WiGLE] History: Connecting to api.wigle.net:443...");
   if (!client.connect(WIGLE_HOST, WIGLE_PORT)) {
     Serial.println("[WiGLE] History: TLS connect failed");
+    wigleHistoryLastLoadMs = millis();  // back off; don't retry every request
     return;
   }
   

@@ -528,8 +528,17 @@ async function doStop(){
 
 async function delFile(name){
   if(!confirm('Delete '+name+'?'))return;
-  await fetch('/delete?name='+encodeURIComponent(name),{method:'POST'});
-  loadFiles();
+  const el=$('files');
+  const prev=el.innerHTML;
+  el.innerHTML='<span style="color:var(--muted)">Deleting...</span>';
+  try{
+    const r=await fetch('/delete?name='+encodeURIComponent(name),{method:'POST'});
+    if(!r.ok) el.innerHTML='<span style="color:var(--bad)">Delete failed ('+r.status+')</span>';
+  }catch(e){
+    el.innerHTML='<span style="color:var(--bad)">Delete error: '+e+'</span>';
+    return;
+  }
+  await loadFiles();
 }
 
 /* ---- Shared save logic used by both Save and Save+Reboot ---- */
@@ -761,23 +770,9 @@ static void addDirFiles(JsonArray arr, const char* dir) {
 }
 
 static void handleFiles() {
-  // History is loaded after boot uploads, but refresh if cache expired (24h)
-  // Only refresh when connected to home network (STA), not in AP mode
-  wifi_mode_t mode = WiFi.getMode();
-  bool isSTA = (mode == WIFI_STA || mode == WIFI_AP_STA);
-  bool staConnected = (WiFi.status() == WL_CONNECTED);
-  
-  // Check if history cache is stale (older than 24h)
-  uint32_t now = millis();
-  const uint32_t CACHE_DURATION_MS = 86400000;  // 24 hours
-  bool cacheExpired = (wigleHistoryLastLoadMs == 0 || (now - wigleHistoryLastLoadMs) > CACHE_DURATION_MS);
-  
-  if (isSTA && staConnected && cfg.wigleBasicToken.length() > 0 && !apWindowActive && cacheExpired) {
-    Serial.println("[WEB] Refreshing WiGLE history (cache expired)...");
-    wigleLoadHistory();
-  }
-  
-  // Increased from 4096 to handle upload stats for many files
+  // NOTE: wigleLoadHistory() is NOT called here — it is a blocking 15-second
+  // HTTPS call that would stall every file-list and delete request.
+  // History is loaded after successful uploads (boot or web UI buttons).
   StaticJsonDocument<8192> doc;
   doc["ok"] = sdOk;
 
@@ -881,6 +876,12 @@ static void handleSaveConfig() {
   Serial.println("[CFG] Updated config from Web UI (in-RAM). Saving to SD...");
   bool ok = saveConfigToSD();
   server.send(ok ? 200 : 500, "text/plain", ok ? "OK" : "FAIL");
+}
+
+static void handleCleanup() {
+  if (!sdOk) { server.send(500, "text/plain", "SD not available"); return; }
+  deleteEmptyCsvs();
+  server.send(200, "text/plain", "OK");
 }
 
 static void handleReboot() {
@@ -1025,6 +1026,7 @@ void startWebServer() {
   server.on("/saveConfig", HTTP_POST, handleSaveConfig);
 
   server.on("/reboot",          HTTP_POST, handleReboot);
+  server.on("/cleanup",         HTTP_POST, handleCleanup);
   server.on("/wigle/test",      HTTP_POST, handleWigleTest);
   server.on("/wigle/uploadAll", HTTP_POST, handleWigleUploadAll);
   server.on("/wigle/upload",    HTTP_POST, handleWigleUploadOne);
