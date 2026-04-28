@@ -394,13 +394,6 @@ void setup() {
         uint32_t uploaded = uploadAllCsvsToWigle(limit);
         Serial.printf("[UPLOAD] Done: %d files moved\n", uploaded);
 
-        // Reload WiGLE history if WiGLE was active and uploads occurred
-        if (uploaded > 0 && hasWigle) {
-          Serial.println("[WiGLE] Loading upload history...");
-          delay(2000);
-          wigleLoadHistory();
-          Serial.printf("[WiGLE] History loaded (%d files)\n", wigleHistoryCount);
-        }
       } else {
         Serial.println("[UPLOAD] Auto-upload disabled (maxBootUploads=0). Use web UI.");
       }

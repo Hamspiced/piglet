@@ -491,22 +491,11 @@ async function loadFiles(){
         ?'<span class="file-badge uploaded">uploaded</span>'
         :'<span class="file-badge log">log</span>';
       
-      // Add upload stats if available
-      let statsText='';
-      if(isUploaded&&f.discoveredGps!==undefined){
-        if(f.processing){
-          statsText='<span class="file-stats">Processing...</span>';
-        }else{
-          statsText='<span class="file-stats">'+f.discoveredGps+' new, '+f.totalGps+' total</span>';
-        }
-      }
-      
       const uploadBtn=isUploaded?''
         :'<button class="btn-sm" onclick="wigleUploadOne(\''+f.name.replace(/'/g,"\\'")+'\')">Upload</button>';
       return '<div class="file-row">'
         +'<a href="/download?name='+encodeURIComponent(f.name)+'">'+f.name+'</a> '
         +badge
-        +statsText
         +'<span class="file-size">'+formatBytes(f.size)+'</span>'
         +'<span class="file-actions">'
         +uploadBtn
@@ -747,21 +736,6 @@ static void addDirFiles(JsonArray arr, const char* dir) {
     o["size"] = (uint32_t)f.size();
     o["uploaded"] = isUploaded;
 
-    // If uploaded, try to find stats in wigleHistory
-    if (isUploaded) {
-      String basename = pathBasename(fullPath);
-      uint32_t fsize = f.size();
-      
-      for (uint8_t i = 0; i < wigleHistoryCount; i++) {
-        if (wigleHistory[i].basename == basename && wigleHistory[i].fileSize == fsize) {
-          o["discoveredGps"] = wigleHistory[i].discoveredGps;
-          o["totalGps"] = wigleHistory[i].totalGps;
-          o["processing"] = wigleHistory[i].wait;
-          break;
-        }
-      }
-    }
-
     f.close();
     f = root.openNextFile();
   }
@@ -770,10 +744,7 @@ static void addDirFiles(JsonArray arr, const char* dir) {
 }
 
 static void handleFiles() {
-  // NOTE: wigleLoadHistory() is NOT called here — it is a blocking 15-second
-  // HTTPS call that would stall every file-list and delete request.
-  // History is loaded after successful uploads (boot or web UI buttons).
-  StaticJsonDocument<8192> doc;
+  StaticJsonDocument<4096> doc;
   doc["ok"] = sdOk;
 
   JsonArray arr = doc.createNestedArray("files");

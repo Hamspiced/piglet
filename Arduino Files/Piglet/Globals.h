@@ -63,20 +63,6 @@ extern uint32_t uploadFailedFiles;  // failed upload attempts in the current bat
 extern int      wigleTokenStatus;
 extern int      wigleLastHttpCode;
 
-// ---- WiGLE upload history tracking ----
-struct WigleFileStats {
-  String basename;        // Just filename without path
-  uint32_t fileSize;
-  uint32_t discoveredGps; // New networks
-  uint32_t totalGps;      // Total networks
-  bool wait;              // true if WiGLE is still processing
-};
-
-#define WIGLE_HISTORY_MAX 50
-extern WigleFileStats wigleHistory[WIGLE_HISTORY_MAX];
-extern uint8_t wigleHistoryCount;
-extern uint32_t wigleHistoryLastLoadMs;  // Timestamp of last successful load
-
 // ---- WiGLE constants ----
 extern const char* WIGLE_HOST;
 extern const uint16_t WIGLE_PORT;
