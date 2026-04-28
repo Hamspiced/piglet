@@ -522,6 +522,25 @@ bool uploadFileToWdgwars(const String& path) {
   return false;
 }
 
+// ---- Empty-file guard ----
+// Returns true if the CSV contains at least one data row beyond the two
+// mandatory WiGLE header lines.  Opens, reads two lines, checks for more.
+static bool csvHasDataRows(const String& path) {
+  File f = SD.open(path, FILE_READ);
+  if (!f) return false;
+
+  // Skip the two header lines
+  for (int i = 0; i < 2; i++) {
+    if (!f.available()) { f.close(); return false; }
+    f.readStringUntil('\n');
+  }
+
+  // If anything remains after the headers, there is at least one data row
+  bool hasData = f.available() > 0;
+  f.close();
+  return hasData;
+}
+
 // ---- Standalone empty-CSV cleanup ----
 // Scans /logs and deletes any CSV that has no data rows (header-only).
 // Called at boot and available via /cleanup endpoint.
@@ -548,25 +567,6 @@ void deleteEmptyCsvs() {
       SD.remove(path);
     }
   }
-}
-
-// ---- Empty-file guard ----
-// Returns true if the CSV contains at least one data row beyond the two
-// mandatory WiGLE header lines.  Opens, reads two lines, checks for more.
-static bool csvHasDataRows(const String& path) {
-  File f = SD.open(path, FILE_READ);
-  if (!f) return false;
-
-  // Skip the two header lines
-  for (int i = 0; i < 2; i++) {
-    if (!f.available()) { f.close(); return false; }
-    f.readStringUntil('\n');
-  }
-
-  // If anything remains after the headers, there is at least one data row
-  bool hasData = f.available() > 0;
-  f.close();
-  return hasData;
 }
 
 // ---- Batch upload ----
