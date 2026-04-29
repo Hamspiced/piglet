@@ -335,6 +335,10 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
         <input id="wdgwarsApiKey" placeholder="API key from wdgwars.pl/profile (leave empty to disable)">
         <a href="https://wdgwars.pl/profile/" target="_blank" rel="noopener" style="font-size:12px;margin-top:5px;display:inline-block">&rarr; Get your API Key here</a>
       </div>
+      <div>
+        <label>Device Name</label>
+        <input id="deviceName" placeholder="e.g. rover1 &mdash; identifies this device in WiGLE uploads (optional)">
+      </div>
       <div><label>GPS Baud Rate</label><input id="gpsBaud" type="number" value="9600"></div>
       <div><label>Home SSID</label><input id="homeSsid" placeholder="Your home Wi-Fi"></div>
       <div><label>Home PSK</label><input id="homePsk" type="password" placeholder="Password"></div>
@@ -466,7 +470,7 @@ async function loadStatus(){
     setText('vApSsid',j?.config?.wardriverSsid||'\u2014');
 
     // Fill config form — skip masked/secret values
-    for(const k of ['wigleBasicToken','wdgwarsApiKey','board','gpsBaud','homeSsid','wardriverSsid','wardriverPsk','scanMode','speedUnits','battPin','batteryTest','maxBootUploads']){
+    for(const k of ['wigleBasicToken','wdgwarsApiKey','deviceName','board','gpsBaud','homeSsid','wardriverSsid','wardriverPsk','scanMode','speedUnits','battPin','batteryTest','maxBootUploads']){
       if(j.config&&(k in j.config)){
         const v=String(j.config[k]);
         if(maskedKeys.has(k)&&(v===''||v==='(set)'))continue;
@@ -532,7 +536,7 @@ async function delFile(name){
 
 /* ---- Shared save logic used by both Save and Save+Reboot ---- */
 async function doSave(){
-  const keys=['board','wigleBasicToken','wdgwarsApiKey','gpsBaud','homeSsid','homePsk','wardriverSsid','wardriverPsk','scanMode','speedUnits','battPin','batteryTest','maxBootUploads'];
+  const keys=['board','wigleBasicToken','wdgwarsApiKey','deviceName','gpsBaud','homeSsid','homePsk','wardriverSsid','wardriverPsk','scanMode','speedUnits','battPin','batteryTest','maxBootUploads'];
   let body='# Saved from Web UI\n# key=value\n';
   for(const k of keys){
     const el=$(k);
@@ -708,6 +712,7 @@ static void handleStatus() {
   c["battPin"] = cfg.battPin;
   c["batteryTest"] = cfg.batteryTest;
   c["maxBootUploads"] = cfg.maxBootUploads;
+  c["deviceName"]     = cfg.deviceName;
 
   String output;
   serializeJson(doc, output);

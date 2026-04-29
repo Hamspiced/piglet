@@ -126,23 +126,44 @@ bool moveToUploaded(const String& srcPath) {
 
 // ---- Log file ----
 
+// Sanitise a user-provided device name for safe use in filenames.
+// Keeps alphanumerics, hyphens, underscores; replaces spaces with _;
+// strips everything else; truncates to 20 chars.
+static String sanitiseDeviceName(const String& raw) {
+  String s = raw;
+  s.replace(" ", "_");
+  for (int i = (int)s.length() - 1; i >= 0; i--) {
+    char c = s[i];
+    if (!isAlphaNumeric(c) && c != '_' && c != '-') s.remove(i, 1);
+  }
+  if (s.length() > 20) s = s.substring(0, 20);
+  return s;
+}
+
 static String newCsvFilename() {
   if (!SD.exists("/logs")) SD.mkdir("/logs");
+
+  // Build optional prefix:  "name_Piglet_"  or empty
+  String prefix = "";
+  if (cfg.deviceName.length() > 0) {
+    String safe = sanitiseDeviceName(cfg.deviceName);
+    if (safe.length() > 0) prefix = safe + "_Piglet_";
+  }
 
   // Make collisions extremely unlikely: millis + esp_random
   for (int tries = 0; tries < 25; tries++) {
     uint32_t r = (uint32_t)esp_random();
-    char buf[64];
-    snprintf(buf, sizeof(buf), "/logs/WiGLE_%lu_%08lX.csv",
-             (unsigned long)millis(), (unsigned long)r);
-
+    char buf[100];
+    snprintf(buf, sizeof(buf), "/logs/%sWiGLE_%lu_%08lX.csv",
+             prefix.c_str(), (unsigned long)millis(), (unsigned long)r);
     String p(buf);
     if (!SD.exists(p)) return p;
   }
 
   // last-resort fallback
-  char buf2[64];
-  snprintf(buf2, sizeof(buf2), "/logs/WiGLE_%lu.csv", (unsigned long)millis());
+  char buf2[100];
+  snprintf(buf2, sizeof(buf2), "/logs/%sWiGLE_%lu.csv",
+           prefix.c_str(), (unsigned long)millis());
   return String(buf2);
 }
 
@@ -164,7 +185,14 @@ bool openLogFile() {
     return false;
   }
 
-  logFile.println("WigleWifi-1.4,appRelease=1,model=Xiao-ESP32S3,release=1,device=Piglet-Wardriver");
+  // Build device field: Piglet-{name} if set, otherwise Piglet-Wardriver
+  String deviceField = "Piglet-Wardriver";
+  if (cfg.deviceName.length() > 0) {
+    String safe = sanitiseDeviceName(cfg.deviceName);
+    if (safe.length() > 0) deviceField = "Piglet-" + safe;
+  }
+  logFile.print("WigleWifi-1.4,appRelease=1,model=Xiao-ESP32S3,release=1,device=");
+  logFile.println(deviceField);
   logFile.println("MAC,SSID,AuthMode,FirstSeen,Channel,RSSI,CurrentLatitude,CurrentLongitude,AltitudeMeters,AccuracyMeters,Type");
   logFile.flush();
 

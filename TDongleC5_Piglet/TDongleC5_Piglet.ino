@@ -130,6 +130,8 @@ struct Config {
   String wdgwarsApiKey;
   // Boot auto-upload limit: -1=all, 0=disabled, 1+=capped
   int maxBootUploads   = 25;
+  // Optional device name shown in WiGLE header and filename
+  String deviceName;
 };
 
 Config cfg;
@@ -353,6 +355,7 @@ static void cfgAssignKV(const String& k, const String& v) {
   else if (k == "speedUnits") { String vv = v; vv.toLowerCase(); if (vv == "kmh" || vv == "mph") cfg.speedUnits = vv; }
   else if (k == "wdgwarsApiKey")   cfg.wdgwarsApiKey = v;
   else if (k == "maxBootUploads") { int n = v.toInt(); if (n >= -1) cfg.maxBootUploads = n; }
+  else if (k == "deviceName")      cfg.deviceName = v;
 }
 
 static bool saveConfigToSD() {
@@ -375,6 +378,8 @@ static bool saveConfigToSD() {
   f.print("wdgwarsApiKey=");   f.println(cfg.wdgwarsApiKey);
   f.println("# Boot auto-upload limit: -1=all, 0=disabled, 1+=capped");
   f.print("maxBootUploads=");  f.println(cfg.maxBootUploads);
+  f.println("# Device name: shown in WiGLE header and filename (optional)");
+  f.print("deviceName=");      f.println(cfg.deviceName);
 
   f.flush(); f.close();
   Serial.println("[CFG] Saved OK");
@@ -419,18 +424,35 @@ static String normalizeSdPath(const char* dir, const char* nameIn) {
   return d + "/" + n;
 }
 
+// Sanitise device name for filename/header use
+static String tdongleSanitiseName(const String& raw) {
+  String s = raw; s.replace(" ", "_");
+  for (int i = (int)s.length()-1; i >= 0; i--) {
+    char c = s[i];
+    if (!isAlphaNumeric(c) && c != '_' && c != '-') s.remove(i, 1);
+  }
+  if (s.length() > 20) s = s.substring(0, 20);
+  return s;
+}
+
 static String newCsvFilename() {
   digitalWrite(PINS.tft_cs, HIGH);
   if (!SD.exists("/logs")) SD.mkdir("/logs");
+  String prefix = "";
+  if (cfg.deviceName.length() > 0) {
+    String safe = tdongleSanitiseName(cfg.deviceName);
+    if (safe.length() > 0) prefix = safe + "_Piglet-TDongle_";
+  }
   for (int tries = 0; tries < 25; tries++) {
-    char buf[64];
-    snprintf(buf, sizeof(buf), "/logs/WiGLE_%lu_%08lX.csv",
-             (unsigned long)millis(), (unsigned long)(uint32_t)esp_random());
+    char buf[100];
+    snprintf(buf, sizeof(buf), "/logs/%sWiGLE_%lu_%08lX.csv",
+             prefix.c_str(), (unsigned long)millis(), (unsigned long)(uint32_t)esp_random());
     String p(buf);
     if (!SD.exists(p)) return p;
   }
-  char buf2[64];
-  snprintf(buf2, sizeof(buf2), "/logs/WiGLE_%lu.csv", (unsigned long)millis());
+  char buf2[100];
+  snprintf(buf2, sizeof(buf2), "/logs/%sWiGLE_%lu.csv",
+           prefix.c_str(), (unsigned long)millis());
   return String(buf2);
 }
 
@@ -452,7 +474,13 @@ static bool openLogFile() {
   logFile = SD.open(currentCsvPath, FILE_WRITE);
   if (!logFile) return false;
 
-  logFile.println("WigleWifi-1.4,appRelease=1,model=LilyGo-T-Dongle-C5,release=1,device=Piglet-Wardriver");
+  String deviceField = "Piglet-Wardriver";
+  if (cfg.deviceName.length() > 0) {
+    String safe = tdongleSanitiseName(cfg.deviceName);
+    if (safe.length() > 0) deviceField = "Piglet-TDongle-" + safe;
+  }
+  logFile.print("WigleWifi-1.4,appRelease=1,model=LilyGo-T-Dongle-C5,release=1,device=");
+  logFile.println(deviceField);
   logFile.println("MAC,SSID,AuthMode,FirstSeen,Channel,RSSI,CurrentLatitude,CurrentLongitude,AltitudeMeters,AccuracyMeters,Type");
   logFile.flush();
   return true;
@@ -1856,6 +1884,7 @@ static void handleStatus() {
   c["scanMode"] = cfg.scanMode;
   c["speedUnits"] = cfg.speedUnits;
   c["maxBootUploads"] = cfg.maxBootUploads;
+  c["deviceName"]     = cfg.deviceName;
 
   String out; serializeJson(doc, out);
   server.send(200, "application/json", out);

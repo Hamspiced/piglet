@@ -118,6 +118,7 @@ void cfgAssignKV(const String& k, const String& v) {
     if (n >= -1) cfg.maxBootUploads = n;  // -1=all, 0=disabled, 1+=limited
   }
   else if (k == "wdgwarsApiKey") cfg.wdgwarsApiKey = v;
+  else if (k == "deviceName")    cfg.deviceName = v;
 }
 
 // ---------------- Load / Save ----------------
@@ -263,6 +264,10 @@ bool saveConfigToSD() {
   f.println("");
   f.println("# WDGoWars API key from https://wdgwars.pl/profile (leave empty to disable)");
   f.print("wdgwarsApiKey="); f.println(cfg.wdgwarsApiKey);
+
+  f.println("# Device name — identifies this Piglet in WiGLE headers and filenames.");
+  f.println("# Alphanumeric + _ - only.  E.g.: rover1  backpack  car");
+  f.print("deviceName="); f.println(cfg.deviceName);
 
   f.flush();
   f.close();

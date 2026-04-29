@@ -98,6 +98,7 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
     <div class="cfg-grid">
       <div><label>WiGLE Basic Token</label><input id="wigleBasicToken" placeholder="Encoded token from wigle.net"><a href="https://wigle.net/account" target="_blank" rel="noopener" style="font-size:11px;margin-top:4px;display:inline-block;color:#2dd4bf">&rarr; Get your API Key here</a></div>
       <div><label>WDGoWars API Key</label><input id="wdgwarsApiKey" placeholder="Key from wdgwars.pl/profile"><a href="https://wdgwars.pl/profile/" target="_blank" rel="noopener" style="font-size:11px;margin-top:4px;display:inline-block;color:#2dd4bf">&rarr; Get your API Key here</a></div>
+      <div><label>Device Name</label><input id="deviceName" placeholder="e.g. rover1 (optional, used in filenames)"></div>
       <div><label>GPS Baud</label><input id="gpsBaud" type="number" value="9600"></div>
       <div><label>Home SSID</label><input id="homeSsid"></div>
       <div><label>Home PSK</label><input id="homePsk" type="password"></div>
@@ -151,7 +152,7 @@ async function loadStatus(){try{
   setText('vApSeen',j.apClientsSeen?'Yes':'No');
   const lu=j.uploadLastResult?j.uploadLastResult+' (HTTP '+(j.wigleLastHttpCode||'\u2014')+')':'\u2014';
   setText('vLastUpload',lu);
-  for(const k of ['wigleBasicToken','wdgwarsApiKey','gpsBaud','homeSsid','wardriverSsid','wardriverPsk','scanMode','speedUnits','maxBootUploads']){
+  for(const k of ['wigleBasicToken','wdgwarsApiKey','deviceName','gpsBaud','homeSsid','wardriverSsid','wardriverPsk','scanMode','speedUnits','maxBootUploads']){
     if(j.config&&(k in j.config)){const v=String(j.config[k]);if(maskedKeys.has(k)&&(v===''||v==='(set)'))continue;const el=$(k);if(el)el.value=v}}
 }catch(e){console.error(e)}}
 
@@ -186,7 +187,7 @@ async function delFile(name){
 }
 
 async function doSave(){
-  const keys=['wigleBasicToken','wdgwarsApiKey','gpsBaud','homeSsid','homePsk','wardriverSsid','wardriverPsk','scanMode','speedUnits','maxBootUploads'];
+  const keys=['wigleBasicToken','wdgwarsApiKey','deviceName','gpsBaud','homeSsid','homePsk','wardriverSsid','wardriverPsk','scanMode','speedUnits','maxBootUploads'];
   let body='# Saved from Web UI\n';
   for(const k of keys){const el=$(k);const v=el?(el.value??''):'';if(maskedKeys.has(k)&&v==='')continue;body+=k+'='+String(v).replace(/\r?\n/g,' ')+'\n'}
   await fetch('/saveConfig',{method:'POST',headers:{'Content-Type':'text/plain'},body});

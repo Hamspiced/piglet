@@ -26,6 +26,12 @@ struct Config {
   // If set, CSVs are uploaded to WDGoWars BEFORE WiGLE at every boot.
   // Leave empty to disable WDGoWars uploads.
   String wdgwarsApiKey;
+
+  // Optional device name — appended to WiGLE CSV header and filename so
+  // multiple Piglets uploading to the same account can be distinguished.
+  // E.g. deviceName=rover1  →  device=Piglet-rover1  /  rover1_Piglet_WiGLE_....csv
+  // Leave empty for default ("Piglet-Wardriver" / "WiGLE_....csv").
+  String deviceName;
 };
 
 const PinMap& detectPinsByChip();
