@@ -447,11 +447,15 @@ void loop() {
   // Web server
   server.handleClient();
 
-  // Track AP client presence and enforce 60s AP window
+  // Track AP client presence and enforce AP window. The window does NOT
+  // auto-extend on connect; the user must click "Stay" in the WebUI prompt
+  // to push it out to the 5 min budget.
   if (apWindowActive && WiFi.getMode() == WIFI_AP_STA) {
     if (WiFi.softAPgetStationNum() > 0) {
-      if (!apClientSeen) Serial.println("[WIFI] AP client connected");
-      apClientSeen = true;
+      if (!apClientSeen) {
+        Serial.println("[WIFI] AP client connected");
+        apClientSeen = true;
+      }
     }
   }
   stopAPIfAllowed();

@@ -189,6 +189,16 @@ Piglet includes custom PCB designs for compact, production-ready builds. KiCad p
 
 The Wardriver functions using a config file located on the root of a FAT32-formatted SD card. On first boot the device will start its own access point (`Piglet-WARDRIVE` / `wardrive1234`) so you can connect and fill in your settings via the web interface — or you can place the config file on the SD card manually before powering on.
 
+**AP Timer & Keep-Alive**
+
+The SoftAP runs for **60 seconds** by default. About **30 seconds before** that window expires, the WebUI shows a *"Stay in WebUI?"* prompt — clicking **Stay** extends the window to a **5 minute** rolling timer so you have room to actually use the WebUI. The same prompt re-appears 30 seconds before the 5 minute timer expires; clicking Stay again resets it.
+
+- **Stay** — extends (or re-extends) the window to 5 minutes.
+- **Start Scanning Now** — closes the AP immediately and begins wardriving.
+- **Ignored / browser closed** — timer runs out, AP closes, scanning starts.
+
+The OLED shows the live countdown (`AP: 192.168.4.1 60s` initially, `m:ss` once extended). Once your home Wi-Fi is configured, the device will connect to it on subsequent boots and the WebUI is reachable on the STA IP shown on the OLED — the AP only comes up if STA fails.
+
 **Location:** `/wardriver.cfg` on the SD card root
 
 A sample config file is included in `Arduino Files/Piglet/wardriver.cfg`. The full default config with all available keys is shown below:
@@ -229,7 +239,9 @@ maxBootUploads=-1
 # Home Wi-Fi (STA mode)
 # ------------------------------------------------------------
 # If provided, device connects on boot.
-# If connection fails, falls back to SoftAP for 60 seconds.
+# If connection fails, falls back to SoftAP for 60 seconds
+# (can be extended via the "Stay in WebUI?" prompt that appears
+# ~30 s before the timer expires).
 
 homeSsid=EnterWifiHere
 homePsk=EnterWifiPasswordHere

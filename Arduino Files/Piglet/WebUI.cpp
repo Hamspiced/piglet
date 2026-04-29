@@ -394,6 +394,18 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
     <div id="files" style="font-size:14px">Loading&hellip;</div>
   </div>
 
+<!-- AP keep-alive prompt (shown ~30 s before the extended AP window expires) -->
+<div id="apKeepAliveOverlay" style="display:none;position:fixed;inset:0;background:rgba(10,14,19,.92);z-index:9998;flex-direction:column;align-items:center;justify-content:center;text-align:center;gap:14px;padding:32px">
+  <div style="font-size:48px">&#x23f3;</div>
+  <h2 style="margin:0;font-size:22px">Stay in WebUI?</h2>
+  <p style="color:var(--muted);margin:0;font-size:15px;max-width:420px">The AP is about to close and the device will start scanning. Tap "Stay" to keep the WebUI open for another 5 minutes.</p>
+  <p id="apKeepAliveCountdown" style="font-size:44px;font-weight:700;color:var(--accent);margin:0">30s</p>
+  <div class="row gap-sm">
+    <button class="btn-primary" onclick="apKeepAliveYes()">Stay</button>
+    <button onclick="apKeepAliveNo()">Start Scanning Now</button>
+  </div>
+</div>
+
 <!-- Reboot overlay (hidden until saveAndReboot() is triggered) -->
 <div id="rebootOverlay" style="display:none;position:fixed;inset:0;background:rgba(10,14,19,.97);z-index:9999;flex-direction:column;align-items:center;justify-content:center;text-align:center;gap:14px;padding:32px">
   <div style="font-size:48px">&#x1f437;</div>
@@ -664,7 +676,59 @@ async function wigleUploadOne(name){
   await loadStatus();
 }
 
-/* ---- Upload progress poller ---- */
+/* ---- AP keep-alive modal ----
+   The firmware reports apActive / apRemainingMs / apExtendPromptLeadMs on
+   /status.json. When the AP is up and remaining time is at or below the lead
+   window, we show the modal. "Stay" hits /extend (resets the 5 min timer).
+   "Start Scanning Now" hits /start (force-closes the AP). */
+let apModalShown=false;
+let apModalDismissed=false;
+let apModalIv=null;
+
+function hideApKeepAlive(){
+  const ov=$('apKeepAliveOverlay');
+  if(ov)ov.style.display='none';
+  if(apModalIv){clearInterval(apModalIv);apModalIv=null;}
+  apModalShown=false;
+}
+
+function showApKeepAlive(initialRemainingMs){
+  const ov=$('apKeepAliveOverlay');
+  if(!ov||apModalShown)return;
+  apModalShown=true;
+  ov.style.display='flex';
+  let remaining=Math.max(0,Math.ceil(initialRemainingMs/1000));
+  $('apKeepAliveCountdown').textContent=remaining+'s';
+  apModalIv=setInterval(()=>{
+    remaining--;
+    if(remaining<=0){clearInterval(apModalIv);apModalIv=null;return;}
+    $('apKeepAliveCountdown').textContent=remaining+'s';
+  },1000);
+}
+
+async function apKeepAliveYes(){
+  try{await fetch('/extend',{method:'POST'});}catch(e){}
+  apModalDismissed=true;  // require remaining to recover before re-showing
+  hideApKeepAlive();
+}
+async function apKeepAliveNo(){
+  hideApKeepAlive();
+  try{await fetch('/start',{method:'POST'});}catch(e){}
+  // AP will go down; the page becomes unreachable until reconnect.
+}
+
+function handleApTimer(j){
+  if(!j||!j.apActive){hideApKeepAlive();return;}
+  const remaining=j.apRemainingMs|0;
+  const lead=j.apExtendPromptLeadMs|30000;
+  // Re-arm the prompt once remaining recovers above the lead (post-extend).
+  if(remaining>lead)apModalDismissed=false;
+  if(!apModalDismissed&&remaining>0&&remaining<=lead){
+    showApKeepAlive(remaining);
+  }
+}
+
+/* ---- Upload progress poller (also drives the AP keep-alive modal) ---- */
 async function pollUpload(){
   try{
     const r=await fetch('/status.json');const j=await r.json();
@@ -678,6 +742,8 @@ async function pollUpload(){
     bar.classList.toggle('active',up);
 
     if(up)setWigleMsg('Uploading\u2026 '+done+'/'+total+' ('+pct+'%)');
+
+    handleApTimer(j);
   }catch(e){/* silent */}
 }
 setInterval(pollUpload,1500);
@@ -720,6 +786,24 @@ static void handleStatus() {
   doc["wifiConnected"] = (WiFi.status() == WL_CONNECTED);
   doc["staIp"] = (WiFi.status() == WL_CONNECTED) ? WiFi.localIP().toString() : "";
   doc["apClientsSeen"] = apClientSeen;
+
+  // AP timer state for the WebUI's keep-alive modal.
+  doc["apActive"]   = apWindowActive;
+  doc["apExtended"] = apExtended;
+  if (apWindowActive) {
+    uint32_t elapsed, budget;
+    if (apExtended) {
+      elapsed = millis() - apExtendedStartMs;
+      budget  = AP_EXTENDED_WINDOW_MS;
+    } else {
+      elapsed = millis() - apStartMs;
+      budget  = AP_WINDOW_MS;
+    }
+    doc["apRemainingMs"] = (elapsed >= budget) ? 0 : (budget - elapsed);
+  } else {
+    doc["apRemainingMs"] = 0;
+  }
+  doc["apExtendPromptLeadMs"] = AP_EXTEND_PROMPT_LEAD_MS;
   doc["uploading"] = uploading;
   doc["uploadTotalFiles"] = uploadTotalFiles;
   doc["uploadDoneFiles"] = uploadDoneFiles;
@@ -856,6 +940,22 @@ static void handleDeleteAll() {
 static void handleStart() {
   scanningEnabled = true;
   userScanOverride = true;
+  // If the AP is still up, request an immediate teardown so scanning can begin.
+  if (apWindowActive) {
+    Serial.println("[WEB] /start -> force-close AP");
+    apForceClose = true;
+  }
+  server.send(200, "text/plain", "OK");
+}
+
+static void handleExtend() {
+  if (!apWindowActive) {
+    server.send(409, "text/plain", "AP not active");
+    return;
+  }
+  apExtended = true;
+  apExtendedStartMs = millis();
+  Serial.println("[WEB] /extend -> AP extended window reset");
   server.send(200, "text/plain", "OK");
 }
 
@@ -1185,6 +1285,7 @@ void startWebServer() {
   server.on("/delete", HTTP_POST, handleDelete);
   server.on("/start",  HTTP_POST, handleStart);
   server.on("/stop",   HTTP_POST, handleStop);
+  server.on("/extend", HTTP_POST, handleExtend);
   server.on("/saveConfig", HTTP_POST, handleSaveConfig);
 
   server.on("/ping",            handlePing);

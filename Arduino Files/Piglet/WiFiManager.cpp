@@ -113,6 +113,9 @@ void startAP() {
   apStartMs = millis();
   apClientSeen = false;
   apWindowActive = true;
+  apExtended = false;
+  apExtendedStartMs = 0;
+  apForceClose = false;
 
   Serial.print("[WIFI] AP SSID: "); Serial.println(cfg.wardriverSsid);
   Serial.print("[WIFI] AP PSK:  "); Serial.println(useOpen ? "(open)" : "(set)");
@@ -169,13 +172,36 @@ bool connectSTA(uint32_t timeoutMs) {
 void stopAPIfAllowed() {
   if (!apWindowActive) return;
 
-  // HARD cutoff: AP must stop after 60 seconds, regardless of clients
-  if ((millis() - apStartMs) > AP_WINDOW_MS) {
-    Serial.printf("[WIFI] AP window expired (%lu ms). Stopping AP HARD.\n",
-                  (unsigned long)AP_WINDOW_MS);
+  // Decide whether the AP should close now.
+  //   - apForceClose  : WebUI "Start Scan" button hit -> close immediately
+  //   - apExtended    : a client connected within the first 60 s; use the
+  //                     5 min rolling window instead of the 60 s budget
+  //   - otherwise     : original 60 s behaviour
+  bool shouldClose = false;
+  const char* reason = "";
+
+  if (apForceClose) {
+    shouldClose = true;
+    reason = "WebUI force-close";
+  } else if (apExtended) {
+    if ((millis() - apExtendedStartMs) > AP_EXTENDED_WINDOW_MS) {
+      shouldClose = true;
+      reason = "extended window expired";
+    }
+  } else {
+    if ((millis() - apStartMs) > AP_WINDOW_MS) {
+      shouldClose = true;
+      reason = "60 s window expired";
+    }
+  }
+
+  if (shouldClose) {
+    Serial.printf("[WIFI] Stopping AP (%s).\n", reason);
 
     WiFi.softAPdisconnect(true);
     apWindowActive = false;
+    apExtended = false;
+    apForceClose = false;
 
     // After AP shuts down, ensure STA is NOT trying to reconnect to home WiFi
     WiFi.setAutoReconnect(false);
