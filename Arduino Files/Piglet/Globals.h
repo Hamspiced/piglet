@@ -43,6 +43,15 @@ extern bool apClientSeen;
 extern bool apWindowActive;
 extern const uint32_t AP_WINDOW_MS;
 
+// Extended AP window: triggered when the first client connects during the initial
+// 60 s window. Replaces the 60 s budget with a 5 min rolling timer that the WebUI
+// can reset via /extend, and the user can short-circuit via /start.
+extern bool apExtended;
+extern uint32_t apExtendedStartMs;
+extern bool apForceClose;
+extern const uint32_t AP_EXTENDED_WINDOW_MS;
+extern const uint32_t AP_EXTEND_PROMPT_LEAD_MS;
+
 // ---- Counters ----
 extern uint32_t networksFound2G;
 extern uint32_t networksFound5G;

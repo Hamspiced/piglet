@@ -27,6 +27,12 @@ bool apClientSeen = false;
 bool apWindowActive = false;
 const uint32_t AP_WINDOW_MS = 60000UL;
 
+bool apExtended = false;
+uint32_t apExtendedStartMs = 0;
+bool apForceClose = false;
+const uint32_t AP_EXTENDED_WINDOW_MS = 5UL * 60UL * 1000UL;  // 5 minutes
+const uint32_t AP_EXTEND_PROMPT_LEAD_MS = 30000UL;            // prompt 30 s before expiry
+
 // ---- Counters ----
 uint32_t networksFound2G = 0;
 uint32_t networksFound5G = 0;

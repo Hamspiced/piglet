@@ -421,13 +421,29 @@ static void drawPageStatus(float speedValue) {
     display.print(WiFi.localIP());
   }
   else if (apWindowActive) {
-    uint32_t elapsed = millis() - apStartMs;
-    uint32_t remainingMs = (elapsed >= AP_WINDOW_MS) ? 0 : (AP_WINDOW_MS - elapsed);
+    uint32_t elapsed, budget;
+    if (apExtended) {
+      elapsed = millis() - apExtendedStartMs;
+      budget  = AP_EXTENDED_WINDOW_MS;
+    } else {
+      elapsed = millis() - apStartMs;
+      budget  = AP_WINDOW_MS;
+    }
+    uint32_t remainingMs = (elapsed >= budget) ? 0 : (budget - elapsed);
     uint32_t remainingS  = (remainingMs + 999) / 1000;
 
     display.print("AP: 192.168.4.1 ");
-    display.print(remainingS);
-    display.print("s");
+    if (apExtended) {
+      uint32_t mm = remainingS / 60;
+      uint32_t ss = remainingS % 60;
+      display.print(mm);
+      display.print(':');
+      if (ss < 10) display.print('0');
+      display.print(ss);
+    } else {
+      display.print(remainingS);
+      display.print("s");
+    }
   }
   else {
     // No STA and AP window is not active: show compass
