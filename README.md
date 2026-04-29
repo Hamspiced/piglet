@@ -236,6 +236,16 @@ wdgwarsApiKey=EnterWDGoWarsAPIKeyHere
 maxBootUploads=-1
 
 # ------------------------------------------------------------
+# Device Name (optional)
+# ------------------------------------------------------------
+# A short label for this device. Used in WiGLE CSV filenames
+# and in the WiGLE upload header so you can tell devices apart.
+# Spaces become underscores. Max 20 characters.
+# Leave empty to use the default (no prefix).
+
+deviceName=
+
+# ------------------------------------------------------------
 # Home Wi-Fi (STA mode)
 # ------------------------------------------------------------
 # If provided, device connects on boot.
@@ -266,7 +276,7 @@ gpsBaud=9600
 # ------------------------------------------------------------
 # Wi-Fi Scan Mode
 # ------------------------------------------------------------
-# aggressive  — scans every ~4.5 seconds (faster, more power)
+# aggressive  — scans every ~3 seconds using async mode (faster, more power)
 # powersaving — scans every ~12 seconds (slower, less power)
 
 scanMode=aggressive
