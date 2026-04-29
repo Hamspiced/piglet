@@ -153,6 +153,12 @@ Pin mappings are automatically selected by firmware.
 
 Print-ready STL files are available in the `Case Files/` directory. These cases are designed specifically for the Piglet PCB and module stack.
 
+### 👏 Case Design by Bread — Breadbox Systems
+
+The Piglet case was designed by **Bread** at [Breadbox Systems](https://breadboxsystems.com). If you print one, please take a moment to **like and boost the design on MakerWorld** — it helps the creator and makes the design easier for others to find.
+
+> **[🖨️ Print the Piglet Wardriver Case on MakerWorld →](https://makerworld.com/en/models/2708429-piglet-wardriver-case#profileId-3000037)**
+
 | File | Description |
 |------|-------------|
 | `Piglet Face.STL` | Front panel / lid |
