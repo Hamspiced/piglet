@@ -18,79 +18,23 @@ static String authModeToString(wifi_auth_mode_t m) {
   }
 }
 
-void doScanOnce() {
-  static uint32_t lastScanMs = 0;
-  uint32_t interval = (cfg.scanMode == "powersaving") ? 12000 : 4500;
-
-  if (millis() - lastScanMs < interval) return;
-
-  Serial.print("[SCAN] Starting WiFi scan (mode=");
-  Serial.print(cfg.scanMode);
-  Serial.println(")...");
-
-  uint32_t t0 = millis();
-  int n = WiFi.scanNetworks(false, true);   // ONE scan only
-  static uint8_t zeroScanCount = 0;
-
-  // IMPORTANT: enforce interval even on empty/failed scans
-  lastScanMs = millis();
-
-  if (n <= 0) {
-    zeroScanCount++;
-
-    Serial.printf("[SCAN] EMPTY (%u) — resetting WiFi if stuck\n", zeroScanCount);
-
-    // Keep scan state clean even on failure
-    WiFi.scanDelete();
-
-    // If we get multiple empty scans in a row, reset WiFi radio (C6 fix)
-    if (zeroScanCount >= 3) {
-      Serial.println("[SCAN] Performing WiFi radio reset (C6 recovery)");
-
-      WiFi.mode(WIFI_OFF);
-      delay(200);
-
-      WiFi.mode(WIFI_STA);
-      delay(200);
-
-      zeroScanCount = 0;
-    }
-
-    return;
-  }
-
-  zeroScanCount = 0;  // got real results -> clear counter
-  uint32_t dt = millis() - t0;
-
-  Serial.printf("[SCAN] scanNetworks() returned %d in %lu ms\n", n, (unsigned long)dt);
-
-  if (n <= 0) {
-    Serial.println("[SCAN] No networks found");
-    WiFi.scanDelete();
-    return;
-  }
-
-  Serial.print("[SCAN] Found raw networks: ");
-  Serial.println(n);
+// ---- Result processor (shared between sync and async paths) ----
+static void processScanResults(int n) {
+  if (n <= 0) { WiFi.scanDelete(); return; }
 
   String firstSeen = iso8601NowUTC();
-
   double lat = 0, lon = 0, altM = 0, accM = 0;
   if (gpsHasFix) {
-    lat = gps.location.lat();
-    lon = gps.location.lng();
+    lat  = gps.location.lat();
+    lon  = gps.location.lng();
     altM = gps.altitude.meters();
     accM = gps.hdop.hdop();
   }
 
   uint32_t wrote = 0;
-
   for (int i = 0; i < n; i++) {
     int ch = WiFi.channel(i);
-
-    // Some cores return 0 for "unknown". Assume 2.4G for logging purposes.
     bool chUnknown = (ch == 0);
-
     bool is2g = (ch >= 1 && ch <= 14) || chUnknown;
     bool is5g = (ch >= 32 && ch <= 177);
 
@@ -98,12 +42,10 @@ void doScanOnce() {
       if (!(wardriverIsC5() && is5g)) continue;
     }
 
-    String ssid = WiFi.SSID(i);
-    String mac  = WiFi.BSSIDstr(i);
-    int rssi = WiFi.RSSI(i);
-
-    wifi_auth_mode_t auth = WiFi.encryptionType(i);
-    String authStr = authModeToString(auth);
+    String ssid   = WiFi.SSID(i);
+    String mac    = WiFi.BSSIDstr(i);
+    int    rssi   = WiFi.RSSI(i);
+    String authStr = authModeToString(WiFi.encryptionType(i));
 
     if (is2g) networksFound2G++;
     else      networksFound5G++;
@@ -113,7 +55,66 @@ void doScanOnce() {
   }
 
   WiFi.scanDelete();
+  Serial.printf("[SCAN] Wrote %lu rows\n", (unsigned long)wrote);
+}
 
-  Serial.print("[SCAN] Wrote 2.4G/5G rows: ");
-  Serial.println(wrote);
+void doScanOnce() {
+  static uint32_t lastScanStartMs  = 0;
+  static bool     scanInProgress   = false;
+  static uint8_t  zeroScanCount    = 0;
+
+  // ---- Timing ----
+  // aggressive:  100 ms/channel dwell, 1500 ms minimum gap between scan starts
+  // powersaving: 200 ms/channel dwell, 10000 ms gap
+  //
+  // With 100 ms/channel the hardware finishes a 13-channel 2.4 GHz sweep in
+  // ~1.3 s instead of the old ~3.9 s (default 300 ms dwell).  Using async
+  // mode means that time no longer blocks the main loop — GPS parsing, the
+  // web server and OLED updates all continue while the radio hops channels.
+  bool powersave     = (cfg.scanMode == "powersaving");
+  uint32_t gapMs     = powersave ? 10000 : 1500;
+  uint32_t dwellMs   = powersave ?   200 :  100;
+
+  // ---- Check if the async scan launched last iteration has finished ----
+  if (scanInProgress) {
+    int n = WiFi.scanComplete();
+    if (n == WIFI_SCAN_RUNNING) return;  // still running — come back next tick
+
+    scanInProgress = false;
+    lastScanStartMs = millis();
+
+    if (n == WIFI_SCAN_FAILED || n < 0) {
+      WiFi.scanDelete();
+      zeroScanCount++;
+      Serial.printf("[SCAN] Failed/empty (%u)\n", zeroScanCount);
+      if (zeroScanCount >= 3) {
+        Serial.println("[SCAN] Resetting WiFi radio (stuck recovery)");
+        WiFi.mode(WIFI_OFF); delay(200);
+        WiFi.mode(WIFI_STA); delay(200);
+        zeroScanCount = 0;
+      }
+      return;
+    }
+
+    zeroScanCount = 0;
+    Serial.printf("[SCAN] Async complete: %d networks\n", n);
+    processScanResults(n);
+    return;
+  }
+
+  // ---- Wait for the minimum gap before starting the next scan ----
+  if (millis() - lastScanStartMs < gapMs) return;
+
+  // ---- Kick off a new async scan ----
+  // async=true, show_hidden=true, passive=false, max_ms_per_chan=dwellMs
+  int16_t rc = WiFi.scanNetworks(/*async*/true, /*show_hidden*/true,
+                                 /*passive*/false, dwellMs);
+  if (rc == WIFI_SCAN_RUNNING || rc == 0) {
+    scanInProgress = true;
+    Serial.printf("[SCAN] Async scan started (dwell=%lu ms)\n", (unsigned long)dwellMs);
+  } else {
+    // Shouldn’t normally happen; fall back and retry after gap
+    Serial.printf("[SCAN] scanNetworks start failed (%d)\n", rc);
+    lastScanStartMs = millis();
+  }
 }

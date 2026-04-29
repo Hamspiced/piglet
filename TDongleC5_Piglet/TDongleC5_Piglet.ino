@@ -2171,29 +2171,10 @@ static bool shouldPauseScanning() {
 }
 
 // ---------------- Scan (2.4 + 5 GHz) ----------------
-static void doScanOnce() {
-  static uint32_t lastScanMs = 0;
-  uint32_t interval = (cfg.scanMode == "powersaving") ? 12000 : 4500;
-  if (millis() - lastScanMs < interval) return;
+static void processScanResults(int n) {
+  if (n <= 0) { WiFi.scanDelete(); return; }
 
-  int n = WiFi.scanNetworks(false, true);
-  static uint8_t zeroScanCount = 0;
-  lastScanMs = millis();
-
-  if (n <= 0) {
-    zeroScanCount++;
-    WiFi.scanDelete();
-    if (zeroScanCount >= 3) {
-      WiFi.mode(WIFI_OFF); delay(200);
-      WiFi.mode(WIFI_STA); delay(200);
-      zeroScanCount = 0;
-    }
-    return;
-  }
-
-  zeroScanCount = 0;
   String firstSeen = iso8601NowUTC();
-
   double lat = 0, lon = 0, altM = 0, accM = 0;
   if (gpsHasFix) {
     lat = gps.location.lat(); lon = gps.location.lng();
@@ -2223,6 +2204,61 @@ static void doScanOnce() {
 
   WiFi.scanDelete();
   if (wrote > 0) ledPulseGreen();
+  Serial.printf("[SCAN] Wrote %lu rows\n", (unsigned long)wrote);
+}
+
+static void doScanOnce() {
+  static uint32_t lastScanStartMs = 0;
+  static bool     scanInProgress  = false;
+  static uint8_t  zeroScanCount   = 0;
+
+  // aggressive:  100 ms/channel dwell, 1500 ms minimum gap between scan starts
+  // powersaving: 200 ms/channel dwell, 10000 ms gap
+  bool powersave   = (cfg.scanMode == "powersaving");
+  uint32_t gapMs   = powersave ? 10000 : 1500;
+  uint32_t dwellMs = powersave ?   200 :  100;
+
+  // Check if the async scan launched last iteration has finished
+  if (scanInProgress) {
+    int n = WiFi.scanComplete();
+    if (n == WIFI_SCAN_RUNNING) return;  // still running — come back next tick
+
+    scanInProgress = false;
+    lastScanStartMs = millis();
+
+    if (n == WIFI_SCAN_FAILED || n < 0) {
+      WiFi.scanDelete();
+      zeroScanCount++;
+      Serial.printf("[SCAN] Failed/empty (%u)\n", zeroScanCount);
+      if (zeroScanCount >= 3) {
+        Serial.println("[SCAN] Resetting WiFi radio (stuck recovery)");
+        WiFi.mode(WIFI_OFF); delay(200);
+        WiFi.mode(WIFI_STA); delay(200);
+        zeroScanCount = 0;
+      }
+      return;
+    }
+
+    zeroScanCount = 0;
+    Serial.printf("[SCAN] Async complete: %d networks\n", n);
+    processScanResults(n);
+    return;
+  }
+
+  // Wait for the minimum gap before starting the next scan
+  if (millis() - lastScanStartMs < gapMs) return;
+
+  // Kick off a new async scan
+  // async=true, show_hidden=true, passive=false, max_ms_per_chan=dwellMs
+  int16_t rc = WiFi.scanNetworks(/*async*/true, /*show_hidden*/true,
+                                 /*passive*/false, dwellMs);
+  if (rc == WIFI_SCAN_RUNNING || rc == 0) {
+    scanInProgress = true;
+    Serial.printf("[SCAN] Async scan started (dwell=%lu ms)\n", (unsigned long)dwellMs);
+  } else {
+    Serial.printf("[SCAN] scanNetworks start failed (%d)\n", rc);
+    lastScanStartMs = millis();
+  }
 }
 
 // ---------------- Page cycling ----------------
