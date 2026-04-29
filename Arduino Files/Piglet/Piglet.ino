@@ -403,7 +403,6 @@ void setup() {
   }
 
   // Now start web server after WiGLE operations are complete
-  Serial.println("[WEB] Starting web server routes...");
   startWebServer();
   
   if (staOk) {

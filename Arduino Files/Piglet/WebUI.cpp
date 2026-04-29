@@ -675,7 +675,11 @@ static void handleRoot() {
 }
 
 static void handleStatus() {
-  StaticJsonDocument<1024> doc;
+  // 2048 bytes: accounts for all config fields including long tokens
+  // (wigleBasicToken ~50, wdgwarsApiKey ~40, deviceName, etc.) plus status fields.
+  // If this doc overflows ArduinoJson silently discards fields, sending broken
+  // JSON that stalls the browser — so keep a comfortable margin.
+  StaticJsonDocument<2048> doc;
 
   bool allowScan = scanningEnabled && sdOk && (userScanOverride || !autoPaused);
   doc["scanningEnabled"] = scanningEnabled;
