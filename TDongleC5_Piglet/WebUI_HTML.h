@@ -126,6 +126,18 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
     <div id="files" style="font-size:13px">Loading&hellip;</div>
   </div>
 
+<!-- AP keep-alive prompt (shown ~30 s before the AP window expires) -->
+<div id="apKeepAliveOverlay" style="display:none;position:fixed;inset:0;background:rgba(10,14,19,.92);z-index:9998;flex-direction:column;align-items:center;justify-content:center;text-align:center;gap:12px;padding:24px">
+  <div style="font-size:40px">&#x23f3;</div>
+  <h2 style="margin:0;color:#e2eaf4">Stay in WebUI?</h2>
+  <p style="color:#8899ab;margin:0;font-size:13px;max-width:360px">The AP is about to close and the device will start scanning. Tap "Stay" to keep the WebUI open for another 5 minutes.</p>
+  <p id="apKeepAliveCountdown" style="font-size:36px;font-weight:700;color:#2dd4bf;margin:0">30s</p>
+  <div class="row">
+    <button class="btn-primary" onclick="apKeepAliveYes()">Stay</button>
+    <button onclick="apKeepAliveNo()">Start Scanning Now</button>
+  </div>
+</div>
+
 <!-- Reboot overlay -->
 <div id="rebootOverlay" style="display:none;position:fixed;inset:0;background:rgba(10,14,19,.97);z-index:9999;flex-direction:column;align-items:center;justify-content:center;text-align:center;gap:12px;padding:24px">
   <div style="font-size:40px">&#x1f437;</div>
@@ -224,7 +236,13 @@ async function wigleUploadAll(){setWigleMsg('Uploading...');try{const r=await fe
 async function wigleUploadOne(name){setWigleMsg('Uploading '+name+'...');try{const r=await fetch('/wigle/upload?name='+encodeURIComponent(name),{method:'POST'});const j=await r.json().catch(()=>null);if(j)setWigleMsg(j.message||(j.ok?'OK':'Failed'),j.ok?'ok-text':'bad-text')}catch(e){setWigleMsg('Failed','bad-text')}await loadFiles();await loadStatus()}
 async function wdgwarsTest(){setWdgwarsMsg('Testing...');try{const r=await fetch('/wdgwars/test',{method:'POST'});const j=await r.json().catch(()=>({ok:false,message:'Bad response'}));setWdgwarsMsg(j.message||(j.ok?'Key valid':'Key invalid'),j.ok?'ok-text':'bad-text')}catch(e){setWdgwarsMsg('Failed','bad-text')}}
 async function wdgwarsUploadAll(){setWdgwarsMsg('Uploading...');try{const r=await fetch('/wdgwars/uploadAll',{method:'POST'});const j=await r.json().catch(()=>null);if(j){setWdgwarsMsg(j.message||(j.ok?j.uploaded+' uploaded':'Failed'),j.ok?'ok-text':'bad-text')}}catch(e){setWdgwarsMsg('Failed','bad-text')}await loadFiles();}
-async function pollUpload(){try{const r=await fetch('/status.json');const j=await r.json();const up=!!j.uploading;const done=j.uploadDoneFiles||0;const total=j.uploadTotalFiles||0;const pct=total>0?Math.round((done/total)*100):0;const bar=$('wigleBar');bar.style.width=pct+'%';bar.classList.toggle('active',up);if(up){const fail=j.uploadFailedFiles||0;const failStr=fail>0?' F:'+fail:'';setWigleMsg('Uploading '+done+'/'+total+' ('+pct+'%)'+failStr)}}catch(e){}}
+let apModalShown=false,apModalDismissed=false,apModalIv=null;
+function hideApKeepAlive(){const ov=$('apKeepAliveOverlay');if(ov)ov.style.display='none';if(apModalIv){clearInterval(apModalIv);apModalIv=null;}apModalShown=false;}
+function showApKeepAlive(ms){const ov=$('apKeepAliveOverlay');if(!ov||apModalShown)return;apModalShown=true;ov.style.display='flex';let s=Math.max(0,Math.ceil(ms/1000));$('apKeepAliveCountdown').textContent=s+'s';apModalIv=setInterval(()=>{s--;if(s<=0){clearInterval(apModalIv);apModalIv=null;return;}$('apKeepAliveCountdown').textContent=s+'s';},1000);}
+async function apKeepAliveYes(){try{await fetch('/extend',{method:'POST'});}catch(e){}apModalDismissed=true;hideApKeepAlive();}
+async function apKeepAliveNo(){hideApKeepAlive();try{await fetch('/start',{method:'POST'});}catch(e){}}
+function handleApTimer(j){if(!j||!j.apActive){hideApKeepAlive();return;}const rem=j.apRemainingMs|0;const lead=j.apExtendPromptLeadMs|30000;if(rem>lead)apModalDismissed=false;if(!apModalDismissed&&rem>0&&rem<=lead)showApKeepAlive(rem);}
+async function pollUpload(){try{const r=await fetch('/status.json');const j=await r.json();const up=!!j.uploading;const done=j.uploadDoneFiles||0;const total=j.uploadTotalFiles||0;const pct=total>0?Math.round((done/total)*100):0;const bar=$('wigleBar');bar.style.width=pct+'%';bar.classList.toggle('active',up);if(up){const fail=j.uploadFailedFiles||0;const failStr=fail>0?' F:'+fail:'';setWigleMsg('Uploading '+done+'/'+total+' ('+pct+'%)'+failStr)}handleApTimer(j);}catch(e){}}
 setInterval(pollUpload,1500);loadStatus();loadFiles();
 </script>
 </body>

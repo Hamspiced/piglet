@@ -174,6 +174,13 @@ static bool apClientSeen = false;
 static bool apWindowActive = false;
 static const uint32_t AP_WINDOW_MS = 60000UL;
 
+// Extended AP window — 5 min rolling timer, driven by the WebUI keep-alive modal
+static bool     apExtended           = false;
+static uint32_t apExtendedStartMs    = 0;
+static bool     apForceClose         = false;
+static const uint32_t AP_EXTENDED_WINDOW_MS    = 5UL * 60UL * 1000UL; // 5 minutes
+static const uint32_t AP_EXTEND_PROMPT_LEAD_MS = 30000UL;              // prompt 30 s before expiry
+
 // Counters
 static uint32_t networksFound2G = 0;
 static uint32_t networksFound5G = 0;
@@ -1870,7 +1877,7 @@ static bool initSD_SharedSPI() {
 static void handleRoot() { server.sendHeader("Cache-Control", "no-store"); server.send_P(200, "text/html", INDEX_HTML); }
 
 static void handleStatus() {
-  DynamicJsonDocument doc(1536);  // heap, not stack — avoids task stack overflow
+  DynamicJsonDocument doc(2048);  // heap, not stack — avoids task stack overflow
   bool allowScan = scanningEnabled && sdOk && (userScanOverride || !autoPaused);
   doc["scanningEnabled"] = scanningEnabled;
   doc["allowScan"] = allowScan;
@@ -1881,6 +1888,24 @@ static void handleStatus() {
   doc["wifiConnected"] = (WiFi.status() == WL_CONNECTED);
   doc["staIp"] = (WiFi.status() == WL_CONNECTED) ? WiFi.localIP().toString() : "";
   doc["apClientsSeen"] = apClientSeen;
+
+  // AP timer fields for the WebUI keep-alive modal
+  doc["apActive"]   = apWindowActive;
+  doc["apExtended"] = apExtended;
+  if (apWindowActive) {
+    uint32_t elapsed, budget;
+    if (apExtended) {
+      elapsed = millis() - apExtendedStartMs;
+      budget  = AP_EXTENDED_WINDOW_MS;
+    } else {
+      elapsed = millis() - apStartMs;
+      budget  = AP_WINDOW_MS;
+    }
+    doc["apRemainingMs"] = (elapsed >= budget) ? 0 : (budget - elapsed);
+  } else {
+    doc["apRemainingMs"] = 0;
+  }
+  doc["apExtendPromptLeadMs"] = AP_EXTEND_PROMPT_LEAD_MS;
   doc["uploading"] = uploading;
   doc["uploadTotalFiles"] = uploadTotalFiles;
   doc["uploadDoneFiles"] = uploadDoneFiles;
@@ -1987,7 +2012,19 @@ static void handleDeleteAll() {
   server.send(200, "application/json", out);
 }
 
-static void handleStart()    { scanningEnabled = true;  userScanOverride = true; server.send(200, "text/plain", "OK"); }
+static void handleStart() {
+  scanningEnabled = true; userScanOverride = true;
+  if (apWindowActive) { Serial.println("[WEB] /start -> force-close AP"); apForceClose = true; }
+  server.send(200, "text/plain", "OK");
+}
+
+static void handleExtend() {
+  if (!apWindowActive) { server.send(409, "text/plain", "AP not active"); return; }
+  apExtended = true;
+  apExtendedStartMs = millis();
+  Serial.println("[WEB] /extend -> AP extended window reset");
+  server.send(200, "text/plain", "OK");
+}
 static void handleStop()     { scanningEnabled = false; userScanOverride = true; server.send(200, "text/plain", "OK"); }
 static void handleNextPage() { advancePage(); server.send(200, "text/plain", String(currentPage)); }
 
@@ -2229,6 +2266,7 @@ static void startWebServer() {
   server.on("/delete", HTTP_POST, handleDelete);
   server.on("/start",    HTTP_POST, handleStart);
   server.on("/stop",     HTTP_POST, handleStop);
+  server.on("/extend",   HTTP_POST, handleExtend);
   server.on("/nextpage", HTTP_POST, handleNextPage);
   server.on("/saveConfig", HTTP_POST, handleSaveConfig);
   server.on("/wigle/test",      HTTP_POST, handleWigleTest);
@@ -2248,6 +2286,7 @@ static void startAP() {
   WiFi.mode(WIFI_AP_STA);
   WiFi.softAP(cfg.wardriverSsid.c_str(), cfg.wardriverPsk.c_str());
   apStartMs = millis(); apClientSeen = false; apWindowActive = true;
+  apExtended = false; apExtendedStartMs = 0; apForceClose = false;
   Serial.print("[WIFI] AP SSID: "); Serial.println(cfg.wardriverSsid);
   Serial.print("[WIFI] AP IP: ");   Serial.println(WiFi.softAPIP());
 }
@@ -2303,9 +2342,29 @@ static bool connectSTA(uint32_t timeoutMs) {
 
 static void stopAPIfAllowed() {
   if (!apWindowActive) return;
-  if ((millis() - apStartMs) > AP_WINDOW_MS) {
-    Serial.println("[WIFI] AP window expired. Stopping AP.");
+
+  bool shouldClose = false;
+  const char* reason = "";
+
+  if (apForceClose) {
+    shouldClose = true;
+    reason = "WebUI force-close";
+  } else if (apExtended) {
+    if ((millis() - apExtendedStartMs) > AP_EXTENDED_WINDOW_MS) {
+      shouldClose = true;
+      reason = "extended window expired";
+    }
+  } else {
+    if ((millis() - apStartMs) > AP_WINDOW_MS) {
+      shouldClose = true;
+      reason = "60 s window expired";
+    }
+  }
+
+  if (shouldClose) {
+    Serial.printf("[WIFI] Stopping AP (%s).\n", reason);
     WiFi.softAPdisconnect(true); apWindowActive = false;
+    apExtended = false; apForceClose = false;
     WiFi.setAutoReconnect(false); WiFi.persistent(false);
     WiFi.disconnect(true, true); delay(50);
     if (WiFi.status() != WL_CONNECTED) WiFi.mode(WIFI_STA);
