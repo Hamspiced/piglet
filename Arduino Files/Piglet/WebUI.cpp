@@ -222,7 +222,7 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
     font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;
     padding:2px 8px;border-radius:999px;
   }
-  .file-badge.log{color:var(--accent);background:var(--okDim);border:1px solid rgba(45,212,191,.3)}
+  .file-badge.log{color:var(--danger);background:var(--dangerDim);border:1px solid rgba(251,113,133,.3)}
   .file-badge.uploaded{color:var(--muted);background:rgba(136,153,171,.1);border:1px solid rgba(136,153,171,.25)}
   .file-stats{color:var(--accent);font-size:12px;font-weight:500;white-space:nowrap}
   .file-actions{margin-left:auto;display:flex;gap:6px}
@@ -497,7 +497,7 @@ async function loadFiles(){
       const isUploaded=f.uploaded;
       let badge=isUploaded
         ?'<span class="file-badge uploaded">uploaded</span>'
-        :'<span class="file-badge log">log</span>';
+        :'<span class="file-badge log">Not Uploaded</span>';
       
       const uploadBtn=isUploaded?''
         :'<button class="btn-sm" onclick="wigleUploadOne(\''+f.name.replace(/'/g,"\\'")+'\')">Upload</button>';

@@ -45,7 +45,7 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
   .cfg-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px} @media(max-width:520px){.cfg-grid{grid-template-columns:1fr}} .cfg-grid>div{display:flex;flex-direction:column}
   .file-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:6px 0;border-bottom:1px solid var(--border)} .file-row:last-child{border-bottom:none}
   .file-badge{font-size:10px;font-weight:600;text-transform:uppercase;padding:2px 6px;border-radius:999px}
-  .file-badge.log{color:var(--accent);background:var(--okDim);border:1px solid rgba(45,212,191,.3)}
+  .file-badge.log{color:var(--danger);background:var(--dangerDim);border:1px solid rgba(251,113,133,.3)}
   .file-badge.uploaded{color:var(--muted);background:rgba(136,153,171,.1);border:1px solid rgba(136,153,171,.2)}
   .file-size{color:var(--muted);font-size:11px} .file-actions{margin-left:auto;display:flex;gap:4px}
   .muted{color:var(--muted)} .mt-sm{margin-top:8px} .mt-md{margin-top:12px}
@@ -166,7 +166,7 @@ async function loadFiles(){try{
   if(!j.files||j.files.length===0){el.textContent='No files';return}
   el.innerHTML=j.files.map(f=>{
     const isUp=f.name.startsWith('/uploaded');
-    const badge=isUp?'<span class="file-badge uploaded">uploaded</span>':'<span class="file-badge log">log</span>';
+    const badge=isUp?'<span class="file-badge uploaded">uploaded</span>':'<span class="file-badge log">Not Uploaded</span>';
     const upBtn=isUp?'':'<button class="btn-sm" onclick="wigleUploadOne(\''+f.name.replace(/'/g,"\\\'")+'\')">Upload</button>';
     return '<div class="file-row"><a href="/download?name='+encodeURIComponent(f.name)+'">'+f.name+'</a> '+badge+
       '<span class="file-size">'+formatBytes(f.size)+'</span><span class="file-actions">'+upBtn+
