@@ -675,11 +675,10 @@ static void handleRoot() {
 }
 
 static void handleStatus() {
-  // 2048 bytes: accounts for all config fields including long tokens
-  // (wigleBasicToken ~50, wdgwarsApiKey ~40, deviceName, etc.) plus status fields.
-  // If this doc overflows ArduinoJson silently discards fields, sending broken
-  // JSON that stalls the browser — so keep a comfortable margin.
-  StaticJsonDocument<2048> doc;
+  // Heap allocation: StaticJsonDocument<N> puts N bytes on the Arduino loop
+  // task stack (8192 bytes). Even 1024 bytes plus WebServer call chain overhead
+  // risks a stack overflow.  DynamicJsonDocument allocates from the heap instead.
+  DynamicJsonDocument doc(2048);
 
   bool allowScan = scanningEnabled && sdOk && (userScanOverride || !autoPaused);
   doc["scanningEnabled"] = scanningEnabled;
@@ -753,7 +752,9 @@ static void addDirFiles(JsonArray arr, const char* dir) {
 }
 
 static void handleFiles() {
-  StaticJsonDocument<4096> doc;
+  // 4096-byte STATIC doc would use half the entire 8192-byte task stack.
+  // Use dynamic (heap) allocation instead.
+  DynamicJsonDocument doc(4096);
   doc["ok"] = sdOk;
 
   JsonArray arr = doc.createNestedArray("files");
