@@ -52,7 +52,7 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
 </style>
 </head>
 <body>
-  <div class="header"><div class="logo">&#x1f437;</div><div><h1>Piglet Wardriver</h1><p class="sub">T-Dongle C5 &mdash; ESP32-C5 Dual-Band</p></div></div>
+  <div class="header"><div class="logo">&#x1f437;</div><div><h1>Piglet Wardriver</h1><p class="sub">T-Dongle C5 &mdash; ESP32-C5 Dual-Band &mdash; v2.2</p></div></div>
 
   <div class="card">
     <h3>Status</h3>
