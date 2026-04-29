@@ -2109,11 +2109,123 @@ static void handleWigleUploadOne() {
   server.send(ok ? 200 : 500, "application/json", out);
 }
 
+// ---- ZIP helpers — used by handleDownloadAll ----
+
+static uint32_t zipCrc32(uint32_t crc, const uint8_t* buf, size_t len) {
+  static const uint32_t T[16] = {
+    0x00000000,0x1DB71064,0x3B6E20C8,0x26D930AC,
+    0x76DC4190,0x6B6B51F4,0x4DB26158,0x5005713C,
+    0xEDB88320,0xF00F9344,0xD6D6A3E8,0xCB61B38C,
+    0x9B64C2B0,0x86D3D2D4,0xA00AE278,0xBDBDF21C
+  };
+  crc = ~crc;
+  for (size_t i = 0; i < len; i++) {
+    crc = (crc >> 4) ^ T[(crc ^ buf[i]) & 0xF];
+    crc = (crc >> 4) ^ T[(crc ^ (buf[i] >> 4)) & 0xF];
+  }
+  return ~crc;
+}
+
+static void zipW16(WiFiClient& cl, uint16_t v) {
+  uint8_t b[2] = { uint8_t(v), uint8_t(v>>8) }; cl.write(b, 2);
+}
+static void zipW32(WiFiClient& cl, uint32_t v) {
+  uint8_t b[4] = { uint8_t(v), uint8_t(v>>8), uint8_t(v>>16), uint8_t(v>>24) }; cl.write(b, 4);
+}
+
+static void handleDownloadAll() {
+  if (!sdOk) { server.send(500, "text/plain", "SD not available"); return; }
+
+  struct ZEntry { String path, name; uint32_t size, crc, off; };
+  std::vector<ZEntry> ents;
+
+  const char* dirs[] = { "/logs", "/uploaded" };
+  for (const char* d : dirs) {
+    digitalWrite(PINS.tft_cs, HIGH);
+    File root = SD.open(d); if (!root) continue;
+    File f = root.openNextFile();
+    while (f) {
+      String p = normalizeSdPath(d, f.name());
+      if (p.length() > 0 && !(currentCsvPath.length() && p == currentCsvPath))
+        ents.push_back({p, pathBasename(p), (uint32_t)f.size(), 0, 0});
+      f.close(); f = root.openNextFile();
+    }
+    root.close();
+  }
+
+  if (ents.empty()) { server.send(200, "text/plain", "No files to download"); return; }
+
+  uint32_t pos = 0;
+  for (auto& e : ents) {
+    e.off = pos;
+    pos += 46 + (uint32_t)e.name.length() + e.size;
+  }
+  uint32_t cdOff = pos;
+  uint32_t cdSz  = 0;
+  for (auto& e : ents) cdSz += 46 + (uint32_t)e.name.length();
+  uint32_t total = cdOff + cdSz + 22;
+
+  server.sendHeader("Content-Disposition", "attachment; filename=\"piglet_logs.zip\"");
+  server.setContentLength(total);
+  server.send(200, "application/zip", "");
+  WiFiClient cl = server.client();
+  uint8_t buf[512];
+
+  for (auto& e : ents) {
+    uint16_t nl = (uint16_t)e.name.length();
+    cl.write((const uint8_t*)"\x50\x4B\x03\x04", 4);
+    zipW16(cl,20); zipW16(cl,8);  zipW16(cl,0);
+    zipW16(cl,0);  zipW16(cl,0);
+    zipW32(cl,0);  zipW32(cl,0); zipW32(cl,0);
+    zipW16(cl,nl); zipW16(cl,0);
+    cl.write((const uint8_t*)e.name.c_str(), nl);
+
+    uint32_t crc = 0, written = 0;
+    digitalWrite(PINS.tft_cs, HIGH);
+    File f = SD.open(e.path, FILE_READ);
+    if (f) {
+      while (true) {
+        int n = f.read(buf, sizeof(buf)); if (n <= 0) break;
+        crc = zipCrc32(crc, buf, (size_t)n);
+        cl.write(buf, (size_t)n);
+        written += (uint32_t)n;
+        yield();
+      }
+      f.close();
+    }
+    e.crc  = crc;
+    e.size = written;
+
+    cl.write((const uint8_t*)"\x50\x4B\x07\x08", 4);
+    zipW32(cl,crc); zipW32(cl,written); zipW32(cl,written);
+  }
+
+  for (auto& e : ents) {
+    uint16_t nl = (uint16_t)e.name.length();
+    cl.write((const uint8_t*)"\x50\x4B\x01\x02", 4);
+    zipW16(cl,20); zipW16(cl,20); zipW16(cl,8);
+    zipW16(cl,0);  zipW16(cl,0);  zipW16(cl,0);
+    zipW32(cl,e.crc); zipW32(cl,e.size); zipW32(cl,e.size);
+    zipW16(cl,nl); zipW16(cl,0);  zipW16(cl,0);
+    zipW16(cl,0);  zipW16(cl,0);  zipW32(cl,0);
+    zipW32(cl,e.off);
+    cl.write((const uint8_t*)e.name.c_str(), nl);
+  }
+
+  uint16_t nc = (uint16_t)ents.size();
+  cl.write((const uint8_t*)"\x50\x4B\x05\x06", 4);
+  zipW16(cl,0); zipW16(cl,0);
+  zipW16(cl,nc); zipW16(cl,nc);
+  zipW32(cl,cdSz); zipW32(cl,cdOff);
+  zipW16(cl,0);
+}
+
 static void startWebServer() {
   server.on("/", handleRoot);
   server.on("/status.json", handleStatus);
   server.on("/files.json", handleFiles);
-  server.on("/download", handleDownload);
+  server.on("/download",    handleDownload);
+  server.on("/downloadAll", handleDownloadAll);
   server.on("/delete", HTTP_POST, handleDelete);
   server.on("/start",    HTTP_POST, handleStart);
   server.on("/stop",     HTTP_POST, handleStop);

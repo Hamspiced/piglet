@@ -118,9 +118,10 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
 
   <div class="card">
     <h3>SD Card Files</h3>
-    <div class="row mt-sm" style="margin-bottom:10px">
+    <div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:10px">
       <button class="btn-sm" onclick="loadFiles()">&#8635; Refresh</button>
-      <button class="btn-sm btn-danger" onclick="deleteAllLogs()">&#128465; Delete All Logs</button>
+      <button class="btn-sm" onclick="window.location.href='/downloadAll'">&#11015; Download All</button>
+      <button class="btn-sm btn-danger" onclick="deleteAllLogs()">&#128465; Delete All</button>
     </div>
     <div id="files" style="font-size:13px">Loading&hellip;</div>
   </div>
