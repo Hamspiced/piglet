@@ -714,6 +714,11 @@ void showSplashScreen() {
     display.print(credit);
   }
 
+  // Version — lower-right corner
+  display.setTextSize(1);
+  display.setCursor(OLED_W - (int)strlen(FIRMWARE_VERSION) * 6 - 1, OLED_H - 8);
+  display.print(FIRMWARE_VERSION);
+
   display.display();
 
   // --- Animated "fake loading bar" ---
@@ -767,6 +772,11 @@ void showSplashScreen() {
     display.setTextColor(SSD1306_WHITE);
     display.print(slogan);
 
+    // Version — lower-right corner
+    display.setTextSize(1);
+    display.setCursor(OLED_W - (int)strlen(FIRMWARE_VERSION) * 6 - 1, OLED_H - 8);
+    display.print(FIRMWARE_VERSION);
+
     display.display();
 
     // Bounce the block left/right
@@ -801,6 +811,11 @@ void showSplashScreen() {
   // Slogan inside filled bar
   display.setTextSize(1);
   drawCentered(BAR_Y + 3, slogan, 1);
+
+  // Version — lower-right corner
+  display.setTextSize(1);
+  display.setCursor(OLED_W - (int)strlen(FIRMWARE_VERSION) * 6 - 1, OLED_H - 8);
+  display.print(FIRMWARE_VERSION);
 
   display.display();
   delay(250);

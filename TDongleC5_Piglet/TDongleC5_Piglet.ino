@@ -39,6 +39,9 @@
 #include <esp_now.h>
 #include "esp_wifi.h"
 
+// Firmware version
+#define FIRMWARE_VERSION "v2.2"
+
 // ---------------- Pins (T-DONGLE C5) ----------------
 struct PinMap {
   // TFT (SPI)
@@ -953,6 +956,12 @@ static void tftSplashAnimateOnce(const char* slogan, uint32_t animMs = 1400, uin
       tft.print(slogan);
     }
 
+    // Version — lower-right corner
+    tft.setTextSize(1);
+    tft.setTextColor(WHITE, BLACK);
+    tft.setCursor(W - (int)strlen(FIRMWARE_VERSION) * 6 - 2, tft.height() - 8 - 2);
+    tft.print(FIRMWARE_VERSION);
+
     pos += dir * 4;
     int maxPos = BAR_W - 2 - blockW;
     if (pos <= 0) { pos = 0; dir = 1; }
@@ -979,6 +988,13 @@ static void tftSplashAnimateOnce(const char* slogan, uint32_t animMs = 1400, uin
     tft.print(slogan);
     tft.setTextColor(WHITE, BLACK);
   }
+
+  // Version — lower-right corner
+  tft.setTextSize(1);
+  tft.setTextColor(WHITE, BLACK);
+  tft.setCursor(W - (int)strlen(FIRMWARE_VERSION) * 6 - 2, tft.height() - 8 - 2);
+  tft.print(FIRMWARE_VERSION);
+
   delay(200);
 }
 
