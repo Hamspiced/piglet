@@ -1854,7 +1854,7 @@ static bool initSD_SharedSPI() {
 static void handleRoot() { server.sendHeader("Cache-Control", "no-store"); server.send_P(200, "text/html", INDEX_HTML); }
 
 static void handleStatus() {
-  StaticJsonDocument<768> doc;
+  DynamicJsonDocument doc(1536);  // heap, not stack — avoids task stack overflow
   bool allowScan = scanningEnabled && sdOk && (userScanOverride || !autoPaused);
   doc["scanningEnabled"] = scanningEnabled;
   doc["allowScan"] = allowScan;
@@ -1908,7 +1908,7 @@ static void addDirFiles(JsonArray arr, const char* dir) {
 }
 
 static void handleFiles() {
-  StaticJsonDocument<4096> doc;
+  DynamicJsonDocument doc(4096);  // heap, not stack — 4KB static would overflow 8KB task stack
   doc["ok"] = sdOk;
   JsonArray arr = doc.createNestedArray("files");
   if (sdOk) { addDirFiles(arr, "/logs"); addDirFiles(arr, "/uploaded"); }
