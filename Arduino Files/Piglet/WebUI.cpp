@@ -669,9 +669,16 @@ loadStatus();loadFiles();
 
 // ---------------- Handlers ----------------
 
+static void handlePing() {
+  Serial.printf("[WEB] /ping  heap=%u\n", ESP.getFreeHeap());
+  server.send(200, "text/plain", "pong");
+}
+
 static void handleRoot() {
+  Serial.printf("[WEB] / requested  heap=%u\n", ESP.getFreeHeap());
   server.sendHeader("Cache-Control", "no-store");
   server.send_P(200, "text/html", INDEX_HTML);
+  Serial.println("[WEB] / send_P done");
 }
 
 static void handleStatus() {
@@ -1006,6 +1013,7 @@ void startWebServer() {
   server.on("/stop",   HTTP_POST, handleStop);
   server.on("/saveConfig", HTTP_POST, handleSaveConfig);
 
+  server.on("/ping",            handlePing);
   server.on("/reboot",          HTTP_POST, handleReboot);
   server.on("/cleanup",         HTTP_POST, handleCleanup);
   server.on("/wigle/test",      HTTP_POST, handleWigleTest);
