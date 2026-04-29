@@ -386,6 +386,10 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
   <!-- ============ FILES ============ -->
   <div class="card">
     <h3>SD Card Files</h3>
+    <div class="row mt-sm" style="margin-bottom:10px">
+      <button class="btn-sm" onclick="loadFiles()">&#8635; Refresh</button>
+      <button class="btn-sm btn-danger" onclick="deleteAllLogs()">&#128465; Delete All Logs</button>
+    </div>
     <div id="files" style="font-size:14px">Loading&hellip;</div>
   </div>
 
@@ -529,6 +533,21 @@ async function delFile(name){
     if(!r.ok) el.innerHTML='<span style="color:var(--bad)">Delete failed ('+r.status+')</span>';
   }catch(e){
     el.innerHTML='<span style="color:var(--bad)">Delete error: '+e+'</span>';
+    return;
+  }
+  await loadFiles();
+}
+
+async function deleteAllLogs(){
+  if(!confirm('Delete ALL log files from /logs and /uploaded?\nThis cannot be undone.'))return;
+  const el=$('files');
+  el.innerHTML='<span style="color:var(--muted)">Deleting all logs\u2026</span>';
+  try{
+    const r=await fetch('/deleteAll',{method:'POST'});
+    const j=await r.json().catch(()=>null);
+    if(!r.ok){el.innerHTML='<span style="color:var(--bad)">Delete failed ('+r.status+')</span>';return;}
+  }catch(e){
+    el.innerHTML='<span style="color:var(--bad)">Error: '+e+'</span>';
     return;
   }
   await loadFiles();
@@ -803,6 +822,36 @@ static void handleDelete() {
   server.send(ok ? 200 : 500, "text/plain", ok ? "OK" : "FAIL");
 }
 
+static void handleDeleteAll() {
+  if (!sdOk) { server.send(500, "application/json", "{\"ok\":false,\"error\":\"SD not available\"}"); return; }
+
+  uint32_t deleted = 0;
+  const char* dirs[] = { "/logs", "/uploaded" };
+  for (const char* dir : dirs) {
+    File root = SD.open(dir);
+    if (!root) continue;
+    std::vector<String> paths;
+    File f = root.openNextFile();
+    while (f) {
+      String p = normalizeSdPath(dir, f.name());
+      f.close();
+      if (p.length() > 0) paths.push_back(p);
+      f = root.openNextFile();
+    }
+    root.close();
+    for (const String& p : paths) {
+      if (currentCsvPath.length() > 0 && p == currentCsvPath) continue;
+      if (SD.remove(p)) deleted++;
+    }
+  }
+
+  DynamicJsonDocument doc(128);
+  doc["ok"] = true;
+  doc["deleted"] = deleted;
+  String out; serializeJson(doc, out);
+  server.send(200, "application/json", out);
+}
+
 static void handleStart() {
   scanningEnabled = true;
   userScanOverride = true;
@@ -1016,6 +1065,7 @@ void startWebServer() {
   server.on("/ping",            handlePing);
   server.on("/reboot",          HTTP_POST, handleReboot);
   server.on("/cleanup",         HTTP_POST, handleCleanup);
+  server.on("/deleteAll",       HTTP_POST, handleDeleteAll);
   server.on("/wigle/test",      HTTP_POST, handleWigleTest);
   server.on("/wigle/uploadAll", HTTP_POST, handleWigleUploadAll);
   server.on("/wigle/upload",    HTTP_POST, handleWigleUploadOne);

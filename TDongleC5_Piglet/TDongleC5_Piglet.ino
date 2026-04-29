@@ -1939,6 +1939,38 @@ static void handleDelete() {
   server.send(ok ? 200 : 500, "text/plain", ok ? "OK" : "FAIL");
 }
 
+static void handleDeleteAll() {
+  if (!sdOk) { server.send(500, "application/json", "{\"ok\":false,\"error\":\"SD not available\"}"); return; }
+
+  uint32_t deleted = 0;
+  const char* dirs[] = { "/logs", "/uploaded" };
+  for (const char* dir : dirs) {
+    digitalWrite(PINS.tft_cs, HIGH);
+    File root = SD.open(dir);
+    if (!root) continue;
+    std::vector<String> paths;
+    File f = root.openNextFile();
+    while (f) {
+      String p = normalizeSdPath(dir, f.name());
+      f.close();
+      if (p.length() > 0) paths.push_back(p);
+      f = root.openNextFile();
+    }
+    root.close();
+    for (const String& p : paths) {
+      if (currentCsvPath.length() > 0 && p == currentCsvPath) continue;
+      digitalWrite(PINS.tft_cs, HIGH);
+      if (SD.remove(p)) deleted++;
+    }
+  }
+
+  DynamicJsonDocument doc(128);
+  doc["ok"] = true;
+  doc["deleted"] = deleted;
+  String out; serializeJson(doc, out);
+  server.send(200, "application/json", out);
+}
+
 static void handleStart()    { scanningEnabled = true;  userScanOverride = true; server.send(200, "text/plain", "OK"); }
 static void handleStop()     { scanningEnabled = false; userScanOverride = true; server.send(200, "text/plain", "OK"); }
 static void handleNextPage() { advancePage(); server.send(200, "text/plain", String(currentPage)); }
@@ -2078,6 +2110,7 @@ static void startWebServer() {
   server.on("/wdgwars/uploadAll",HTTP_POST, handleWdgwarsUploadAll);
   server.on("/reboot",          HTTP_POST, handleReboot);
   server.on("/cleanup",         HTTP_POST, handleCleanup);
+  server.on("/deleteAll",       HTTP_POST, handleDeleteAll);
   server.begin();
   Serial.println("[WEB] Server started");
 }

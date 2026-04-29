@@ -118,6 +118,10 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
 
   <div class="card">
     <h3>SD Card Files</h3>
+    <div class="row mt-sm" style="margin-bottom:10px">
+      <button class="btn-sm" onclick="loadFiles()">&#8635; Refresh</button>
+      <button class="btn-sm btn-danger" onclick="deleteAllLogs()">&#128465; Delete All Logs</button>
+    </div>
     <div id="files" style="font-size:13px">Loading&hellip;</div>
   </div>
 
@@ -181,6 +185,19 @@ async function delFile(name){
     if(!r.ok){el.innerHTML='<span style="color:#fb7185">Delete failed ('+r.status+')</span>';return;}
   }catch(e){
     el.innerHTML='<span style="color:#fb7185">Delete error: '+e+'</span>';
+    return;
+  }
+  await loadFiles();
+}
+async function deleteAllLogs(){
+  if(!confirm('Delete ALL log files from /logs and /uploaded?\nThis cannot be undone.'))return;
+  const el=$('files');
+  el.innerHTML='<span style="color:#8899ab">Deleting all logs\u2026</span>';
+  try{
+    const r=await fetch('/deleteAll',{method:'POST'});
+    if(!r.ok){el.innerHTML='<span style="color:#fb7185">Delete failed ('+r.status+')</span>';return;}
+  }catch(e){
+    el.innerHTML='<span style="color:#fb7185">Error: '+e+'</span>';
     return;
   }
   await loadFiles();
