@@ -429,6 +429,11 @@ void enterNodeMode() {
   // Soft WiFi reset — do NOT erase NVS credentials (eraseap=false)
   WiFi.softAPdisconnect(true);
   WiFi.disconnect(true, false);
+  // Prevent STA auto-reconnect from moving the radio off ch 6 while ESP-Now runs.
+  // A background reconnect to the home AP changes the radio channel and silently
+  // kills ESP-Now receive (Core stops seeing node heartbeats → 20 s timeout).
+  WiFi.setAutoReconnect(false);
+  WiFi.persistent(false);
   delay(100);
   WiFi.mode(WIFI_STA);
   delay(150);  // let the driver settle before touching the channel
@@ -462,6 +467,7 @@ void exitNodeMode() {
   // Full WiFi stack reset: OFF then STA gives a clean state after esp_now_deinit
   WiFi.mode(WIFI_OFF);
   delay(150);
+  WiFi.setAutoReconnect(true);  // restore auto-reconnect for normal wardriving
   WiFi.mode(WIFI_STA);
   delay(100);
 
@@ -494,6 +500,9 @@ void enterCoreMode() {
 
   WiFi.softAPdisconnect(true);
   WiFi.disconnect(true, false);
+  // Prevent STA auto-reconnect from moving the radio off ch 6 while ESP-Now runs.
+  WiFi.setAutoReconnect(false);
+  WiFi.persistent(false);
   delay(100);
   WiFi.mode(WIFI_STA);
   delay(150);
@@ -520,6 +529,7 @@ void exitCoreMode() {
 
   WiFi.mode(WIFI_OFF);
   delay(150);
+  WiFi.setAutoReconnect(true);  // restore auto-reconnect for normal wardriving
   WiFi.mode(WIFI_STA);
   delay(100);
 

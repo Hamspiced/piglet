@@ -1771,8 +1771,10 @@ static void enterCoreMode() {
   // Mesh mode owns the WiFi stack — prevent stopAPIfAllowed() from firing
   // WiFi.disconnect(true,true) after esp_now_init() would kill the ESP-Now driver.
   apWindowActive = false;
-  WiFi.softAPdisconnect(true); WiFi.disconnect(true,false); delay(100);
-  WiFi.mode(WIFI_STA); delay(150);
+  WiFi.softAPdisconnect(true); WiFi.disconnect(true,false);
+  // Prevent STA auto-reconnect from moving the radio off ch 6 while ESP-Now runs.
+  WiFi.setAutoReconnect(false); WiFi.persistent(false);
+  delay(100); WiFi.mode(WIFI_STA); delay(150);
   esp_err_t err=esp_now_init();
   if (err!=ESP_OK) { Serial.printf("[CORE] init failed: %d\n",(int)err); return; }
   esp_now_register_recv_cb(jcmkOnRecv);
@@ -1786,7 +1788,9 @@ static void exitCoreMode() {
   Serial.println("[CORE] Exiting Core mode");
   if (meshCoreActive) esp_now_deinit();
   meshCoreActive=false; coreNodeCount=0;
-  WiFi.mode(WIFI_OFF); delay(150); WiFi.mode(WIFI_STA); delay(100);
+  WiFi.mode(WIFI_OFF); delay(150);
+  WiFi.setAutoReconnect(true);  // restore auto-reconnect for normal wardriving
+  WiFi.mode(WIFI_STA); delay(100);
   while (GPSSerial.available()) gps.encode(GPSSerial.read());
   scanningEnabled=true;
   pageNeedsInit[4]=true;  // force TFT header redraw for Node mode
@@ -1874,6 +1878,9 @@ static void enterNodeMode() {
   // Soft WiFi reset — do NOT erase NVS credentials (eraseap=false)
   WiFi.softAPdisconnect(true);
   WiFi.disconnect(true, false);
+  // Prevent STA auto-reconnect from moving the radio off ch 6 while ESP-Now runs.
+  WiFi.setAutoReconnect(false);
+  WiFi.persistent(false);
   delay(100);
   WiFi.mode(WIFI_STA);
   delay(150);  // let the driver settle before touching the channel
@@ -1908,6 +1915,7 @@ static void exitNodeMode() {
   // Full WiFi stack reset: OFF then STA gives a clean state after esp_now_deinit
   WiFi.mode(WIFI_OFF);
   delay(150);
+  WiFi.setAutoReconnect(true);  // restore auto-reconnect for normal wardriving
   WiFi.mode(WIFI_STA);
   delay(100);
 
