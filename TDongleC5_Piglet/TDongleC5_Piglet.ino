@@ -1559,7 +1559,7 @@ static uint8_t      coreAssignVer   = 0;
 static uint32_t     coreLastHbMs    = 0;
 static uint32_t     coreHbCounter   = 0;
 static const uint32_t CORE_HB_MS         = 5000;
-static const uint32_t CORE_NODE_TIMEOUT  = 20000;
+static const uint32_t CORE_NODE_TIMEOUT  = 45000;  // 45 s — accounts for blocking scan latency
 
 #define CORE_REQ_QUEUE   4
 #define CORE_TEXT_QUEUE 16
@@ -1852,6 +1852,14 @@ static void nodeDoScan() {
   }
   // Return radio to JCMK home channel so ESP-Now can transmit
   jcmkSetChannel(JCMK_ESPNOW_CH);
+
+  // Send a guaranteed heartbeat after each scan cycle (JCMK pattern).
+  // The blocking scan can delay the 5 s timer heartbeat; sending one here
+  // ensures the Core always gets a heartbeat within one scan cycle.
+  if (jcmkHaveCore) {
+    jcmkSendHeartbeat();
+    jcmkLastHbMs = millis();  // reset timer so 5 s window starts fresh
+  }
 }
 
 // Enter mesh node mode — call on page 4 entry

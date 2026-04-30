@@ -99,7 +99,7 @@ static uint32_t coreLastHbMs   = 0;
 static uint32_t coreHbCounter  = 0;
 
 static const uint32_t CORE_HB_MS        = 5000;
-static const uint32_t CORE_NODE_TIMEOUT = 20000;  // 20 s without HB
+static const uint32_t CORE_NODE_TIMEOUT = 45000;  // 45 s — accounts for blocking scan latency
 
 // Ring buffers: ESP-Now callback → main loop
 #define CORE_REQ_QUEUE   4
@@ -401,6 +401,14 @@ static void nodeDoScan() {
 
   // Drain GPS serial buffer that built up during the blocking scan
   while (GPSSerial.available()) gps.encode(GPSSerial.read());
+
+  // Send a guaranteed heartbeat after each scan cycle (JCMK pattern).
+  // The blocking scan can delay the 5 s timer heartbeat; sending one here
+  // ensures the Core always gets a heartbeat within one scan cycle.
+  if (jcmkHaveCore) {
+    jcmkSendHeartbeat();
+    jcmkLastHbMs = millis();  // reset timer so 5 s window starts fresh
+  }
 }
 
 // ================================================================
