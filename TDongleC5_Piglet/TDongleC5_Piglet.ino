@@ -1768,6 +1768,9 @@ static void enterCoreMode() {
   coreAssignVer=0; coreHbCounter=0; coreLastHbMs=0;
   coreReqHead=coreReqTail=0; coreTextHead=coreTextTail=0;
   memset(coreNodes, 0, sizeof(coreNodes));
+  // Mesh mode owns the WiFi stack — prevent stopAPIfAllowed() from firing
+  // WiFi.disconnect(true,true) after esp_now_init() would kill the ESP-Now driver.
+  apWindowActive = false;
   WiFi.softAPdisconnect(true); WiFi.disconnect(true,false); delay(100);
   WiFi.mode(WIFI_STA); delay(150);
   esp_err_t err=esp_now_init();
@@ -1863,6 +1866,10 @@ static void enterNodeMode() {
   jcmkStartIdx          = 0;
   jcmkEndIdx            = JCMK_NUM_CHANNELS - 1;
   jcmkAssignVer         = 0;
+
+  // Mesh mode owns the WiFi stack — prevent stopAPIfAllowed() from firing
+  // WiFi.disconnect(true,true) after esp_now_init() would kill the ESP-Now driver.
+  apWindowActive = false;
 
   // Soft WiFi reset — do NOT erase NVS credentials (eraseap=false)
   WiFi.softAPdisconnect(true);
