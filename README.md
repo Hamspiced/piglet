@@ -26,7 +26,6 @@ Designed for **Seeed XIAO ESP32-S3, ESP32-C5, and ESP32-C6**, Piglet focuses on:
 - OLED live status display  
 - Optional battery monitoring (board dependent)  
 - Automatic STA connect with AP fallback  
-- Network de-duplication  
 - Optimized for mobile wardriving or warWalking!
 - **ESP-Now Mesh Node mode** — pair with a coordinator device for multi-node wardriving
 - **Mesh auto-start on boot** — configure `meshModeOnBoot` to automatically enter Core or Node mode after uploads complete, bypassing the AP window
