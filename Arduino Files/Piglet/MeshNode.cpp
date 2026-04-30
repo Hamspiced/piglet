@@ -1,6 +1,7 @@
 #include "MeshNode.h"
 #include "Globals.h"
 #include "GPS.h"
+#include "SDUtils.h"
 #include <esp_now.h>
 #include "esp_wifi.h"
 
@@ -86,6 +87,34 @@ static volatile bool  jcmkCoreFoundPending = false;
 static uint8_t        jcmkCoreMacPending[6] = {0};
 
 // ================================================================
+//  Core mode state
+// ================================================================
+bool         meshCoreActive = false;
+uint32_t     coreRecordsRx  = 0;
+uint8_t      coreNodeCount  = 0;
+CoreNodeInfo coreNodes[CORE_MAX_NODES] = {};
+
+static uint8_t  coreAssignVer  = 0;
+static uint32_t coreLastHbMs   = 0;
+static uint32_t coreHbCounter  = 0;
+
+static const uint32_t CORE_HB_MS        = 5000;
+static const uint32_t CORE_NODE_TIMEOUT = 20000;  // 20 s without HB
+
+// Ring buffers: ESP-Now callback → main loop
+#define CORE_REQ_QUEUE   4
+#define CORE_TEXT_QUEUE 16
+
+struct CorReqSlot  { uint8_t mac[6]; };
+struct CorTextSlot { char    line[JCMK_TEXT_MAX + 1]; };
+
+static CorReqSlot          coreReqBuf[CORE_REQ_QUEUE];
+static volatile uint8_t    coreReqHead = 0, coreReqTail = 0;
+
+static CorTextSlot         coreTextBuf[CORE_TEXT_QUEUE];
+static volatile uint8_t    coreTextHead = 0, coreTextTail = 0;
+
+// ================================================================
 //  Local helpers
 // ================================================================
 static String meshAuthModeToString(wifi_auth_mode_t m) {
@@ -152,24 +181,168 @@ static void jcmkSendText(const String& s) {
   esp_now_send(dest, (uint8_t*)&msg, pktLen);
 }
 
-// ESP-Now receive callback — called from WiFi task; keep it short
+// ================================================================
+//  Core mode helpers (forward declarations used in jcmkOnRecv)
+// ================================================================
+static void coreSendReply(const uint8_t* mac) {
+  jcmk_req_msg_t msg;
+  memcpy(msg.magic, JCMK_MAGIC, 4);
+  msg.type = JCMK_MSG_CORE_REPLY;
+  esp_now_send(mac, (uint8_t*)&msg, sizeof(msg));
+}
+
+// ESP-Now receive callback — handles both Node and Core roles
 static void jcmkOnRecv(const esp_now_recv_info_t* info,
                         const uint8_t* data, int len) {
   if (len < 5) return;
   if (data[0] != 'E' || data[1] != 'N' || data[2] != 'O' || data[3] != 'W') return;
   uint8_t type = data[4];
 
-  if (type == JCMK_MSG_CORE_REPLY && !jcmkHaveCore && !jcmkCoreFoundPending) {
-    memcpy(jcmkCoreMacPending, info->src_addr, 6);
-    jcmkCoreFoundPending = true;
-  } else if (type == JCMK_MSG_ADMIN && len >= (int)sizeof(jcmk_admin_msg_t)) {
-    const jcmk_admin_msg_t* adm = (const jcmk_admin_msg_t*)data;
-    if (adm->assignment_version != jcmkAssignVer) {
-      jcmkAssignVer = adm->assignment_version;
-      jcmkStartIdx  = adm->start_channel_idx;
-      jcmkEndIdx    = adm->end_channel_idx;
+  if (meshCoreActive) {
+    // ---- Core role: handle requests from nodes ----
+    if (type == JCMK_MSG_CORE_REQUEST) {
+      coreSendReply(info->src_addr);  // reply immediately (safe from callback)
+      uint8_t next = (coreReqTail + 1) % CORE_REQ_QUEUE;
+      if (next != coreReqHead) {
+        memcpy(coreReqBuf[coreReqTail].mac, info->src_addr, 6);
+        coreReqTail = next;
+      }
+    } else if (type == JCMK_MSG_TEXT && len >= 11) {
+      const jcmk_text_msg_t* tm = (const jcmk_text_msg_t*)data;
+      uint8_t next = (coreTextTail + 1) % CORE_TEXT_QUEUE;
+      if (next != coreTextHead) {
+        uint16_t slen = (tm->len < JCMK_TEXT_MAX) ? tm->len : JCMK_TEXT_MAX;
+        memcpy(coreTextBuf[coreTextTail].line, tm->text, slen);
+        coreTextBuf[coreTextTail].line[slen] = '\0';
+        coreTextTail = next;
+      }
+      // Data counts as a heartbeat
+      for (uint8_t i = 0; i < CORE_MAX_NODES; i++) {
+        if (coreNodes[i].active && memcmp(coreNodes[i].mac, info->src_addr, 6) == 0) {
+          coreNodes[i].lastHbMs = millis();
+          coreNodes[i].recordsRx++;
+          break;
+        }
+      }
+    } else if (type == JCMK_MSG_HEARTBEAT) {
+      for (uint8_t i = 0; i < CORE_MAX_NODES; i++) {
+        if (coreNodes[i].active && memcmp(coreNodes[i].mac, info->src_addr, 6) == 0) {
+          coreNodes[i].lastHbMs = millis();
+          break;
+        }
+      }
+    }
+  } else {
+    // ---- Node role (existing) ----
+    if (type == JCMK_MSG_CORE_REPLY && !jcmkHaveCore && !jcmkCoreFoundPending) {
+      memcpy(jcmkCoreMacPending, info->src_addr, 6);
+      jcmkCoreFoundPending = true;
+    } else if (type == JCMK_MSG_ADMIN && len >= (int)sizeof(jcmk_admin_msg_t)) {
+      const jcmk_admin_msg_t* adm = (const jcmk_admin_msg_t*)data;
+      if (adm->assignment_version != jcmkAssignVer) {
+        jcmkAssignVer = adm->assignment_version;
+        jcmkStartIdx  = adm->start_channel_idx;
+        jcmkEndIdx    = adm->end_channel_idx;
+      }
     }
   }
+}
+
+// ================================================================
+//  Core mode helpers (main loop only — not ISR-safe)
+// ================================================================
+static void coreFindOrAddNode(const uint8_t* mac) {
+  for (uint8_t i = 0; i < CORE_MAX_NODES; i++) {
+    if (coreNodes[i].active && memcmp(coreNodes[i].mac, mac, 6) == 0) {
+      coreNodes[i].lastHbMs = millis();
+      return;  // already registered
+    }
+  }
+  for (uint8_t i = 0; i < CORE_MAX_NODES; i++) {
+    if (!coreNodes[i].active) {
+      coreNodes[i].active    = true;
+      coreNodes[i].lastHbMs  = millis();
+      coreNodes[i].recordsRx = 0;
+      memcpy(coreNodes[i].mac, mac, 6);
+      coreNodeCount++;
+      jcmkAddPeer(mac);
+      Serial.printf("[CORE] New node %d: %02X:%02X:%02X:%02X:%02X:%02X\n",
+        i, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+      return;
+    }
+  }
+  Serial.println("[CORE] Max nodes reached");
+}
+
+static void coreReassignChannels() {
+  // Build list of active slot indices
+  uint8_t slots[CORE_MAX_NODES];
+  uint8_t count = 0;
+  for (uint8_t i = 0; i < CORE_MAX_NODES; i++)
+    if (coreNodes[i].active) slots[count++] = i;
+  if (count == 0) return;
+
+  // Split JCMK_CHANNELS[] evenly; last node gets the remainder
+  uint8_t perNode  = JCMK_NUM_CHANNELS / count;
+  uint8_t startIdx = 0;
+  for (uint8_t n = 0; n < count; n++) {
+    coreNodes[slots[n]].startIdx = startIdx;
+    coreNodes[slots[n]].endIdx   = (n < count - 1)
+                                   ? (startIdx + perNode - 1)
+                                   : (JCMK_NUM_CHANNELS - 1);
+    startIdx += perNode;
+  }
+  coreAssignVer++;
+
+  // Send ADMIN to each active node
+  jcmk_admin_msg_t msg;
+  memcpy(msg.magic, JCMK_MAGIC, 4);
+  msg.type       = JCMK_MSG_ADMIN;
+  msg.node_count = count;
+  msg.assignment_version = coreAssignVer;
+  for (uint8_t n = 0; n < count; n++) {
+    uint8_t slot = slots[n];
+    msg.node_index        = n;
+    msg.start_channel_idx = coreNodes[slot].startIdx;
+    msg.end_channel_idx   = coreNodes[slot].endIdx;
+    esp_now_send(coreNodes[slot].mac, (uint8_t*)&msg, sizeof(msg));
+  }
+  Serial.printf("[CORE] Reassigned channels: %d nodes v%d\n", count, coreAssignVer);
+}
+
+static void coreSendHeartbeatToAll() {
+  jcmk_hb_msg_t msg;
+  memcpy(msg.magic, JCMK_MAGIC, 4);
+  msg.type    = JCMK_MSG_HEARTBEAT;
+  msg.counter = ++coreHbCounter;
+  for (uint8_t i = 0; i < CORE_MAX_NODES; i++)
+    if (coreNodes[i].active)
+      esp_now_send(coreNodes[i].mac, (uint8_t*)&msg, sizeof(msg));
+}
+
+static void coreParseAndLogText(const char* line) {
+  // JCMK format: BSSID,SSID,AUTH,CHANNEL,RSSI,W
+  String s(line);
+  int p0 = s.indexOf(',');                if (p0 < 0) return;
+  int p1 = s.indexOf(',', p0 + 1);       if (p1 < 0) return;
+  int p2 = s.indexOf(',', p1 + 1);       if (p2 < 0) return;
+  int p3 = s.indexOf(',', p2 + 1);       if (p3 < 0) return;
+
+  String bssid = s.substring(0,      p0);
+  String ssid  = s.substring(p0 + 1, p1);
+  String auth  = s.substring(p1 + 1, p2);
+  int    ch    = s.substring(p2 + 1, p3).toInt();
+  int    rssi  = s.substring(p3 + 1).toInt();  // toInt() stops at next comma
+
+  double lat = 0, lon = 0, altM = 0, accM = 0;
+  if (gpsHasFix) {
+    lat  = gps.location.lat();
+    lon  = gps.location.lng();
+    altM = gps.altitude.meters();
+    accM = gps.hdop.hdop();
+  }
+  appendWigleRow(bssid, ssid, auth, iso8601NowUTC(), ch, rssi, lat, lon, altM, accM);
+  coreRecordsRx++;
 }
 
 // ================================================================
@@ -275,6 +448,96 @@ void exitNodeMode() {
 }
 
 // ================================================================
+//  Core mode lifecycle
+// ================================================================
+void enterCoreMode() {
+  Serial.println("[CORE] Entering Core mode");
+
+  meshCoreActive = false;
+  coreRecordsRx  = 0;
+  coreNodeCount  = 0;
+  coreAssignVer  = 0;
+  coreHbCounter  = 0;
+  coreLastHbMs   = 0;
+  coreReqHead = coreReqTail = 0;
+  coreTextHead = coreTextTail = 0;
+  memset(coreNodes, 0, sizeof(coreNodes));
+
+  WiFi.softAPdisconnect(true);
+  WiFi.disconnect(true, false);
+  delay(100);
+  WiFi.mode(WIFI_STA);
+  delay(150);
+
+  esp_err_t err = esp_now_init();
+  if (err != ESP_OK) {
+    Serial.printf("[CORE] esp_now_init failed: %d\n", (int)err);
+    return;
+  }
+  esp_now_register_recv_cb(jcmkOnRecv);
+  delay(50);
+  jcmkSetChannel(JCMK_ESPNOW_CH);
+  jcmkAddPeer(JCMK_BCAST);
+
+  meshCoreActive = true;
+  Serial.println("[CORE] Ready — listening for nodes on ch 6");
+}
+
+void exitCoreMode() {
+  Serial.println("[CORE] Exiting Core mode");
+  if (meshCoreActive) esp_now_deinit();
+  meshCoreActive = false;
+  coreNodeCount  = 0;
+
+  WiFi.mode(WIFI_OFF);
+  delay(150);
+  WiFi.mode(WIFI_STA);
+  delay(100);
+
+  while (GPSSerial.available()) gps.encode(GPSSerial.read());
+  scanningEnabled = true;
+}
+
+void coreModeTick() {
+  if (!meshCoreActive) return;
+  uint32_t now = millis();
+
+  // 1. Process pending CORE_REQUEST queue (new node registrations)
+  while (coreReqHead != coreReqTail) {
+    uint8_t i = coreReqHead;
+    coreReqHead = (coreReqHead + 1) % CORE_REQ_QUEUE;
+    coreFindOrAddNode(coreReqBuf[i].mac);
+    coreReassignChannels();
+  }
+
+  // 2. Process pending TEXT records
+  while (coreTextHead != coreTextTail) {
+    uint8_t i = coreTextHead;
+    coreTextHead = (coreTextHead + 1) % CORE_TEXT_QUEUE;
+    coreParseAndLogText(coreTextBuf[i].line);
+  }
+
+  // 3. Periodic heartbeat to all connected nodes
+  if (now - coreLastHbMs >= CORE_HB_MS) {
+    coreLastHbMs = now;
+    coreSendHeartbeatToAll();
+  }
+
+  // 4. Node timeout check
+  bool changed = false;
+  for (uint8_t i = 0; i < CORE_MAX_NODES; i++) {
+    if (coreNodes[i].active && (now - coreNodes[i].lastHbMs) > CORE_NODE_TIMEOUT) {
+      Serial.printf("[CORE] Node %d timed out\n", i);
+      esp_now_del_peer(coreNodes[i].mac);
+      memset(&coreNodes[i], 0, sizeof(CoreNodeInfo));
+      coreNodeCount--;
+      changed = true;
+    }
+  }
+  if (changed) coreReassignChannels();
+}
+
+// ================================================================
 //  Loop tick
 // ================================================================
 void nodeModeTick() {
@@ -317,69 +580,128 @@ void nodeModeTick() {
 }
 
 // ================================================================
-//  OLED page renderer (page 5) — 128×64 SSD1306
-//  Yellow band header (0..15): "Mesh"
-//  Blue body (16..63): status rows at size 1 (8px/row)
+//  OLED page renderer (page 5) — handles both Node and Core mode
 // ================================================================
 void drawPageMeshNode() {
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
-
-  // Header
   display.setTextSize(2);
   display.setCursor(0, 0);
-  display.print("Mesh");
-  display.drawFastHLine(0, 15, 128, SSD1306_WHITE);
 
-  display.setTextSize(1);
+  if (meshCoreActive) {
+    // ---- Core mode ----
+    display.print("CORE");
+    // Node count in small text next to header
+    display.setTextSize(1);
+    char nb[5]; snprintf(nb, sizeof(nb), "[%d]", coreNodeCount);
+    display.setCursor(52, 5);
+    display.print(nb);
+    display.drawFastHLine(0, 15, 128, SSD1306_WHITE);
 
-  // Row 1 (y=16): link status
-  display.setCursor(0, 17);
-  if (!meshNodeActive) {
-    display.print("Init error");
-  } else if (!jcmkHaveCore) {
-    display.print("Searching...");
+    display.setTextSize(1);
+
+    // Row 1 (y=17): status
+    display.setCursor(0, 17);
+    if (coreNodeCount == 0) {
+      display.print("Waiting for nodes");
+    } else {
+      char buf[22];
+      snprintf(buf, sizeof(buf), "%d node%s connected",
+               coreNodeCount, coreNodeCount == 1 ? "" : "s");
+      display.print(buf);
+    }
+
+    // Rows 2-3 (y=26, y=35): first 2 active node slots
+    uint8_t shown = 0;
+    for (uint8_t i = 0; i < CORE_MAX_NODES && shown < 2; i++) {
+      int y = (shown == 0) ? 26 : 35;
+      display.setCursor(0, y);
+      if (coreNodes[i].active) {
+        uint8_t* m = coreNodes[i].mac;
+        uint8_t si = coreNodes[i].startIdx, ei = coreNodes[i].endIdx;
+        char buf[22];
+        snprintf(buf, sizeof(buf), "%02X:%02X:%02X %d-%d",
+                 m[3], m[4], m[5],
+                 (si < JCMK_NUM_CHANNELS) ? JCMK_CHANNELS[si] : 0,
+                 (ei < JCMK_NUM_CHANNELS) ? JCMK_CHANNELS[ei] : 0);
+        display.print(buf);
+        shown++;
+      }
+    }
+    if (shown == 0) {
+      display.setCursor(0, 26); display.print("--:--:-- ------");
+      display.setCursor(0, 35); display.print("--:--:-- ------");
+    } else if (shown == 1) {
+      display.setCursor(0, 35); display.print("--:--:-- ------");
+    }
+
+    // Row 4 (y=44): total records received
+    display.setCursor(0, 44);
+    char rbuf[22];
+    snprintf(rbuf, sizeof(rbuf), "Rcvd: %lu", (unsigned long)coreRecordsRx);
+    display.print(rbuf);
+
+    // Row 5 (y=53): GPS + hint
+    display.setCursor(0, 53);
+    display.print(gpsHasFix ? "GPS:FIX" : "GPS:---");
+    display.setCursor(62, 53);
+    display.print("Hold=Node");
+
   } else {
-    display.print("Core linked");
+    // ---- Node mode (original layout) ----
+    display.print("Mesh");
+    display.drawFastHLine(0, 15, 128, SSD1306_WHITE);
+    display.setTextSize(1);
+
+    // Row 1 (y=17): link status
+    display.setCursor(0, 17);
+    if (!meshNodeActive) {
+      display.print("Init error");
+    } else if (!jcmkHaveCore) {
+      display.print("Searching...");
+    } else {
+      display.print("Core linked");
+    }
+
+    // Row 2 (y=26): core MAC
+    display.setCursor(0, 26);
+    if (jcmkHaveCore) {
+      char macStr[18];
+      snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
+        jcmkCoreMac[0], jcmkCoreMac[1], jcmkCoreMac[2],
+        jcmkCoreMac[3], jcmkCoreMac[4], jcmkCoreMac[5]);
+      display.print(macStr);
+    } else {
+      display.print("--:--:--:--:--:--");
+    }
+
+    // Row 3 (y=35): channel assignment + ENOW ch
+    display.setCursor(0, 35);
+    display.print("Ch:");
+    if (jcmkAssignVer > 0 && jcmkStartIdx < JCMK_NUM_CHANNELS
+                          && jcmkEndIdx   < JCMK_NUM_CHANNELS) {
+      display.print(JCMK_CHANNELS[jcmkStartIdx]);
+      display.print("-");
+      display.print(JCMK_CHANNELS[jcmkEndIdx]);
+    } else {
+      display.print("all");
+    }
+    display.setCursor(72, 35);
+    display.print("ENOW:");
+    display.print(JCMK_ESPNOW_CH);
+
+    // Row 4 (y=44): networks found
+    display.setCursor(0, 44);
+    display.print("Found:");
+    display.print(jcmkNetworksFound);
+
+    // Row 5 (y=53): records sent + hint
+    display.setCursor(0, 53);
+    display.print("Sent:");
+    display.print(jcmkSentCount);
+    display.setCursor(66, 53);
+    display.print("Hold=Core");
   }
-
-  // Row 2 (y=25): core MAC (xx:xx:xx:xx:xx:xx = 17 chars @ 6px = 102px — fits)
-  display.setCursor(0, 26);
-  if (jcmkHaveCore) {
-    char macStr[18];
-    snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
-      jcmkCoreMac[0], jcmkCoreMac[1], jcmkCoreMac[2],
-      jcmkCoreMac[3], jcmkCoreMac[4], jcmkCoreMac[5]);
-    display.print(macStr);
-  } else {
-    display.print("--:--:--:--:--:--");
-  }
-
-  // Row 3 (y=34): channel assignment
-  display.setCursor(0, 35);
-  display.print("Ch:");
-  if (jcmkAssignVer > 0 && jcmkStartIdx < JCMK_NUM_CHANNELS
-                        && jcmkEndIdx   < JCMK_NUM_CHANNELS) {
-    display.print(JCMK_CHANNELS[jcmkStartIdx]);
-    display.print("-");
-    display.print(JCMK_CHANNELS[jcmkEndIdx]);
-  } else {
-    display.print("all");
-  }
-  // ENOW home channel on the same row, right side
-  display.setCursor(72, 35);
-  display.print("ENOW:");
-  display.print(JCMK_ESPNOW_CH);
-
-  // Row 4 (y=44): networks found
-  display.setCursor(0, 44);
-  display.print("Found:");
-  display.print(jcmkNetworksFound);
-
-  // Row 5 (y=53): records sent to Core
-  display.setCursor(0, 53);
-  display.print("Sent:");
-  display.print(jcmkSentCount);
 
   display.display();
 }

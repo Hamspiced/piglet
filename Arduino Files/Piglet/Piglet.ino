@@ -102,9 +102,12 @@ static void onPageChange(uint8_t oldPage, uint8_t newPage) {
     pig.phase = 0;
   }
 
-  // Mesh node page lifecycle
+  // Mesh node page lifecycle — always enter as Node; long-press activates Core
   if (newPage == 5) enterNodeMode();
-  if (oldPage == 5) exitNodeMode();
+  if (oldPage == 5) {
+    if (meshCoreActive) exitCoreMode();
+    else                exitNodeMode();
+  }
 
   Serial.print("[PAGE] ");
   Serial.print(oldPage);
@@ -144,7 +147,18 @@ static void pollButton() {
           (millis() - pressStartMs >= LONG_PRESS_MS)) {
         longPressTriggered = true;
         clickCount = 0;  // cancel any pending click
-        enterDeepSleep();  // never returns
+        if (currentPage == 5) {
+          // Mesh page: toggle Core / Node instead of sleeping
+          if (meshCoreActive) {
+            exitCoreMode();
+            enterNodeMode();
+          } else {
+            exitNodeMode();
+            enterCoreMode();
+          }
+        } else {
+          enterDeepSleep();  // never returns
+        }
       }
     } else {
       // Released
@@ -535,7 +549,8 @@ void loop() {
   // Scanning – page-aware logic
   // Mesh node page handles its own scan via nodeModeTick(); skip normal path.
   if (currentPage == 5) {
-    nodeModeTick();
+    if (meshCoreActive) coreModeTick();
+    else                nodeModeTick();
   } else {
     autoPaused = shouldPauseScanning();
     wifi_mode_t m = WiFi.getMode();

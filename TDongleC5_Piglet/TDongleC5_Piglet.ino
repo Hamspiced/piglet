@@ -1542,6 +1542,34 @@ static uint32_t jcmkLastScanMs  = 0;
 static volatile bool  jcmkCoreFoundPending = false;
 static uint8_t        jcmkCoreMacPending[6] = {0};
 
+// ---- Core mode state ----
+#define CORE_MAX_NODES 4
+struct CoreNodeInfo {
+  bool     active;
+  uint8_t  mac[6];
+  uint8_t  startIdx, endIdx;
+  uint32_t lastHbMs;
+  uint32_t recordsRx;
+};
+static bool         meshCoreActive  = false;
+static uint32_t     coreRecordsRx   = 0;
+static uint8_t      coreNodeCount   = 0;
+static CoreNodeInfo coreNodes[CORE_MAX_NODES] = {};
+static uint8_t      coreAssignVer   = 0;
+static uint32_t     coreLastHbMs    = 0;
+static uint32_t     coreHbCounter   = 0;
+static const uint32_t CORE_HB_MS         = 5000;
+static const uint32_t CORE_NODE_TIMEOUT  = 20000;
+
+#define CORE_REQ_QUEUE   4
+#define CORE_TEXT_QUEUE 16
+struct CorReqSlot  { uint8_t mac[6]; };
+struct CorTextSlot { char    line[JCMK_TEXT_MAX + 1]; };
+static CorReqSlot         coreReqBuf[CORE_REQ_QUEUE];
+static volatile uint8_t   coreReqHead = 0, coreReqTail = 0;
+static CorTextSlot        coreTextBuf[CORE_TEXT_QUEUE];
+static volatile uint8_t   coreTextHead = 0, coreTextTail = 0;
+
 // ------------- ESP-Now helpers -----------------------------------
 static void jcmkSetChannel(uint8_t ch) {
   esp_wifi_set_ps(WIFI_PS_NONE);
@@ -1590,24 +1618,182 @@ static void jcmkSendText(const String& s) {
   esp_now_send(dest, (uint8_t*)&msg, pktLen);
 }
 
-// ESP-Now receive callback — called from WiFi task; keep it short
+// ---- Core forward decl (used inside jcmkOnRecv callback) ----
+static void coreSendReply(const uint8_t* mac) {
+  jcmk_req_msg_t msg;
+  memcpy(msg.magic, JCMK_MAGIC, 4);
+  msg.type = JCMK_MSG_CORE_REPLY;
+  esp_now_send(mac, (uint8_t*)&msg, sizeof(msg));
+}
+
+// ESP-Now receive callback — handles both Node and Core roles
 static void jcmkOnRecv(const esp_now_recv_info_t* info,
                         const uint8_t* data, int len) {
   if (len < 5) return;
   if (data[0] != 'E' || data[1] != 'N' || data[2] != 'O' || data[3] != 'W') return;
   uint8_t type = data[4];
 
-  if (type == JCMK_MSG_CORE_REPLY && !jcmkHaveCore && !jcmkCoreFoundPending) {
-    memcpy(jcmkCoreMacPending, info->src_addr, 6);
-    jcmkCoreFoundPending = true;
-  } else if (type == JCMK_MSG_ADMIN && len >= (int)sizeof(jcmk_admin_msg_t)) {
-    const jcmk_admin_msg_t* adm = (const jcmk_admin_msg_t*)data;
-    if (adm->assignment_version != jcmkAssignVer) {
-      jcmkAssignVer = adm->assignment_version;
-      jcmkStartIdx  = adm->start_channel_idx;
-      jcmkEndIdx    = adm->end_channel_idx;
+  if (meshCoreActive) {
+    if (type == JCMK_MSG_CORE_REQUEST) {
+      coreSendReply(info->src_addr);
+      uint8_t next = (coreReqTail + 1) % CORE_REQ_QUEUE;
+      if (next != coreReqHead) {
+        memcpy(coreReqBuf[coreReqTail].mac, info->src_addr, 6);
+        coreReqTail = next;
+      }
+    } else if (type == JCMK_MSG_TEXT && len >= 11) {
+      const jcmk_text_msg_t* tm = (const jcmk_text_msg_t*)data;
+      uint8_t next = (coreTextTail + 1) % CORE_TEXT_QUEUE;
+      if (next != coreTextHead) {
+        uint16_t slen = (tm->len < JCMK_TEXT_MAX) ? tm->len : JCMK_TEXT_MAX;
+        memcpy(coreTextBuf[coreTextTail].line, tm->text, slen);
+        coreTextBuf[coreTextTail].line[slen] = '\0';
+        coreTextTail = next;
+      }
+      for (uint8_t i = 0; i < CORE_MAX_NODES; i++) {
+        if (coreNodes[i].active && memcmp(coreNodes[i].mac, info->src_addr, 6) == 0) {
+          coreNodes[i].lastHbMs = millis();
+          coreNodes[i].recordsRx++;
+          break;
+        }
+      }
+    } else if (type == JCMK_MSG_HEARTBEAT) {
+      for (uint8_t i = 0; i < CORE_MAX_NODES; i++) {
+        if (coreNodes[i].active && memcmp(coreNodes[i].mac, info->src_addr, 6) == 0) {
+          coreNodes[i].lastHbMs = millis();
+          break;
+        }
+      }
+    }
+  } else {
+    if (type == JCMK_MSG_CORE_REPLY && !jcmkHaveCore && !jcmkCoreFoundPending) {
+      memcpy(jcmkCoreMacPending, info->src_addr, 6);
+      jcmkCoreFoundPending = true;
+    } else if (type == JCMK_MSG_ADMIN && len >= (int)sizeof(jcmk_admin_msg_t)) {
+      const jcmk_admin_msg_t* adm = (const jcmk_admin_msg_t*)data;
+      if (adm->assignment_version != jcmkAssignVer) {
+        jcmkAssignVer = adm->assignment_version;
+        jcmkStartIdx  = adm->start_channel_idx;
+        jcmkEndIdx    = adm->end_channel_idx;
+      }
     }
   }
+}
+
+// ---- Core mode helpers (main loop only) ----
+static void coreFindOrAddNode(const uint8_t* mac) {
+  for (uint8_t i = 0; i < CORE_MAX_NODES; i++) {
+    if (coreNodes[i].active && memcmp(coreNodes[i].mac, mac, 6) == 0) {
+      coreNodes[i].lastHbMs = millis(); return;
+    }
+  }
+  for (uint8_t i = 0; i < CORE_MAX_NODES; i++) {
+    if (!coreNodes[i].active) {
+      coreNodes[i].active = true; coreNodes[i].lastHbMs = millis();
+      coreNodes[i].recordsRx = 0; memcpy(coreNodes[i].mac, mac, 6);
+      coreNodeCount++; jcmkAddPeer(mac);
+      Serial.printf("[CORE] New node %d: %02X:%02X:%02X:%02X:%02X:%02X\n",
+        i, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+      return;
+    }
+  }
+}
+
+static void coreReassignChannels() {
+  uint8_t slots[CORE_MAX_NODES]; uint8_t count = 0;
+  for (uint8_t i = 0; i < CORE_MAX_NODES; i++) if (coreNodes[i].active) slots[count++] = i;
+  if (count == 0) return;
+  uint8_t perNode = JCMK_NUM_CHANNELS / count, startIdx = 0;
+  for (uint8_t n = 0; n < count; n++) {
+    coreNodes[slots[n]].startIdx = startIdx;
+    coreNodes[slots[n]].endIdx   = (n < count-1) ? (startIdx+perNode-1) : (JCMK_NUM_CHANNELS-1);
+    startIdx += perNode;
+  }
+  coreAssignVer++;
+  jcmk_admin_msg_t msg; memcpy(msg.magic, JCMK_MAGIC, 4);
+  msg.type = JCMK_MSG_ADMIN; msg.node_count = count; msg.assignment_version = coreAssignVer;
+  for (uint8_t n = 0; n < count; n++) {
+    uint8_t slot = slots[n];
+    msg.node_index = n; msg.start_channel_idx = coreNodes[slot].startIdx;
+    msg.end_channel_idx = coreNodes[slot].endIdx;
+    esp_now_send(coreNodes[slot].mac, (uint8_t*)&msg, sizeof(msg));
+  }
+  Serial.printf("[CORE] Reassigned: %d nodes v%d\n", count, coreAssignVer);
+}
+
+static void coreSendHeartbeatToAll() {
+  jcmk_hb_msg_t msg; memcpy(msg.magic, JCMK_MAGIC, 4);
+  msg.type = JCMK_MSG_HEARTBEAT; msg.counter = ++coreHbCounter;
+  for (uint8_t i = 0; i < CORE_MAX_NODES; i++)
+    if (coreNodes[i].active) esp_now_send(coreNodes[i].mac, (uint8_t*)&msg, sizeof(msg));
+}
+
+static void coreParseAndLogText(const char* line) {
+  String s(line);
+  int p0=s.indexOf(','); if(p0<0)return;
+  int p1=s.indexOf(',',p0+1); if(p1<0)return;
+  int p2=s.indexOf(',',p1+1); if(p2<0)return;
+  int p3=s.indexOf(',',p2+1); if(p3<0)return;
+  String bssid=s.substring(0,p0), ssid=s.substring(p0+1,p1);
+  String auth=s.substring(p1+1,p2);
+  int ch=s.substring(p2+1,p3).toInt(), rssi=s.substring(p3+1).toInt();
+  double lat=0, lon=0, altM=0, accM=0;
+  if (gpsHasFix) { lat=gps.location.lat(); lon=gps.location.lng();
+                   altM=gps.altitude.meters(); accM=gps.hdop.hdop(); }
+  digitalWrite(PINS.tft_cs, HIGH);
+  appendWigleRow(bssid, ssid, auth, iso8601NowUTC(), ch, rssi, lat, lon, altM, accM);
+  coreRecordsRx++;
+}
+
+static void enterCoreMode() {
+  Serial.println("[CORE] Entering Core mode");
+  meshCoreActive=false; coreRecordsRx=0; coreNodeCount=0;
+  coreAssignVer=0; coreHbCounter=0; coreLastHbMs=0;
+  coreReqHead=coreReqTail=0; coreTextHead=coreTextTail=0;
+  memset(coreNodes, 0, sizeof(coreNodes));
+  WiFi.softAPdisconnect(true); WiFi.disconnect(true,false); delay(100);
+  WiFi.mode(WIFI_STA); delay(150);
+  esp_err_t err=esp_now_init();
+  if (err!=ESP_OK) { Serial.printf("[CORE] init failed: %d\n",(int)err); return; }
+  esp_now_register_recv_cb(jcmkOnRecv);
+  delay(50); jcmkSetChannel(JCMK_ESPNOW_CH); jcmkAddPeer(JCMK_BCAST);
+  meshCoreActive=true;
+  pageNeedsInit[4]=true;  // force TFT header redraw for Core mode
+  Serial.println("[CORE] Ready — listening for nodes on ch 6");
+}
+
+static void exitCoreMode() {
+  Serial.println("[CORE] Exiting Core mode");
+  if (meshCoreActive) esp_now_deinit();
+  meshCoreActive=false; coreNodeCount=0;
+  WiFi.mode(WIFI_OFF); delay(150); WiFi.mode(WIFI_STA); delay(100);
+  while (GPSSerial.available()) gps.encode(GPSSerial.read());
+  scanningEnabled=true;
+  pageNeedsInit[4]=true;  // force TFT header redraw for Node mode
+}
+
+static void coreModeTick() {
+  if (!meshCoreActive) return;
+  uint32_t now=millis();
+  while (coreReqHead!=coreReqTail) {
+    uint8_t i=coreReqHead; coreReqHead=(coreReqHead+1)%CORE_REQ_QUEUE;
+    coreFindOrAddNode(coreReqBuf[i].mac); coreReassignChannels();
+  }
+  while (coreTextHead!=coreTextTail) {
+    uint8_t i=coreTextHead; coreTextHead=(coreTextHead+1)%CORE_TEXT_QUEUE;
+    coreParseAndLogText(coreTextBuf[i].line);
+  }
+  if (now-coreLastHbMs>=CORE_HB_MS) { coreLastHbMs=now; coreSendHeartbeatToAll(); }
+  bool changed=false;
+  for (uint8_t i=0; i<CORE_MAX_NODES; i++) {
+    if (coreNodes[i].active && (now-coreNodes[i].lastHbMs)>CORE_NODE_TIMEOUT) {
+      Serial.printf("[CORE] Node %d timed out\n",i);
+      esp_now_del_peer(coreNodes[i].mac);
+      memset(&coreNodes[i], 0, sizeof(CoreNodeInfo));
+      coreNodeCount--; changed=true;
+    }
+  }
+  if (changed) coreReassignChannels();
 }
 
 // Scan assigned channels and forward results to Core
@@ -1748,80 +1934,130 @@ static void nodeModeTick() {
 }
 
 // ================================================================
-//  Page 4: JCMK Mesh Node status display
+//  Page 4: handles both Mesh Node and Core mode
 // ================================================================
 static void drawPageMeshNode() {
-  if (pageNeedsInit[4]) {
-    pageNeedsInit[4] = false;
-    tft.fillScreen(BLACK);
-    tft.setTextColor(WHITE, BLACK);
-    tft.setTextSize(2);
-    tftDrawCentered(2, "Mesh Node", 2);
-    tft.drawFastHLine(0, 20, tft.width(), WHITE);
-  }
-
   int W = tft.width();
-  tft.setTextColor(WHITE, BLACK);
-  tft.setTextSize(1);
 
-  // Status row
-  tft.fillRect(0, 24, W, 12, BLACK);
-  tft.setCursor(2, 26);
-  if (!meshNodeActive) {
-    tft.setTextColor(COLOR_RED, BLACK);
-    tft.print("Init error");
-  } else if (!jcmkHaveCore) {
-    tft.setTextColor(COLOR_YELLOW, BLACK);
-    tft.print("Searching...");
+  if (meshCoreActive) {
+    // ---- Core mode ----
+    if (pageNeedsInit[4]) {
+      pageNeedsInit[4] = false;
+      tft.fillScreen(BLACK);
+      tft.setTextColor(WHITE, BLACK); tft.setTextSize(2);
+      tftDrawCentered(2, "CORE", 2);
+      tft.drawFastHLine(0, 20, W, WHITE);
+    }
+    tft.setTextColor(WHITE, BLACK); tft.setTextSize(1);
+
+    // Node count (y=24)
+    tft.fillRect(0, 24, W, 10, BLACK); tft.setCursor(2, 25);
+    if (coreNodeCount == 0) {
+      tft.setTextColor(COLOR_YELLOW, BLACK); tft.print("Waiting for nodes");
+    } else {
+      tft.setTextColor(COLOR_GREEN, BLACK);
+      char buf[20]; snprintf(buf, sizeof(buf), "%d node%s",
+        coreNodeCount, coreNodeCount==1?" active":"s active"); tft.print(buf);
+    }
+    tft.setTextColor(WHITE, BLACK);
+
+    // Node slots (y=36, y=58) — show first 2
+    uint8_t shown = 0;
+    for (uint8_t i = 0; i < CORE_MAX_NODES && shown < 2; i++) {
+      int y = 36 + (int)shown * 22;
+      tft.fillRect(0, y, W, 20, BLACK);
+      tft.setCursor(2, y + 1);
+      if (coreNodes[i].active) {
+        uint8_t* m = coreNodes[i].mac;
+        uint8_t si = coreNodes[i].startIdx, ei = coreNodes[i].endIdx;
+        char buf[20];
+        snprintf(buf, sizeof(buf), "%02X%02X%02X %d-%d",
+          m[3], m[4], m[5],
+          (si<JCMK_NUM_CHANNELS)?JCMK_CHANNELS[si]:0,
+          (ei<JCMK_NUM_CHANNELS)?JCMK_CHANNELS[ei]:0);
+        tft.setTextColor(COLOR_GREEN, BLACK); tft.print(buf);
+        tft.setTextColor(WHITE, BLACK);
+        tft.setCursor(2, y + 11);
+        char rbuf[14]; snprintf(rbuf, sizeof(rbuf), "  rx:%lu", (unsigned long)coreNodes[i].recordsRx);
+        tft.print(rbuf);
+        shown++;
+      }
+    }
+    // Fill empty slots
+    for (; shown < 2; shown++) {
+      int y = 36 + (int)shown * 22;
+      tft.fillRect(0, y, W, 20, BLACK);
+      tft.setCursor(2, y + 1);
+      tft.setTextColor(0x4208, BLACK); tft.print("-- no node --");  // dim gray
+      tft.setTextColor(WHITE, BLACK);
+    }
+
+    // Records total (y=82)
+    tft.fillRect(0, 82, W, 10, BLACK); tft.setCursor(2, 83);
+    char tbuf[20]; snprintf(tbuf, sizeof(tbuf), "Rcvd: %lu", (unsigned long)coreRecordsRx);
+    tft.print(tbuf);
+
+    // GPS (y=96)
+    tft.fillRect(0, 96, W, 10, BLACK); tft.setCursor(2, 97);
+    tft.setTextColor(gpsHasFix ? COLOR_GREEN : COLOR_YELLOW, BLACK);
+    tft.print(gpsHasFix ? "GPS: FIX" : "GPS: ---");
+    tft.setTextColor(WHITE, BLACK);
+
+    // Hint (y=110)
+    tft.fillRect(0, 110, W, 10, BLACK); tft.setCursor(2, 111);
+    tft.setTextColor(0x4208, BLACK); tft.print("Hold btn = Node mode");
+    tft.setTextColor(WHITE, BLACK);
+
   } else {
-    tft.setTextColor(COLOR_GREEN, BLACK);
-    tft.print("Core linked");
+    // ---- Node mode (original layout) ----
+    if (pageNeedsInit[4]) {
+      pageNeedsInit[4] = false;
+      tft.fillScreen(BLACK);
+      tft.setTextColor(WHITE, BLACK); tft.setTextSize(2);
+      tftDrawCentered(2, "Mesh Node", 2);
+      tft.drawFastHLine(0, 20, W, WHITE);
+    }
+    tft.setTextColor(WHITE, BLACK); tft.setTextSize(1);
+
+    tft.fillRect(0, 24, W, 12, BLACK); tft.setCursor(2, 26);
+    if (!meshNodeActive) {
+      tft.setTextColor(COLOR_RED, BLACK); tft.print("Init error");
+    } else if (!jcmkHaveCore) {
+      tft.setTextColor(COLOR_YELLOW, BLACK); tft.print("Searching...");
+    } else {
+      tft.setTextColor(COLOR_GREEN, BLACK); tft.print("Core linked");
+    }
+    tft.setTextColor(WHITE, BLACK);
+
+    tft.fillRect(0, 38, W, 10, BLACK); tft.setCursor(2, 39);
+    if (jcmkHaveCore) {
+      char macStr[18];
+      snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
+        jcmkCoreMac[0], jcmkCoreMac[1], jcmkCoreMac[2],
+        jcmkCoreMac[3], jcmkCoreMac[4], jcmkCoreMac[5]);
+      tft.print(macStr);
+    } else { tft.print("--:--:--:--:--:--"); }
+
+    tft.fillRect(0, 51, W, 10, BLACK); tft.setCursor(2, 52);
+    tft.print("Ch: ");
+    if (jcmkAssignVer>0 && jcmkStartIdx<JCMK_NUM_CHANNELS && jcmkEndIdx<JCMK_NUM_CHANNELS) {
+      tft.print(JCMK_CHANNELS[jcmkStartIdx]); tft.print("-"); tft.print(JCMK_CHANNELS[jcmkEndIdx]);
+    } else { tft.print("all"); }
+
+    tft.fillRect(0, 64, W, 10, BLACK); tft.setCursor(2, 65);
+    tft.print("Found: "); tft.print(jcmkNetworksFound);
+
+    tft.fillRect(0, 77, W, 10, BLACK); tft.setCursor(2, 78);
+    tft.print("Sent: "); tft.print(jcmkSentCount);
+
+    tft.fillRect(0, 90, W, 10, BLACK); tft.setCursor(2, 91);
+    tft.print("ENOW ch: "); tft.print(JCMK_ESPNOW_CH);
+
+    // Hold hint
+    tft.fillRect(0, 104, W, 10, BLACK); tft.setCursor(2, 105);
+    tft.setTextColor(0x4208, BLACK); tft.print("Hold btn = Core mode");
+    tft.setTextColor(WHITE, BLACK);
   }
-  tft.setTextColor(WHITE, BLACK);
-
-  // Core MAC
-  tft.fillRect(0, 38, W, 10, BLACK);
-  tft.setCursor(2, 39);
-  if (jcmkHaveCore) {
-    char macStr[18];
-    snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
-      jcmkCoreMac[0], jcmkCoreMac[1], jcmkCoreMac[2],
-      jcmkCoreMac[3], jcmkCoreMac[4], jcmkCoreMac[5]);
-    tft.print(macStr);
-  } else {
-    tft.print("--:--:--:--:--:--");
-  }
-
-  // Channel assignment
-  tft.fillRect(0, 51, W, 10, BLACK);
-  tft.setCursor(2, 52);
-  tft.print("Ch: ");
-  if (jcmkAssignVer > 0 && jcmkStartIdx < JCMK_NUM_CHANNELS
-                        && jcmkEndIdx   < JCMK_NUM_CHANNELS) {
-    tft.print(JCMK_CHANNELS[jcmkStartIdx]);
-    tft.print("-");
-    tft.print(JCMK_CHANNELS[jcmkEndIdx]);
-  } else {
-    tft.print("all");
-  }
-
-  // Networks discovered (raw scan count)
-  tft.fillRect(0, 64, W, 10, BLACK);
-  tft.setCursor(2, 65);
-  tft.print("Found: ");
-  tft.print(jcmkNetworksFound);
-
-  // Records forwarded to Core (assigned channels only)
-  tft.fillRect(0, 77, W, 10, BLACK);
-  tft.setCursor(2, 78);
-  tft.print("Sent: ");
-  tft.print(jcmkSentCount);
-
-  // ESP-Now home channel
-  tft.fillRect(0, 90, W, 10, BLACK);
-  tft.setCursor(2, 91);
-  tft.print("ENOW ch: ");
-  tft.print(JCMK_ESPNOW_CH);
 }
 
 // ---------------- SD init (shared SPI) ----------------
@@ -2488,23 +2724,48 @@ static void doScanOnce() {
 static void advancePage() {
   uint8_t prev = currentPage;
   uint8_t next = (currentPage + 1) % PAGE_COUNT;
-  if (prev == 4) exitNodeMode();  // tear down ESP-Now before entering next page
+  if (prev == 4) {
+    if (meshCoreActive) exitCoreMode();
+    else                exitNodeMode();
+  }
   currentPage = next;
   tftPageEntered(next);
   Serial.printf("[PAGE] -> %d\n", next);
 }
 
-// Button: any LOW reading fires once, 500 ms cooldown handles debounce and
-// the ~400 ms WiFi-scan blocking gap that would swallow a shorter lockout.
+// Button: short press = advance page; 2 s hold on mesh page = toggle Core / Node.
 static void pollButton() {
-  static uint32_t lastFireMs = 0;
-  if (digitalRead(PINS.btn) == LOW) {
-    uint32_t now = millis();
-    if (now - lastFireMs >= 500) {
-      lastFireMs = now;
-      advancePage();
-      Serial.printf("[BTN] GPIO%d pressed\n", PINS.btn);
+  static uint32_t pressStartMs  = 0;
+  static bool     pressing      = false;
+  static bool     longTriggered = false;
+  static uint32_t lastReleaseMs = 0;
+
+  bool low = (digitalRead(PINS.btn) == LOW);
+
+  if (low && !pressing) {
+    pressing = true; pressStartMs = millis(); longTriggered = false;
+  }
+
+  if (pressing && !longTriggered && (millis() - pressStartMs >= 2000)) {
+    longTriggered = true;
+    if (currentPage == 4) {
+      if (meshCoreActive) { exitCoreMode(); enterNodeMode(); }
+      else                { exitNodeMode(); enterCoreMode(); }
+      Serial.printf("[BTN] Long press on mesh page -> %s\n",
+                    meshCoreActive ? "Core" : "Node");
     }
+  }
+
+  if (!low && pressing) {
+    if (!longTriggered) {
+      uint32_t now = millis();
+      if (now - lastReleaseMs >= 400) {
+        lastReleaseMs = now;
+        advancePage();
+        Serial.printf("[BTN] GPIO%d pressed\n", PINS.btn);
+      }
+    }
+    pressing = false;
   }
 }
 
@@ -2741,9 +3002,10 @@ void loop() {
 
   handleStaTransitions();
 
-  // Scanning — mesh node mode handles its own scan; skip normal path on page 4
+  // Scanning — mesh page handles its own logic; skip normal scan path
   if (currentPage == 4) {
-    nodeModeTick();
+    if (meshCoreActive) coreModeTick();
+    else                nodeModeTick();
   } else {
     autoPaused = shouldPauseScanning();
     wifi_mode_t m = WiFi.getMode();
