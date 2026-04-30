@@ -1717,8 +1717,25 @@ static void coreReassignChannels() {
     msg.node_index = n; msg.start_channel_idx = coreNodes[slot].startIdx;
     msg.end_channel_idx = coreNodes[slot].endIdx;
     esp_now_send(coreNodes[slot].mac, (uint8_t*)&msg, sizeof(msg));
+    delay(10);  // brief gap prevents back-to-back send collisions
   }
   Serial.printf("[CORE] Reassigned: %d nodes v%d\n", count, coreAssignVer);
+}
+
+// Re-send the current ADMIN assignment to every node.
+// Called periodically so nodes that missed the update (e.g. mid-scan) recover.
+static void coreResendAdminToAll() {
+  if (coreNodeCount == 0) return;
+  jcmk_admin_msg_t msg; memcpy(msg.magic, JCMK_MAGIC, 4);
+  msg.type = JCMK_MSG_ADMIN; msg.node_count = coreNodeCount; msg.assignment_version = coreAssignVer;
+  uint8_t n = 0;
+  for (uint8_t i = 0; i < CORE_MAX_NODES; i++) {
+    if (!coreNodes[i].active) continue;
+    msg.node_index = n++; msg.start_channel_idx = coreNodes[i].startIdx;
+    msg.end_channel_idx = coreNodes[i].endIdx;
+    esp_now_send(coreNodes[i].mac, (uint8_t*)&msg, sizeof(msg));
+    delay(10);
+  }
 }
 
 static void coreSendHeartbeatToAll() {
@@ -1783,7 +1800,8 @@ static void coreModeTick() {
     uint8_t i=coreTextHead; coreTextHead=(coreTextHead+1)%CORE_TEXT_QUEUE;
     coreParseAndLogText(coreTextBuf[i].line);
   }
-  if (now-coreLastHbMs>=CORE_HB_MS) { coreLastHbMs=now; coreSendHeartbeatToAll(); }
+  // Heartbeat + ADMIN refresh — nodes that missed the ADMIN while scanning recover here.
+  if (now-coreLastHbMs>=CORE_HB_MS) { coreLastHbMs=now; coreSendHeartbeatToAll(); coreResendAdminToAll(); }
   bool changed=false;
   for (uint8_t i=0; i<CORE_MAX_NODES; i++) {
     if (coreNodes[i].active && (now-coreNodes[i].lastHbMs)>CORE_NODE_TIMEOUT) {
