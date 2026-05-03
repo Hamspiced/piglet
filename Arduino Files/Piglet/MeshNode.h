@@ -46,6 +46,7 @@ struct CoreNodeInfo {
   uint8_t  endIdx;
   uint32_t lastHbMs;
   uint32_t recordsRx;
+  bool     isBiscuit;  // true = Biscuit Node protocol (requires full-size 212-byte packets)
 };
 
 // Core state (read from Display.cpp for page 5 rendering)

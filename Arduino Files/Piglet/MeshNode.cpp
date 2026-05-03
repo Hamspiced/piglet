@@ -111,7 +111,7 @@ static const uint32_t CORE_NODE_TIMEOUT = 45000;  // 45 s — accounts for block
 #define CORE_REQ_QUEUE   4
 #define CORE_TEXT_QUEUE 64   // large enough for burst from two nodes per cycle
 
-struct CorReqSlot  { uint8_t mac[6]; };
+struct CorReqSlot  { uint8_t mac[6]; bool isBiscuit; };
 struct CorTextSlot { char    line[JCMK_TEXT_MAX + 1]; };
 
 static CorReqSlot          coreReqBuf[CORE_REQ_QUEUE];
@@ -193,10 +193,61 @@ static void jcmkSendText(const String& s) {
 //  Core mode helpers (forward declarations used in jcmkOnRecv)
 // ================================================================
 static void coreSendReply(const uint8_t* mac) {
-  jcmk_req_msg_t msg;
+  // Use full-size jcmk_text_msg_t (212 bytes) instead of jcmk_req_msg_t (5 bytes).
+  // Biscuit Node drops any packet < sizeof(enow_text_msg_t) = 212 bytes.
+  // JCMK nodes only check len >= 5, so this is fully backward-compatible.
+  jcmk_text_msg_t msg = {};
   memcpy(msg.magic, JCMK_MAGIC, 4);
-  msg.type = JCMK_MSG_CORE_REPLY;
+  msg.type    = JCMK_MSG_CORE_REPLY;
+  msg.counter = 0;
+  msg.len     = 0;
   esp_now_send(mac, (uint8_t*)&msg, sizeof(msg));
+}
+
+// Send Biscuit Node a role assignment (MSG_ROLE_ASSIGN, type=5) then a channel
+// config (MSG_CONFIG_UPDATE, type=10). Both packets must be full size (212 bytes).
+// Called from coreReassignChannels / coreResendAdminToAll for isBiscuit nodes.
+static void coreSendBiscuitRoleAndConfig(const uint8_t* mac, uint8_t startIdx, uint8_t endIdx) {
+  // Step 1: role assignment — text[0] = 1 (ROLE_WIFI)
+  // Biscuit MSG_ROLE_ASSIGN = type 5, same numeric value as JCMK_MSG_ADMIN.
+  // After receiving this, Biscuit transitions from STATE_WAITING_ROLE to STATE_SCANNING.
+  jcmk_text_msg_t roleMsg = {};
+  memcpy(roleMsg.magic, JCMK_MAGIC, 4);
+  roleMsg.type    = JCMK_MSG_ADMIN;  // = 5 = MSG_ROLE_ASSIGN on Biscuit
+  roleMsg.counter = 0;
+  roleMsg.len     = 1;
+  roleMsg.text[0] = 1;  // ROLE_WIFI
+  esp_now_send(mac, (uint8_t*)&roleMsg, sizeof(roleMsg));
+  delay(10);
+
+  // Step 2: channel config — "channels=1,2,...;dwell=80"
+  // Biscuit MSG_CONFIG_UPDATE = type 10. Payload uses actual channel numbers
+  // (not indices) in comma-separated list.
+  jcmk_text_msg_t cfgMsg = {};
+  memcpy(cfgMsg.magic, JCMK_MAGIC, 4);
+  cfgMsg.type    = 10;  // MSG_CONFIG_UPDATE
+  cfgMsg.counter = 0;
+
+  String chList = "channels=";
+  uint8_t end = (endIdx < JCMK_NUM_CHANNELS) ? endIdx : (JCMK_NUM_CHANNELS - 1);
+  for (uint8_t j = startIdx; j <= end; j++) {
+    if (j > startIdx) chList += ",";
+    chList += String(JCMK_CHANNELS[j]);
+  }
+  chList += ";dwell=";
+  chList += String((uint32_t)NODE_SCAN_DWELL_MS);
+
+  uint16_t slen = (chList.length() < JCMK_TEXT_MAX)
+                ? (uint16_t)chList.length() : (uint16_t)JCMK_TEXT_MAX;
+  cfgMsg.len = slen;
+  memcpy(cfgMsg.text, chList.c_str(), slen);
+  cfgMsg.text[slen] = '\0';
+  esp_now_send(mac, (uint8_t*)&cfgMsg, sizeof(cfgMsg));
+
+  Serial.printf("[CORE] Biscuit role+config sent (ch %d-%d, dwell %dms)\n",
+    JCMK_CHANNELS[startIdx],
+    JCMK_CHANNELS[end],
+    (int)NODE_SCAN_DWELL_MS);
 }
 
 // ESP-Now receive callback — handles both Node and Core roles
@@ -213,6 +264,8 @@ static void jcmkOnRecv(const esp_now_recv_info_t* info,
       uint8_t next = (coreReqTail + 1) % CORE_REQ_QUEUE;
       if (next != coreReqHead) {
         memcpy(coreReqBuf[coreReqTail].mac, info->src_addr, 6);
+        // Biscuit Node always sends full-size packets (212 bytes); JCMK sends 5 bytes.
+        coreReqBuf[coreReqTail].isBiscuit = (len >= (int)sizeof(jcmk_text_msg_t));
         coreReqTail = next;
       }
     } else if (type == JCMK_MSG_TEXT && len >= 11) {
@@ -240,6 +293,7 @@ static void jcmkOnRecv(const esp_now_recv_info_t* info,
           uint8_t nxt = (coreReqTail + 1) % CORE_REQ_QUEUE;
           if (nxt != coreReqHead) {
             memcpy(coreReqBuf[coreReqTail].mac, info->src_addr, 6);
+            coreReqBuf[coreReqTail].isBiscuit = (len >= (int)sizeof(jcmk_text_msg_t));
             coreReqTail = nxt;
           }
         }
@@ -257,6 +311,7 @@ static void jcmkOnRecv(const esp_now_recv_info_t* info,
         uint8_t nxt = (coreReqTail + 1) % CORE_REQ_QUEUE;
         if (nxt != coreReqHead) {
           memcpy(coreReqBuf[coreReqTail].mac, info->src_addr, 6);
+          coreReqBuf[coreReqTail].isBiscuit = (len >= (int)sizeof(jcmk_text_msg_t));
           coreReqTail = nxt;
         }
       }
@@ -280,7 +335,7 @@ static void jcmkOnRecv(const esp_now_recv_info_t* info,
 // ================================================================
 //  Core mode helpers (main loop only — not ISR-safe)
 // ================================================================
-static void coreFindOrAddNode(const uint8_t* mac) {
+static void coreFindOrAddNode(const uint8_t* mac, bool isBiscuit) {
   for (uint8_t i = 0; i < CORE_MAX_NODES; i++) {
     if (coreNodes[i].active && memcmp(coreNodes[i].mac, mac, 6) == 0) {
       coreNodes[i].lastHbMs = millis();
@@ -292,10 +347,12 @@ static void coreFindOrAddNode(const uint8_t* mac) {
       coreNodes[i].active    = true;
       coreNodes[i].lastHbMs  = millis();
       coreNodes[i].recordsRx = 0;
+      coreNodes[i].isBiscuit = isBiscuit;
       memcpy(coreNodes[i].mac, mac, 6);
       coreNodeCount++;
       jcmkAddPeer(mac);
-      Serial.printf("[CORE] New node %d: %02X:%02X:%02X:%02X:%02X:%02X\n",
+      Serial.printf("[CORE] New %s node %d: %02X:%02X:%02X:%02X:%02X:%02X\n",
+        isBiscuit ? "Biscuit" : "JCMK",
         i, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
       return;
     }
@@ -323,18 +380,26 @@ static void coreReassignChannels() {
   }
   coreAssignVer++;
 
-  // Send ADMIN to each active node (10 ms gap prevents back-to-back collisions)
-  jcmk_admin_msg_t msg;
-  memcpy(msg.magic, JCMK_MAGIC, 4);
-  msg.type       = JCMK_MSG_ADMIN;
-  msg.node_count = count;
-  msg.assignment_version = coreAssignVer;
+  // Send assignment to each node using its protocol:
+  // - Biscuit: MSG_ROLE_ASSIGN (type=5, text[0]=ROLE_WIFI) + MSG_CONFIG_UPDATE (type=10, channel string)
+  // - JCMK:    jcmk_admin_msg_t (type=5, packed binary channel indices)
   for (uint8_t n = 0; n < count; n++) {
     uint8_t slot = slots[n];
-    msg.node_index        = n;
-    msg.start_channel_idx = coreNodes[slot].startIdx;
-    msg.end_channel_idx   = coreNodes[slot].endIdx;
-    esp_now_send(coreNodes[slot].mac, (uint8_t*)&msg, sizeof(msg));
+    if (coreNodes[slot].isBiscuit) {
+      coreSendBiscuitRoleAndConfig(coreNodes[slot].mac,
+                                   coreNodes[slot].startIdx,
+                                   coreNodes[slot].endIdx);
+    } else {
+      jcmk_admin_msg_t msg;
+      memcpy(msg.magic, JCMK_MAGIC, 4);
+      msg.type               = JCMK_MSG_ADMIN;
+      msg.node_count         = count;
+      msg.assignment_version = coreAssignVer;
+      msg.node_index         = n;
+      msg.start_channel_idx  = coreNodes[slot].startIdx;
+      msg.end_channel_idx    = coreNodes[slot].endIdx;
+      esp_now_send(coreNodes[slot].mac, (uint8_t*)&msg, sizeof(msg));
+    }
     delay(10);
   }
   Serial.printf("[CORE] Reassigned channels: %d nodes v%d\n", count, coreAssignVer);
@@ -344,27 +409,37 @@ static void coreReassignChannels() {
 // Called periodically so nodes that missed the update (e.g. mid-scan) recover.
 static void coreResendAdminToAll() {
   if (coreNodeCount == 0) return;
-  jcmk_admin_msg_t msg;
-  memcpy(msg.magic, JCMK_MAGIC, 4);
-  msg.type               = JCMK_MSG_ADMIN;
-  msg.node_count         = coreNodeCount;
-  msg.assignment_version = coreAssignVer;
   uint8_t n = 0;
   for (uint8_t i = 0; i < CORE_MAX_NODES; i++) {
     if (!coreNodes[i].active) continue;
-    msg.node_index        = n++;
-    msg.start_channel_idx = coreNodes[i].startIdx;
-    msg.end_channel_idx   = coreNodes[i].endIdx;
-    esp_now_send(coreNodes[i].mac, (uint8_t*)&msg, sizeof(msg));
+    if (coreNodes[i].isBiscuit) {
+      coreSendBiscuitRoleAndConfig(coreNodes[i].mac,
+                                   coreNodes[i].startIdx,
+                                   coreNodes[i].endIdx);
+    } else {
+      jcmk_admin_msg_t msg;
+      memcpy(msg.magic, JCMK_MAGIC, 4);
+      msg.type               = JCMK_MSG_ADMIN;
+      msg.node_count         = coreNodeCount;
+      msg.assignment_version = coreAssignVer;
+      msg.node_index         = n;
+      msg.start_channel_idx  = coreNodes[i].startIdx;
+      msg.end_channel_idx    = coreNodes[i].endIdx;
+      esp_now_send(coreNodes[i].mac, (uint8_t*)&msg, sizeof(msg));
+    }
+    n++;
     delay(10);
   }
 }
 
 static void coreSendHeartbeatToAll() {
-  jcmk_hb_msg_t msg;
+  // Use full-size jcmk_text_msg_t (212 bytes) so Biscuit Node accepts it
+  // (Biscuit drops packets < 212 bytes). JCMK nodes only need len >= 5.
+  jcmk_text_msg_t msg = {};
   memcpy(msg.magic, JCMK_MAGIC, 4);
   msg.type    = JCMK_MSG_HEARTBEAT;
   msg.counter = ++coreHbCounter;
+  msg.len     = 0;
   for (uint8_t i = 0; i < CORE_MAX_NODES; i++)
     if (coreNodes[i].active)
       esp_now_send(coreNodes[i].mac, (uint8_t*)&msg, sizeof(msg));
@@ -615,7 +690,7 @@ void coreModeTick() {
   while (coreReqHead != coreReqTail) {
     uint8_t i = coreReqHead;
     coreReqHead = (coreReqHead + 1) % CORE_REQ_QUEUE;
-    coreFindOrAddNode(coreReqBuf[i].mac);
+    coreFindOrAddNode(coreReqBuf[i].mac, coreReqBuf[i].isBiscuit);
     coreReassignChannels();
   }
 
