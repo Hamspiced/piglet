@@ -1599,25 +1599,30 @@ static bool jcmkAddPeer(const uint8_t* mac) {
   return (esp_now_add_peer(&peer) == ESP_OK);
 }
 
+// Node-mode sends always use full jcmk_text_msg_t (212 bytes).
+// Biscuit Pro drops any packet < 212 bytes; JCMK Cores only check len >= 5
+// so full-size packets are backward-compatible with both coordinators.
+
 static void jcmkSendCoreRequest() {
-  jcmk_req_msg_t msg;
+  jcmk_text_msg_t msg = {};
   memcpy(msg.magic, JCMK_MAGIC, 4);
-  msg.type = JCMK_MSG_CORE_REQUEST;
+  msg.type    = JCMK_MSG_CORE_REQUEST;
+  msg.counter = 0;
+  msg.len     = 0;
   esp_now_send(JCMK_BCAST, (uint8_t*)&msg, sizeof(msg));
 }
 
 static void jcmkSendHeartbeat() {
-  jcmk_hb_msg_t msg;
+  jcmk_text_msg_t msg = {};
   memcpy(msg.magic, JCMK_MAGIC, 4);
   msg.type    = JCMK_MSG_HEARTBEAT;
   msg.counter = ++jcmkHbCounter;
-  // Broadcast heartbeat (JCMK non-encrypted pattern: esp_now_send(BROADCAST_MAC, ...)).
-  // Core identifies sender via info->src_addr in the receive callback.
+  msg.len     = 0;
   esp_now_send(JCMK_BCAST, (uint8_t*)&msg, sizeof(msg));
 }
 
 static void jcmkSendText(const String& s) {
-  jcmk_text_msg_t msg;
+  jcmk_text_msg_t msg = {};
   memcpy(msg.magic, JCMK_MAGIC, 4);
   msg.type    = JCMK_MSG_TEXT;
   msg.counter = jcmkHbCounter;
@@ -1625,11 +1630,8 @@ static void jcmkSendText(const String& s) {
   msg.len = slen;
   memcpy(msg.text, s.c_str(), slen);
   msg.text[slen] = '\0';
-  // magic(4) + type(1) + counter(4) + len(2) + text(slen+1)
-  size_t pktLen = 11 + slen + 1;
-  // Broadcast TEXT (JCMK non-encrypted pattern): no ACK/retry pressure, two nodes
-  // can send simultaneously without waiting. Core identifies sender via src_addr.
-  esp_now_send(JCMK_BCAST, (uint8_t*)&msg, pktLen);
+  // Always send full struct size — Biscuit Pro drops variable-length packets < 212 bytes.
+  esp_now_send(JCMK_BCAST, (uint8_t*)&msg, sizeof(msg));
 }
 
 // ---- Core forward decls (used inside jcmkOnRecv callback) ----
