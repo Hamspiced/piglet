@@ -3035,20 +3035,21 @@ void setup() {
   GPSSerial.setRxBufferSize(512);
   GPSSerial.begin(cfg.gpsBaud, SERIAL_8N1, PINS.gps_rx, PINS.gps_tx);
 
-  // WiFi
+  // WiFi setup: mesh mode skips STA entirely; normal mode tries STA and falls back to AP.
   WiFi.mode(WIFI_STA);
-  bool staOk = connectSTA(12000);
-  if (!staOk) {
-    WiFi.setAutoReconnect(false); WiFi.persistent(false);
-    WiFi.disconnect(true, true); delay(100);
-    // Skip AP when meshModeOnBoot is Core or Node — mesh init takes over the WiFi stack.
-    {
-      String mm = cfg.meshModeOnBoot; mm.toLowerCase();
-      if (mm != "core" && mm != "node") {
+  bool staOk = false;
+  {
+    String mm = cfg.meshModeOnBoot; mm.toLowerCase();
+    if (mm == "node" || mm == "core") {
+      // Dedicated mesh boot — skip STA connect and AP window entirely.
+      Serial.printf("[BOOT] meshModeOnBoot=%s — skipping STA/AP\n", cfg.meshModeOnBoot.c_str());
+    } else {
+      // Normal wardriving boot: attempt STA, fall back to AP if it fails.
+      staOk = connectSTA(12000);
+      if (!staOk) {
+        WiFi.setAutoReconnect(false); WiFi.persistent(false);
+        WiFi.disconnect(true, true); delay(100);
         startAP();
-      } else {
-        Serial.printf("[BOOT] Skipping AP window — meshModeOnBoot=%s\n",
-                      cfg.meshModeOnBoot.c_str());
       }
     }
   }
@@ -3107,7 +3108,8 @@ void setup() {
     Serial.print("[SD] Log file: "); Serial.println(lfOk ? "OK" : "FAIL");
   }
 
-  // Auto-start mesh mode if meshModeOnBoot=Core|Node
+  // Auto-start mesh mode if meshModeOnBoot=Core|Node.
+  // Activates unconditionally — STA was skipped above for mesh boots.
   {
     String mm = cfg.meshModeOnBoot;
     mm.toLowerCase();

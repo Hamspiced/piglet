@@ -368,26 +368,24 @@ void setup() {
   GPSSerial.begin(cfg.gpsBaud, SERIAL_8N1, pins.gps_rx, pins.gps_tx);
   Serial.println("[GPS] UART started");
 
-  // Try STA FIRST (short timeout). Do NOT start AP unless STA fails.
+  // WiFi setup: mesh mode skips STA entirely; normal mode tries STA and falls back to AP.
   WiFi.mode(WIFI_STA);
-  bool staOk = connectSTA(12000);
-
-  // If STA failed, stop background reconnect attempts, then start AP
-  if (!staOk) {
-    WiFi.setAutoReconnect(false);
-    WiFi.persistent(false);
-    WiFi.disconnect(true, true);
-    delay(100);
-
-    // Skip AP when meshModeOnBoot is Core or Node — mesh init takes over the WiFi stack.
-    // The AP would be useless (and interfere with ESP-Now) in mesh mode.
-    {
-      String mm = cfg.meshModeOnBoot; mm.toLowerCase();
-      if (mm != "core" && mm != "node") {
+  bool staOk = false;
+  {
+    String mm = cfg.meshModeOnBoot; mm.toLowerCase();
+    if (mm == "node" || mm == "core") {
+      // Dedicated mesh boot — skip STA connect and AP window entirely.
+      // enterNodeMode / enterCoreMode will take over the WiFi stack.
+      Serial.printf("[BOOT] meshModeOnBoot=%s — skipping STA/AP\n", cfg.meshModeOnBoot.c_str());
+    } else {
+      // Normal wardriving boot: attempt STA, fall back to AP if it fails.
+      staOk = connectSTA(12000);
+      if (!staOk) {
+        WiFi.setAutoReconnect(false);
+        WiFi.persistent(false);
+        WiFi.disconnect(true, true);
+        delay(100);
         startAP();
-      } else {
-        Serial.printf("[BOOT] Skipping AP window — meshModeOnBoot=%s\n",
-                      cfg.meshModeOnBoot.c_str());
       }
     }
   }
@@ -459,7 +457,8 @@ void setup() {
     Serial.println("[BATT] Battery test enabled");
   }
 
-  // Auto-start mesh mode if meshModeOnBoot=Core|Node
+  // Auto-start mesh mode if meshModeOnBoot=Core|Node.
+  // Activates unconditionally — STA was skipped above for mesh boots.
   {
     String mm = cfg.meshModeOnBoot;
     mm.toLowerCase();
