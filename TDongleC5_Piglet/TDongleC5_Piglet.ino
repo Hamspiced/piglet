@@ -2790,6 +2790,15 @@ static void stopAPIfAllowed() {
 static void handleStaTransitions() {
   wl_status_t now = WiFi.status();
   if (lastStaStatus == WL_CONNECTED && now != WL_CONNECTED) {
+    Serial.println("[WIFI] STA disconnected -> switching to wardriving mode");
+    // Disable auto-reconnect so the WiFi stack is idle for scanning.
+    // Background reconnection attempts interfere with WiFi.scanNetworks()
+    // and cause it to return 0 results even while the scan indicator shows active.
+    WiFi.setAutoReconnect(false);
+    WiFi.persistent(false);
+    WiFi.disconnect(true, false);  // stop reconnect; eraseap=false keeps NVS credentials
+    delay(50);
+    WiFi.mode(WIFI_STA);  // clean idle STA state ready for scanning
     if (!(userScanOverride && !scanningEnabled)) scanningEnabled = true;
   }
   static wl_status_t prev = WL_IDLE_STATUS;

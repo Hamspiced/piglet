@@ -9,7 +9,19 @@ void handleStaTransitions() {
 
   // Detect transition: connected -> not connected
   if (lastStaStatus == WL_CONNECTED && now != WL_CONNECTED) {
-    Serial.println("[WIFI] STA disconnected -> scanning can resume");
+    Serial.println("[WIFI] STA disconnected -> switching to wardriving mode");
+
+    // Disable auto-reconnect so the WiFi stack is idle for scanning.
+    // Without this, background reconnection attempts run concurrently with
+    // WiFi.scanNetworks() and cause it to return 0 results while the play
+    // indicator shows — scans appear active but collect nothing.
+    WiFi.setAutoReconnect(false);
+    WiFi.persistent(false);
+    // Soft disconnect to stop any in-progress reconnect attempt.
+    // eraseap=false preserves NVS credentials for next boot.
+    WiFi.disconnect(true, false);
+    delay(50);
+    WiFi.mode(WIFI_STA);  // clean idle STA state ready for scanning
 
     // Only force scanning ON if the user has NOT explicitly overridden scanning off
     if (!(userScanOverride && !scanningEnabled)) {
