@@ -4,7 +4,7 @@
 #include "GPS.h"
 #include "SDUtils.h"
 
-static String authModeToString(wifi_auth_mode_t m) {
+String authModeToString(wifi_auth_mode_t m) {
   switch (m) {
     case WIFI_AUTH_OPEN: return "OPEN";
     case WIFI_AUTH_WEP: return "WEP";

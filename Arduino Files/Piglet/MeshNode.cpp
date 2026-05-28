@@ -2,6 +2,7 @@
 #include "Globals.h"
 #include "GPS.h"
 #include "SDUtils.h"
+#include "Scanner.h"
 #include <esp_now.h>
 #include "esp_wifi.h"
 
@@ -119,23 +120,6 @@ static volatile uint8_t    coreReqHead = 0, coreReqTail = 0;
 
 static CorTextSlot         coreTextBuf[CORE_TEXT_QUEUE];
 static volatile uint8_t    coreTextHead = 0, coreTextTail = 0;
-
-// ================================================================
-//  Local helpers
-// ================================================================
-static String meshAuthModeToString(wifi_auth_mode_t m) {
-  switch (m) {
-    case WIFI_AUTH_OPEN:            return "OPEN";
-    case WIFI_AUTH_WEP:             return "WEP";
-    case WIFI_AUTH_WPA_PSK:         return "WPA";
-    case WIFI_AUTH_WPA2_PSK:        return "WPA2";
-    case WIFI_AUTH_WPA_WPA2_PSK:    return "WPAWPA2";
-    case WIFI_AUTH_WPA2_ENTERPRISE: return "WPA2EAP";
-    case WIFI_AUTH_WPA3_PSK:        return "WPA3";
-    case WIFI_AUTH_WPA2_WPA3_PSK:   return "WPA2WPA3";
-    default: return "UNKNOWN";
-  }
-}
 
 // ================================================================
 //  ESP-Now helpers
@@ -538,7 +522,7 @@ static void nodeDoScanTick() {
     for (int i = 0; i < n; i++) {
       String bssid = WiFi.BSSIDstr(i);
       String ssid  = WiFi.SSID(i);
-      String auth  = meshAuthModeToString(WiFi.encryptionType(i));
+      String auth  = authModeToString(WiFi.encryptionType(i));
       int    ch    = WiFi.channel(i);
       int    rssi  = WiFi.RSSI(i);
       String line  = bssid + "," + ssid + "," + auth + ","

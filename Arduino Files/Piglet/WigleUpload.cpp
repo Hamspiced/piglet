@@ -653,20 +653,24 @@ uint32_t uploadAllCsvsToWigle(int maxFiles) {
   uploadCurrentFile = "";
   updateOLED(0);
 
-  // First pass: count
+  // Collect candidate file paths in one pass (avoid rename while dir handle is open).
+  // We intentionally do NOT apply maxFiles here so uploadTotalFiles reflects the
+  // true number of eligible CSVs on disk; the loop below honours maxFiles.
+  std::vector<String> paths;
   File root = SD.open("/logs");
   if (root) {
     File f = root.openNextFile();
     while (f) {
-      String name = normalizeSdPath("/logs", f.name());
-      bool isCsv = name.endsWith(".csv");
-      bool isCurrent = (currentCsvPath.length() && name == currentCsvPath);
-      if (isCsv && !isCurrent) uploadTotalFiles++;
+      String path = normalizeSdPath("/logs", f.name());
+      bool isCsv = path.endsWith(".csv");
+      bool isCurrent = (currentCsvPath.length() && path == currentCsvPath);
       f.close();
+      if (isCsv && !isCurrent) paths.push_back(path);
       f = root.openNextFile();
     }
     root.close();
   }
+  uploadTotalFiles = paths.size();
 
   if (uploadTotalFiles == 0) {
     uploading = false;
@@ -683,32 +687,9 @@ uint32_t uploadAllCsvsToWigle(int maxFiles) {
   uint32_t filesToUpload = uploadTotalFiles;
   if (maxFiles > 0 && (uint32_t)maxFiles < uploadTotalFiles) {
     filesToUpload = (uint32_t)maxFiles;
-    Serial.printf("[WiGLE] Limiting upload to %d of %d files (maxBootUploads)\n", 
+    Serial.printf("[WiGLE] Limiting upload to %d of %d files (maxBootUploads)\n",
                   filesToUpload, uploadTotalFiles);
-  }
-  
-  // Second pass: collect file paths first (avoid rename while dir handle is open)
-  std::vector<String> paths;
-  paths.reserve(uploadTotalFiles + 4);
-
-  root = SD.open("/logs");
-  if (root) {
-    File f = root.openNextFile();
-    while (f) {
-      String path = normalizeSdPath("/logs", f.name());
-      bool isCsv = path.endsWith(".csv");
-      bool isCurrent = (currentCsvPath.length() && path == currentCsvPath);
-      f.close();
-
-      if (isCsv && !isCurrent) {
-        paths.push_back(path);
-        // Stop collecting if we've hit the limit
-        if (maxFiles > 0 && paths.size() >= filesToUpload) break;
-      }
-
-      f = root.openNextFile();
-    }
-    root.close();
+    paths.resize(filesToUpload);
   }
 
   // Now upload + move with no directory handle open
@@ -791,18 +772,22 @@ uint32_t uploadAllCsvsToWdgwars(int maxFiles) {
   uploadCurrentFile = "";
   updateOLED(0);
 
-  // Count eligible files
+  // Collect candidate file paths in a single pass.
+  std::vector<String> paths;
   File root = SD.open("/logs");
   if (root) {
     File f = root.openNextFile();
     while (f) {
-      String name = normalizeSdPath("/logs", f.name());
-      if (name.endsWith(".csv") && !(currentCsvPath.length() && name == currentCsvPath))
-        uploadTotalFiles++;
-      f.close(); f = root.openNextFile();
+      String path = normalizeSdPath("/logs", f.name());
+      bool isCsv = path.endsWith(".csv");
+      bool isCurrent = (currentCsvPath.length() && path == currentCsvPath);
+      f.close();
+      if (isCsv && !isCurrent) paths.push_back(path);
+      f = root.openNextFile();
     }
     root.close();
   }
+  uploadTotalFiles = paths.size();
 
   if (uploadTotalFiles == 0) {
     uploading = false; uploadTargetName = "";
@@ -811,27 +796,8 @@ uint32_t uploadAllCsvsToWdgwars(int maxFiles) {
     return 0;
   }
 
-  uint32_t filesToUpload = uploadTotalFiles;
-  if (maxFiles > 0 && (uint32_t)maxFiles < uploadTotalFiles)
-    filesToUpload = (uint32_t)maxFiles;
-
-  std::vector<String> paths;
-  paths.reserve(filesToUpload + 2);
-  root = SD.open("/logs");
-  if (root) {
-    File f = root.openNextFile();
-    while (f) {
-      String path = normalizeSdPath("/logs", f.name());
-      bool isCsv = path.endsWith(".csv");
-      bool isCurrent = (currentCsvPath.length() && path == currentCsvPath);
-      f.close();
-      if (isCsv && !isCurrent) {
-        paths.push_back(path);
-        if (maxFiles > 0 && paths.size() >= filesToUpload) break;
-      }
-      f = root.openNextFile();
-    }
-    root.close();
+  if (maxFiles > 0 && (uint32_t)maxFiles < uploadTotalFiles) {
+    paths.resize((size_t)maxFiles);
   }
 
   uint32_t okCount = 0;

@@ -467,7 +467,7 @@ function formatBytes(b){
 }
 
 /* ---- Masked config keys that should not be filled back into form ---- */
-const maskedKeys=new Set(['homePsk']);
+const maskedKeys=new Set(['homePsk','wigleBasicToken','wdgwarsApiKey']);
 
 /* ---- Status ---- */
 async function loadStatus(){
@@ -826,8 +826,8 @@ static void handleStatus() {
   doc["wigleLastHttpCode"] = wigleLastHttpCode;
 
   JsonObject c = doc.createNestedObject("config");
-  c["wigleBasicToken"] = cfg.wigleBasicToken;
-  c["wdgwarsApiKey"]   = cfg.wdgwarsApiKey;
+  c["wigleBasicToken"] = cfg.wigleBasicToken.length() ? "(set)" : "";
+  c["wdgwarsApiKey"]   = cfg.wdgwarsApiKey.length() ? "(set)" : "";
   c["homeSsid"] = cfg.homeSsid;
   c["homePsk"] = cfg.homePsk.length() ? "(set)" : "";
   c["wardriverSsid"] = cfg.wardriverSsid;
