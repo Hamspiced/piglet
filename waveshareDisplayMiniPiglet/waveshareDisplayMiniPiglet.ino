@@ -50,6 +50,8 @@
 #include <stdint.h>
 #include "esp_netif.h"
 #include <vector>
+#include <unordered_set>
+#include <deque>
 #include <time.h>
 #include <math.h>
 
@@ -573,10 +575,39 @@ static bool openLogFile() {
   return true;
 }
 
+// ---- Log-once dedupe (matches the upstream JCMK/Biscuit mac_history[200]) ----
+// Self-contained for this single-file sketch. Each BSSID is written once until
+// evicted past the cap (FIFO ring), keeping CSV files from ballooning.
+struct WifiSeenRing {
+  explicit WifiSeenRing(size_t cap = 200) : cap_(cap ? cap : 1) {}
+  bool firstTime(const String& mac) {
+    if (mac.length() < 17) return true;          // unparseable -> don't suppress
+    uint64_t key = 0;
+    for (int i = 0; i < 6; i++)
+      key |= (uint64_t)strtoul(mac.c_str() + i * 3, nullptr, 16) << (i * 8);
+    if (seen_.count(key)) return false;
+    seen_.insert(key);
+    order_.push_back(key);
+    while (seen_.size() > cap_ && !order_.empty()) {
+      seen_.erase(order_.front());
+      order_.pop_front();
+    }
+    return true;
+  }
+ private:
+  std::unordered_set<uint64_t> seen_;
+  std::deque<uint64_t> order_;
+  size_t cap_;
+};
+
 static void appendWigleRow(const String& mac, const String& ssid, const String& auth,
                            const String& firstSeen, int channel, int rssi,
                            double lat, double lon, double altM, double accM) {
   if (!sdOk || !logFile) return;
+
+  // Log each BSSID once.
+  static WifiSeenRing gWigleSeen;
+  if (!gWigleSeen.firstTime(mac)) return;
 
   String safeSsid = ssid;
   safeSsid.replace("\"", "\"\"");

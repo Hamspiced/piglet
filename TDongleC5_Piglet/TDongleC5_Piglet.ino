@@ -34,6 +34,8 @@
 #include <stdint.h>
 #include "esp_netif.h"
 #include <vector>
+#include <unordered_set>
+#include <deque>
 #include <time.h>
 #include <math.h>
 #include <esp_now.h>
@@ -520,10 +522,40 @@ static bool openLogFile() {
   return true;
 }
 
+// ---- Log-once dedupe (matches the upstream JCMK/Biscuit mac_history[200]) ----
+// Self-contained for this single-file sketch (no shared header). Each BSSID is
+// accepted once until it is evicted past the cap (FIFO ring), so a given network
+// is written / forwarded only once per session.
+struct WifiSeenRing {
+  explicit WifiSeenRing(size_t cap = 200) : cap_(cap ? cap : 1) {}
+  bool firstTime(const String& mac) {
+    if (mac.length() < 17) return true;          // unparseable -> don't suppress
+    uint64_t key = 0;
+    for (int i = 0; i < 6; i++)
+      key |= (uint64_t)strtoul(mac.c_str() + i * 3, nullptr, 16) << (i * 8);
+    if (seen_.count(key)) return false;
+    seen_.insert(key);
+    order_.push_back(key);
+    while (seen_.size() > cap_ && !order_.empty()) {
+      seen_.erase(order_.front());
+      order_.pop_front();
+    }
+    return true;
+  }
+ private:
+  std::unordered_set<uint64_t> seen_;
+  std::deque<uint64_t> order_;
+  size_t cap_;
+};
+
 static void appendWigleRow(const String& mac, const String& ssid, const String& auth,
                            const String& firstSeen, int channel, int rssi,
                            double lat, double lon, double altM, double accM) {
   if (!sdOk || !logFile) return;
+
+  // Log each BSSID once (covers solo + Core node-forwarded writes via one ring).
+  static WifiSeenRing gWigleSeen;
+  if (!gWigleSeen.firstTime(mac)) return;
 
   String safeSsid = ssid;
   safeSsid.replace("\"", "\"\"");
@@ -2269,8 +2301,10 @@ static void nodeDoScanTick() {
     // Return to ch 6 before any ESP-Now send (JCMK sendBroadcastStringPlain pattern).
     // The scan left the radio on the scan channel; Core listens only on ch 6.
     jcmkSetChannel(JCMK_ESPNOW_CH);
+    static WifiSeenRing gFwdSeen;  // node-side: forward each BSSID once
     for (int i = 0; i < n; i++) {
       String bssid = WiFi.BSSIDstr(i);
+      if (!gFwdSeen.firstTime(bssid)) continue;  // already forwarded
       String ssid  = WiFi.SSID(i);
       String auth  = authModeToString(WiFi.encryptionType(i));
       int    ch    = WiFi.channel(i);

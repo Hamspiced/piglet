@@ -1,5 +1,7 @@
 #include "SDUtils.h"
 #include "Globals.h"
+#include <unordered_set>
+#include <deque>
 
 // ---- Path helpers ----
 
@@ -220,10 +222,42 @@ void closeLogFile() {
   }
 }
 
+// ---- Log-once dedupe (matches the upstream JCMK/Biscuit mac_history[200]) ----
+// Each BSSID is written once until evicted past the cap (FIFO ring), so a
+// stationary AP isn't re-logged every scan. appendWigleRow is the single WiGLE
+// write path — called both by the solo scanner and by the mesh Core for records
+// forwarded by nodes — so one shared ring keeps the CSV (and WiGLE merge rate)
+// from ballooning whether wardriving solo or as a cluster.
+struct WifiSeenRing {
+  explicit WifiSeenRing(size_t cap = 200) : cap_(cap ? cap : 1) {}
+  bool firstTime(const String& mac) {
+    if (mac.length() < 17) return true;          // unparseable -> don't suppress
+    uint64_t key = 0;
+    for (int i = 0; i < 6; i++)
+      key |= (uint64_t)strtoul(mac.c_str() + i * 3, nullptr, 16) << (i * 8);
+    if (seen_.count(key)) return false;
+    seen_.insert(key);
+    order_.push_back(key);
+    while (seen_.size() > cap_ && !order_.empty()) {
+      seen_.erase(order_.front());
+      order_.pop_front();
+    }
+    return true;
+  }
+ private:
+  std::unordered_set<uint64_t> seen_;
+  std::deque<uint64_t> order_;
+  size_t cap_;
+};
+
 void appendWigleRow(const String& mac, const String& ssid, const String& auth,
                     const String& firstSeen, int channel, int rssi,
                     double lat, double lon, double altM, double accM) {
   if (!sdOk || !logFile) return;
+
+  // Log each BSSID once (one ring covers solo + Core node-forwarded writes).
+  static WifiSeenRing gWigleSeen;
+  if (!gWigleSeen.firstTime(mac)) return;
 
   String safeSsid = ssid;
   safeSsid.replace("\"", "\"\"");

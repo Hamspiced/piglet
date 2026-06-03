@@ -19,6 +19,8 @@
 #include <WiFi.h>
 #include <esp_now.h>
 #include "esp_wifi.h"
+#include <unordered_set>
+#include <deque>
 
 // ================================================================
 //  Board — XIAO ESP32-C5
@@ -290,6 +292,31 @@ static void resetToSearching() {
   Serial.println("[NODE] Searching for Core on ch 6...");
 }
 
+// ---- Log-once dedupe (matches the upstream JCMK/Biscuit mac_history[200]) ----
+// Forward each BSSID to the Core only once until evicted past the cap (FIFO
+// ring), so a stationary AP isn't re-sent over ESP-Now every scan cycle.
+struct WifiSeenRing {
+  explicit WifiSeenRing(size_t cap = 200) : cap_(cap ? cap : 1) {}
+  bool firstTime(const String& mac) {
+    if (mac.length() < 17) return true;          // unparseable -> don't suppress
+    uint64_t key = 0;
+    for (int i = 0; i < 6; i++)
+      key |= (uint64_t)strtoul(mac.c_str() + i * 3, nullptr, 16) << (i * 8);
+    if (seen_.count(key)) return false;
+    seen_.insert(key);
+    order_.push_back(key);
+    while (seen_.size() > cap_ && !order_.empty()) {
+      seen_.erase(order_.front());
+      order_.pop_front();
+    }
+    return true;
+  }
+ private:
+  std::unordered_set<uint64_t> seen_;
+  std::deque<uint64_t> order_;
+  size_t cap_;
+};
+
 // ================================================================
 //  Per-channel async scan tick
 // ================================================================
@@ -339,8 +366,11 @@ static void scanTick() {
     netFound += (uint32_t)n;
     // Return to ch 6 before sending (Core only listens on ch 6)
     setChannel(ESPNOW_CH);
+    static WifiSeenRing gFwdSeen;  // forward each BSSID once
     for (int i = 0; i < n; i++) {
-      String line = WiFi.BSSIDstr(i) + "," + WiFi.SSID(i) + ","
+      String bssid = WiFi.BSSIDstr(i);
+      if (!gFwdSeen.firstTime(bssid)) continue;  // already forwarded
+      String line = bssid + "," + WiFi.SSID(i) + ","
                   + authStr(WiFi.encryptionType(i)) + ","
                   + String(WiFi.channel(i)) + "," + String(WiFi.RSSI(i)) + ",W";
       sendText(line);
