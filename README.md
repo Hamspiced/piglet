@@ -116,6 +116,11 @@ All networking, SPI, SD, ESP-Now, and ESP-IDF headers are included in the ESP32 
 
 **Board setup:** Add `https://espressif.github.io/arduino-esp32/package_esp32_dev_index.json` to Additional Boards Manager URLs, install **esp32 by Espressif v3.x or later**, and select **ESP32C5 Dev Module**.
 
+If the sketch exceeds the maximum program storage space when uploading, then make these changes in settings in the Tools pull-down menu:
+
+1. Change "Flash Size" to "16MB"
+2. Change "Partition Scheme" to "8M with spiffs".
+
 
 ## Supported Hardware
 
