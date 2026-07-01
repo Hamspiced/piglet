@@ -1,10 +1,10 @@
 {
-  "additionalFiles": "../..,../..,../..,../..,../..,../..,../..,../..,../..,../..,../..,../..,../..,../..,../..,../..,../..,../..,../..,../..,../..,../..,../..",
+  "additionalFiles": "../..",
   "builtInLibrariesFolders": "/Users/gambino/Library/Arduino15/libraries",
   "compiler.optimization_flags": "-Os",
   "customBuildProperties": "",
   "fqbn": "esp32:esp32:XIAO_ESP32C5:UploadSpeed=921600,CDCOnBoot=cdc,CPUFreq=240,FlashFreq=80,FlashMode=qio,FlashSize=8M,PartitionScheme=huge_app,DebugLevel=none,PSRAM=disabled,EraseFlash=none,JTAGAdapter=default,ZigbeeMode=default",
   "hardwareFolders": "/Users/gambino/Library/Arduino15/packages/esp32/hardware/esp32/3.3.10,/Users/gambino/Library/Arduino15/packages/esp32/hardware/esp32/3.3.10",
   "otherLibrariesFolders": "/Users/gambino/Documents/Arduino/libraries",
-  "sketchLocation": "/Users/gambino/Github/piglet/Arduino Files/Piglet"
+  "sketchLocation": "/Users/gambino/Github/piglet/TDongleC5_Piglet"
 }
