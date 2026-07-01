@@ -198,11 +198,15 @@ bool openLogFile() {
     if (safe.length() > 0) deviceField = "Piglet-" + safe;
   }
 
-  // Derive a human-readable board model from the config key
-  String boardModel = "Xiao-ESP32S3"; // default / "auto"
-  if (cfg.board == "c5")  boardModel = "Xiao-ESP32C5";
-  else if (cfg.board == "c6")  boardModel = "Xiao-ESP32C6";
-  else if (cfg.board == "exp") boardModel = "Xiao-ESP32S3-Exp";
+  // Derive board model from the ACTIVE pin-map name (set by detectPinsByChip /
+  // pickPinsFromConfig at boot). This reflects the real chip even when
+  // cfg.board="auto", avoiding the old fallback that always wrote "Xiao-ESP32S3".
+  String pn = String(pins.name); pn.toUpperCase();
+  String boardModel;
+  if      (pn.indexOf("EXP") >= 0) boardModel = "Xiao-ESP32S3-Exp";
+  else if (pn.indexOf("C5")  >= 0) boardModel = "Xiao-ESP32C5";
+  else if (pn.indexOf("C6")  >= 0) boardModel = "Xiao-ESP32C6";
+  else                              boardModel = "Xiao-ESP32S3";
 
   // WiGLE WiFi 1.6 header
   logFile.print("WigleWifi-1.6,appRelease=");
