@@ -43,7 +43,7 @@
 #include "esp32-hal-matrix.h"
 
 // Firmware version
-#define FIRMWARE_VERSION "v2.57"
+#define FIRMWARE_VERSION "v2.58"
 
 // ---------------- Pins (T-DONGLE C5) ----------------
 struct PinMap {
@@ -3120,8 +3120,14 @@ static bool shouldPauseScanning() {
 
 // Last-known GPS position — used when fix is temporarily lost so networks
 // aren't logged at 0,0 (null island).
-static bool   lastGpsValid = false;
-static double lastLat = 0, lastLon = 0, lastAlt = 0, lastAcc = 0;
+// Updated every loop() iteration (not just on scan) so position stays current
+// even when driving through areas with no networks.
+// Quality-gated: requires HDOP ≤ 10 and ≥ 3 satellites to prevent a brief
+// low-quality re-acquisition from overwriting a good cached position.
+static bool     lastGpsValid   = false;
+static double   lastLat = 0, lastLon = 0, lastAlt = 0, lastAcc = 0;
+static uint32_t lastGpsValidMs = 0;          // millis() when position was last cached
+static const uint32_t GPS_CACHE_MAX_MS = 180000UL;  // discard cache after 3 min
 
 // ---------------- Scan (2.4 + 5 GHz) ----------------
 static void processScanResults(int n) {
@@ -3130,12 +3136,16 @@ static void processScanResults(int n) {
   String firstSeen = iso8601NowUTC();
   double lat = 0, lon = 0, altM = 0, accM = 0;
   if (gpsHasFix) {
-    lat = gps.location.lat(); lon = gps.location.lng();
-    altM = gps.altitude.meters(); accM = gps.hdop.hdop();
-    lastLat = lat; lastLon = lon; lastAlt = altM; lastAcc = accM;
-    lastGpsValid = true;
-  } else if (lastGpsValid) {
-    lat = lastLat; lon = lastLon; altM = lastAlt; accM = lastAcc;
+    lat  = gps.location.lat();
+    lon  = gps.location.lng();
+    altM = gps.altitude.isValid() ? gps.altitude.meters() : 0.0;
+    accM = gps.hdop.isValid()     ? gps.hdop.hdop()       : 0.0;
+    // lastLat/lastLon is maintained by loop() — no update here.
+  } else if (lastGpsValid && (millis() - lastGpsValidMs) <= GPS_CACHE_MAX_MS) {
+    lat  = lastLat;
+    lon  = lastLon;
+    altM = lastAlt;
+    accM = lastAcc;
   }
 
   uint32_t wrote = 0;
@@ -3382,12 +3392,40 @@ void setup() {
 
   // GPS (UART via Qwiic connector)
   // QWIIC pinout: RX = GPIO12 (from GPS TX), TX = GPIO11 (to GPS RX).
-  // Increase RX buffer to 512 bytes: at 9600 baud, the default 256-byte buffer fills
-  // in ~267ms — not enough headroom for WiFi scan (~300ms) or SD flush bursts.
-  // setRxBufferSize() must be called before begin().
+  // RX buffer 512 bytes: at 9600 baud the default 256-byte buffer fills in ~267ms.
   Serial.printf("[GPS] UART on RX=%d TX=%d Baud=%lu\n", PINS.gps_rx, PINS.gps_tx, (unsigned long)cfg.gpsBaud);
   GPSSerial.setRxBufferSize(512);
   GPSSerial.begin(cfg.gpsBaud, SERIAL_8N1, PINS.gps_rx, PINS.gps_tx);
+
+  // GPS connection check — wait up to 2 s for any bytes from the module.
+  // Diagnosis key:
+  //   chars=0            -> RX not connected (GPIO12 not reaching GPS TX)
+  //   chars>0, failed>0  -> baud rate mismatch or signal noise
+  //   chars>0, failed=0  -> UART wired correctly; fix comes once outside with signal
+  {
+    Serial.println("[GPS] Checking wiring...");
+    uint32_t gpsCheckEnd = millis() + 2000;
+    while (millis() < gpsCheckEnd) {
+      while (GPSSerial.available()) gps.encode(GPSSerial.read());
+      delay(10);
+    }
+    uint32_t chars     = gps.charsProcessed();
+    uint32_t sentences = gps.passedChecksum();
+    uint32_t failed    = gps.failedChecksum();
+    if (chars == 0) {
+      Serial.printf("[GPS] WARNING: No data on RX=GPIO%d\n"
+                    "[GPS]   -> Check GPS TX wire is on GPIO%d\n"
+                    "[GPS]   -> Check GPS module is powered (3.3V on QWIIC)\n",
+                    PINS.gps_rx, PINS.gps_rx);
+    } else if (failed > sentences) {
+      Serial.printf("[GPS] Data on RX but high checksum errors (chars=%lu ok=%lu fail=%lu)\n"
+                    "[GPS]   -> Likely wrong baud rate (currently %lu) or signal noise\n",
+                    chars, sentences, failed, (unsigned long)cfg.gpsBaud);
+    } else {
+      Serial.printf("[GPS] UART OK — chars=%lu sentences=%lu failed=%lu\n",
+                    chars, sentences, failed);
+    }
+  }
 
   // WiFi setup: mesh boot with a home network connects STA first for auto-upload,
   // then hands off to mesh. Mesh boot with no home network skips STA/AP entirely.
@@ -3534,6 +3572,43 @@ void loop() {
   gpsHasFix = gps.location.isValid() && gps.location.age() < 2000;
   if (gpsHasFix != prevFix) {
     Serial.println(gpsHasFix ? "[GPS] LOCKED" : "[GPS] NO FIX");
+  }
+
+  // Update last-known-good position every loop — decoupled from scan results
+  // so it stays current even when no networks are found.
+  // Quality gate: HDOP ≤ 10 and ≥ 3 satellites guards against brief bad fixes
+  // (e.g. re-acquisition after a tunnel) overwriting a good cached position.
+  if (gpsHasFix) {
+    float hdop = gps.hdop.isValid()       ? gps.hdop.hdop()           : 99.0f;
+    int   sats = gps.satellites.isValid() ? (int)gps.satellites.value() : 0;
+    if (hdop <= 10.0f && sats >= 3) {
+      lastLat        = gps.location.lat();
+      lastLon        = gps.location.lng();
+      lastAlt        = gps.altitude.isValid() ? gps.altitude.meters() : 0.0;
+      lastAcc        = hdop;
+      lastGpsValid   = true;
+      lastGpsValidMs = millis();
+    }
+  }
+
+  // GPS health log every 10 s until fix acquired
+  if (!gpsHasFix) {
+    static uint32_t lastGpsDiagMs = 0;
+    if (millis() - lastGpsDiagMs >= 10000) {
+      lastGpsDiagMs = millis();
+      uint32_t chars  = gps.charsProcessed();
+      uint32_t ok     = gps.passedChecksum();
+      uint32_t failed = gps.failedChecksum();
+      int      sats   = gps.satellites.isValid() ? (int)gps.satellites.value() : 0;
+      Serial.printf("[GPS] chars=%lu ok=%lu fail=%lu sats=%d fix=NO\n",
+                    chars, ok, failed, sats);
+      if (chars == 0)
+        Serial.printf("[GPS]   No data — RX=GPIO%d not receiving. Check GPS TX wire.\n",
+                      PINS.gps_rx);
+      else if (failed > ok)
+        Serial.printf("[GPS]   Checksum errors dominate — check baud rate (%lu bps)\n",
+                      (unsigned long)cfg.gpsBaud);
+    }
   }
 
   uiGpsSats = gps.satellites.isValid() ? (int)gps.satellites.value() : 0;
