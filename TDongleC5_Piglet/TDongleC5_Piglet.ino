@@ -43,7 +43,7 @@
 #include "esp32-hal-matrix.h"
 
 // Firmware version
-#define FIRMWARE_VERSION "v2.57"
+#define FIRMWARE_VERSION "v2.59"
 
 // ---------------- Pins (T-DONGLE C5) ----------------
 struct PinMap {
@@ -211,6 +211,23 @@ static int      wigleLastHttpCode = 0;
 
 static const char* WDGWARS_HOST = "wdgwars.pl";
 static const uint16_t WDGWARS_PORT = 443;
+
+// A 202 response only means the CSV was received and queued for import —
+// it does NOT mean the server has finished processing it. Blocking the
+// upload loop for up to 45 s per file waiting on that made both WDGoWars
+// and WiGLE uploads (which run right after it, for the same file) look
+// hung even though the file had already reached the server. Instead, the
+// job is queued here and checked opportunistically from loop() via
+// wdgwarsServicePendingJobs(), without blocking anything.
+struct WdgwarsPendingJob {
+  int      jobId;
+  String   filename;
+  uint32_t queuedAtMs;
+  uint32_t lastCheckMs;
+};
+static std::vector<WdgwarsPendingJob> wdgwarsPendingJobs;
+static const uint32_t WDGWARS_JOB_CHECK_INTERVAL_MS = 4000;            // min gap between checks
+static const uint32_t WDGWARS_JOB_MAX_AGE_MS        = 5UL * 60UL * 1000UL; // give up after 5 min
 
 static const char* WIGLE_HOST = "api.wigle.net";
 static const uint16_t WIGLE_PORT = 443;
@@ -601,6 +618,8 @@ static void appendWigleRow(const String& mac, const String& ssid, const String& 
 // Forward declarations needed by WDGoWars and WiGLE batch functions
 static void tftWigleUploadScreen(uint32_t done, uint32_t total, const String& filename);
 static void forceStatusFullRedraw();
+static void wdgwarsServicePendingJobs();
+static void wdgwarsDrainPendingJobs(uint32_t budgetMs);
 
 // ---- WDGoWars API key test — GET /api/me ----
 static bool wdgwarsTestKey() {
@@ -720,46 +739,132 @@ static bool uploadFileToWdgwars(const String& path) {
   }
   client.stop();
   Serial.printf("[WDGWars] HTTP %d  body: %s\n", code, body.substring(0,100).c_str());
-  // V2 API: HTTP 202 Accepted — async job
+  // V2 API: HTTP 202 Accepted — file received and queued for processing.
+  // Report success immediately instead of blocking here for up to 45 s;
+  // the job result is checked later in the background (see
+  // wdgwarsServicePendingJobs() / wdgwarsDrainPendingJobs() below).
   if (code == 202) {
     int jobId = 0;
     int ji = body.indexOf("\"job_id\":");
     if (ji >= 0) jobId = body.substring(ji + 9).toInt();
     if (jobId <= 0) { uploadLastResult = "WDGW: no job_id"; return false; }
-    Serial.printf("[WDGWars] Job %d submitted, polling...\n", jobId);
-    String jobPath = String("/api/v2/upload-job/") + String(jobId);
-    for (int poll = 1; poll <= 15; poll++) {
-      delay(3000); yield();
-      WiFiClientSecure pc; pc.setInsecure(); pc.setTimeout(15000);
-      if (!pc.connect(WDGWARS_HOST, WDGWARS_PORT)) { continue; }
-      pc.print("GET " + jobPath + " HTTP/1.0\r\n");
-      pc.print(String("Host: ")+WDGWARS_HOST+"\r\n");
-      pc.print(String("X-API-Key: ")+cfg.wdgwarsApiKey+"\r\n");
-      pc.print("Connection: close\r\n\r\n");
-      uint32_t pw = millis();
-      while (!pc.available() && pc.connected() && (millis()-pw)<10000) { delay(100); yield(); }
-      if (!pc.available()) { pc.stop(); continue; }
-      pc.readStringUntil('\n');
-      String pb=""; bool pIn=false;
-      while (pc.connected()||pc.available()) {
-        String ln=pc.readStringUntil('\n'); ln.trim();
-        if (!pIn){if(ln.length()==0) pIn=true;} else{pb+=ln;if(pb.length()>512) break;}
-      }
-      pc.stop();
-      Serial.printf("[WDGWars] Poll %d: %s\n", poll, pb.substring(0,80).c_str());
-      if (pb.indexOf("\"done\"") >= 0) {
-        int imp=0; int ii=pb.indexOf("\"imported\":");
-        if (ii>=0) imp=pb.substring(ii+11).toInt();
-        uploadLastResult = "WDGW OK ("+String(imp)+" net)";
-        return true;
-      }
-      if (pb.indexOf("\"failed\"") >= 0) { uploadLastResult="WDGW: job failed"; return false; }
-    }
-    uploadLastResult = "WDGW: poll timeout"; return false;
+
+    uint32_t nowMs = millis();
+    wdgwarsPendingJobs.push_back({ jobId, filename, nowMs, nowMs });
+    uploadLastResult = "WDGW: queued (job " + String(jobId) + ")";
+    Serial.printf("[WDGWars] Job %d submitted for %s — result will be checked in background\n",
+                  jobId, filename.c_str());
+    return true;
   }
   uploadLastResult = "WDGW fail (" + String(code) + ")";
   Serial.printf("[WDGWars] Upload FAILED HTTP %d: %s\n", code, body.c_str());
   return false;
+}
+
+// ---- WDGoWars background job status check ----
+// Does the actual work of checking a single pending job: one short-lived
+// HTTPS GET, no retries. Removes the job from the queue once it resolves
+// (done/failed) or once it has been pending longer than
+// WDGWARS_JOB_MAX_AGE_MS. Returns true if it made a network attempt (or
+// gave up on an aged-out job), so callers can pace successive checks.
+static bool wdgwarsCheckOnePendingJob() {
+  if (wdgwarsPendingJobs.empty()) return false;
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  uint32_t nowMs = millis();
+
+  int idx = -1;
+  for (size_t i = 0; i < wdgwarsPendingJobs.size(); i++) {
+    if (nowMs - wdgwarsPendingJobs[i].lastCheckMs >= WDGWARS_JOB_CHECK_INTERVAL_MS) {
+      idx = (int)i;
+      break;
+    }
+  }
+  if (idx < 0) return false;
+
+  WdgwarsPendingJob job = wdgwarsPendingJobs[idx];
+
+  if (nowMs - job.queuedAtMs > WDGWARS_JOB_MAX_AGE_MS) {
+    Serial.printf("[WDGWars] Job %d (%s): giving up after %lus with no result\n",
+                  job.jobId, job.filename.c_str(),
+                  (unsigned long)(WDGWARS_JOB_MAX_AGE_MS / 1000));
+    wdgwarsPendingJobs.erase(wdgwarsPendingJobs.begin() + idx);
+    return true;
+  }
+
+  wdgwarsPendingJobs[idx].lastCheckMs = nowMs;
+
+  WiFiClientSecure pc;
+  pc.setInsecure();
+  pc.setTimeout(8000);
+  if (!pc.connect(WDGWARS_HOST, WDGWARS_PORT)) return true;
+
+  String jobPath = String("/api/v2/upload-job/") + String(job.jobId);
+  pc.print("GET " + jobPath + " HTTP/1.0\r\n");
+  pc.print(String("Host: ") + WDGWARS_HOST + "\r\n");
+  pc.print(String("X-API-Key: ") + cfg.wdgwarsApiKey + "\r\n");
+  pc.print("Connection: close\r\n\r\n");
+
+  uint32_t pw = millis();
+  while (!pc.available() && pc.connected() && (millis() - pw) < 6000) { delay(50); yield(); }
+  if (!pc.available()) { pc.stop(); return true; }
+
+  pc.readStringUntil('\n');  // skip HTTP status line
+  String pb = ""; bool pInBody = false;
+  while (pc.connected() || pc.available()) {
+    String ln = pc.readStringUntil('\n'); ln.trim();
+    if (!pInBody) { if (ln.length() == 0) pInBody = true; }
+    else { pb += ln; if (pb.length() > 512) break; }
+  }
+  pc.stop();
+
+  if (pb.indexOf("\"done\"") >= 0) {
+    int imp = 0;
+    int ii = pb.indexOf("\"imported\":");
+    if (ii >= 0) imp = pb.substring(ii + 11).toInt();
+    Serial.printf("[WDGWars] Job %d (%s) done — imported: %d\n",
+                  job.jobId, job.filename.c_str(), imp);
+    wdgwarsPendingJobs.erase(wdgwarsPendingJobs.begin() + idx);
+  } else if (pb.indexOf("\"failed\"") >= 0) {
+    Serial.printf("[WDGWars] Job %d (%s) FAILED server-side\n",
+                  job.jobId, job.filename.c_str());
+    wdgwarsPendingJobs.erase(wdgwarsPendingJobs.begin() + idx);
+  }
+  // else still "processing" — leave queued, checked again later
+
+  return true;
+}
+
+// Call periodically from loop(). Internally rate-limited so it never does
+// more than one short network round-trip per call.
+static void wdgwarsServicePendingJobs() {
+  static uint32_t lastRunMs = 0;
+  uint32_t nowMs = millis();
+  if (nowMs - lastRunMs < WDGWARS_JOB_CHECK_INTERVAL_MS) return;
+  lastRunMs = nowMs;
+  wdgwarsCheckOnePendingJob();
+}
+
+// Best-effort: keep checking pending jobs back-to-back for up to budgetMs.
+// Intended to be called right before intentionally dropping the STA
+// connection (e.g. entering mesh Core mode) so quick jobs still get
+// confirmed instead of being silently abandoned.
+static void wdgwarsDrainPendingJobs(uint32_t budgetMs) {
+  if (wdgwarsPendingJobs.empty()) return;
+
+  for (auto& j : wdgwarsPendingJobs) j.lastCheckMs = 0;
+
+  uint32_t start = millis();
+  while (!wdgwarsPendingJobs.empty() && (millis() - start) < budgetMs) {
+    if (!wdgwarsCheckOnePendingJob()) break;  // WiFi down or nothing due yet
+    delay(200);
+    yield();
+  }
+
+  if (!wdgwarsPendingJobs.empty()) {
+    Serial.printf("[WDGWars] %u job(s) still pending — will not be confirmed (STA disconnecting)\n",
+                  (unsigned)wdgwarsPendingJobs.size());
+  }
 }
 
 // ---- Empty-file guard: true if file has any data beyond the 2 header lines ----
@@ -3120,8 +3225,14 @@ static bool shouldPauseScanning() {
 
 // Last-known GPS position — used when fix is temporarily lost so networks
 // aren't logged at 0,0 (null island).
-static bool   lastGpsValid = false;
-static double lastLat = 0, lastLon = 0, lastAlt = 0, lastAcc = 0;
+// Updated every loop() iteration (not just on scan) so position stays current
+// even when driving through areas with no networks.
+// Quality-gated: requires HDOP ≤ 10 and ≥ 3 satellites to prevent a brief
+// low-quality re-acquisition from overwriting a good cached position.
+static bool     lastGpsValid   = false;
+static double   lastLat = 0, lastLon = 0, lastAlt = 0, lastAcc = 0;
+static uint32_t lastGpsValidMs = 0;          // millis() when position was last cached
+static const uint32_t GPS_CACHE_MAX_MS = 180000UL;  // discard cache after 3 min
 
 // ---------------- Scan (2.4 + 5 GHz) ----------------
 static void processScanResults(int n) {
@@ -3130,12 +3241,16 @@ static void processScanResults(int n) {
   String firstSeen = iso8601NowUTC();
   double lat = 0, lon = 0, altM = 0, accM = 0;
   if (gpsHasFix) {
-    lat = gps.location.lat(); lon = gps.location.lng();
-    altM = gps.altitude.meters(); accM = gps.hdop.hdop();
-    lastLat = lat; lastLon = lon; lastAlt = altM; lastAcc = accM;
-    lastGpsValid = true;
-  } else if (lastGpsValid) {
-    lat = lastLat; lon = lastLon; altM = lastAlt; accM = lastAcc;
+    lat  = gps.location.lat();
+    lon  = gps.location.lng();
+    altM = gps.altitude.isValid() ? gps.altitude.meters() : 0.0;
+    accM = gps.hdop.isValid()     ? gps.hdop.hdop()       : 0.0;
+    // lastLat/lastLon is maintained by loop() — no update here.
+  } else if (lastGpsValid && (millis() - lastGpsValidMs) <= GPS_CACHE_MAX_MS) {
+    lat  = lastLat;
+    lon  = lastLon;
+    altM = lastAlt;
+    accM = lastAcc;
   }
 
   uint32_t wrote = 0;
@@ -3382,12 +3497,40 @@ void setup() {
 
   // GPS (UART via Qwiic connector)
   // QWIIC pinout: RX = GPIO12 (from GPS TX), TX = GPIO11 (to GPS RX).
-  // Increase RX buffer to 512 bytes: at 9600 baud, the default 256-byte buffer fills
-  // in ~267ms — not enough headroom for WiFi scan (~300ms) or SD flush bursts.
-  // setRxBufferSize() must be called before begin().
+  // RX buffer 512 bytes: at 9600 baud the default 256-byte buffer fills in ~267ms.
   Serial.printf("[GPS] UART on RX=%d TX=%d Baud=%lu\n", PINS.gps_rx, PINS.gps_tx, (unsigned long)cfg.gpsBaud);
   GPSSerial.setRxBufferSize(512);
   GPSSerial.begin(cfg.gpsBaud, SERIAL_8N1, PINS.gps_rx, PINS.gps_tx);
+
+  // GPS connection check — wait up to 2 s for any bytes from the module.
+  // Diagnosis key:
+  //   chars=0            -> RX not connected (GPIO12 not reaching GPS TX)
+  //   chars>0, failed>0  -> baud rate mismatch or signal noise
+  //   chars>0, failed=0  -> UART wired correctly; fix comes once outside with signal
+  {
+    Serial.println("[GPS] Checking wiring...");
+    uint32_t gpsCheckEnd = millis() + 2000;
+    while (millis() < gpsCheckEnd) {
+      while (GPSSerial.available()) gps.encode(GPSSerial.read());
+      delay(10);
+    }
+    uint32_t chars     = gps.charsProcessed();
+    uint32_t sentences = gps.passedChecksum();
+    uint32_t failed    = gps.failedChecksum();
+    if (chars == 0) {
+      Serial.printf("[GPS] WARNING: No data on RX=GPIO%d\n"
+                    "[GPS]   -> Check GPS TX wire is on GPIO%d\n"
+                    "[GPS]   -> Check GPS module is powered (3.3V on QWIIC)\n",
+                    PINS.gps_rx, PINS.gps_rx);
+    } else if (failed > sentences) {
+      Serial.printf("[GPS] Data on RX but high checksum errors (chars=%lu ok=%lu fail=%lu)\n"
+                    "[GPS]   -> Likely wrong baud rate (currently %lu) or signal noise\n",
+                    chars, sentences, failed, (unsigned long)cfg.gpsBaud);
+    } else {
+      Serial.printf("[GPS] UART OK — chars=%lu sentences=%lu failed=%lu\n",
+                    chars, sentences, failed);
+    }
+  }
 
   // WiFi setup: mesh boot with a home network connects STA first for auto-upload,
   // then hands off to mesh. Mesh boot with no home network skips STA/AP entirely.
@@ -3493,6 +3636,10 @@ void setup() {
       // (if any) was only needed for auto-upload and must not remain active
       // or ESP-Now channel control will conflict with the STA home channel.
       if (WiFi.status() == WL_CONNECTED || WiFi.getMode() != WIFI_OFF) {
+        // Give any WDGoWars jobs queued during boot upload a brief chance to
+        // resolve before we drop the STA connection they'd need to check on.
+        wdgwarsDrainPendingJobs(5000);
+
         Serial.println("[BOOT] Tearing down STA before Core mode");
         WiFi.disconnect(true, true);
         WiFi.mode(WIFI_OFF);
@@ -3534,6 +3681,43 @@ void loop() {
   gpsHasFix = gps.location.isValid() && gps.location.age() < 2000;
   if (gpsHasFix != prevFix) {
     Serial.println(gpsHasFix ? "[GPS] LOCKED" : "[GPS] NO FIX");
+  }
+
+  // Update last-known-good position every loop — decoupled from scan results
+  // so it stays current even when no networks are found.
+  // Quality gate: HDOP ≤ 10 and ≥ 3 satellites guards against brief bad fixes
+  // (e.g. re-acquisition after a tunnel) overwriting a good cached position.
+  if (gpsHasFix) {
+    float hdop = gps.hdop.isValid()       ? gps.hdop.hdop()           : 99.0f;
+    int   sats = gps.satellites.isValid() ? (int)gps.satellites.value() : 0;
+    if (hdop <= 10.0f && sats >= 3) {
+      lastLat        = gps.location.lat();
+      lastLon        = gps.location.lng();
+      lastAlt        = gps.altitude.isValid() ? gps.altitude.meters() : 0.0;
+      lastAcc        = hdop;
+      lastGpsValid   = true;
+      lastGpsValidMs = millis();
+    }
+  }
+
+  // GPS health log every 10 s until fix acquired
+  if (!gpsHasFix) {
+    static uint32_t lastGpsDiagMs = 0;
+    if (millis() - lastGpsDiagMs >= 10000) {
+      lastGpsDiagMs = millis();
+      uint32_t chars  = gps.charsProcessed();
+      uint32_t ok     = gps.passedChecksum();
+      uint32_t failed = gps.failedChecksum();
+      int      sats   = gps.satellites.isValid() ? (int)gps.satellites.value() : 0;
+      Serial.printf("[GPS] chars=%lu ok=%lu fail=%lu sats=%d fix=NO\n",
+                    chars, ok, failed, sats);
+      if (chars == 0)
+        Serial.printf("[GPS]   No data — RX=GPIO%d not receiving. Check GPS TX wire.\n",
+                      PINS.gps_rx);
+      else if (failed > ok)
+        Serial.printf("[GPS]   Checksum errors dominate — check baud rate (%lu bps)\n",
+                      (unsigned long)cfg.gpsBaud);
+    }
   }
 
   uiGpsSats = gps.satellites.isValid() ? (int)gps.satellites.value() : 0;
@@ -3591,6 +3775,11 @@ void loop() {
   // Skip STA transition handler in mesh mode — it calls WiFi.disconnect(wifioff=true)
   // which stops the WiFi driver and deinits ESP-Now.
   if (!meshNodeActive && !meshCoreActive) handleStaTransitions();
+
+  // Check on any WDGoWars jobs queued during the last upload batch. This is
+  // rate-limited internally to at most one short network round-trip per
+  // call, so it never blocks scanning, GPS, or the display.
+  wdgwarsServicePendingJobs();
 
   // Scanning — mesh page handles its own logic; skip normal scan path
   if (currentPage == 4) {

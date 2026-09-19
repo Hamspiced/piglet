@@ -22,6 +22,7 @@ const PinMap& detectPinsByChip() {
 
   if (m.indexOf("C5") >= 0) return PINS_C5;
   if (m.indexOf("C6") >= 0) return PINS_C6;
+  if (m.indexOf("C3") >= 0) return PINS_XIAO_C3;
   if (m.indexOf("S3") >= 0) return PINS_S3;
 
   // fallback
@@ -30,10 +31,11 @@ const PinMap& detectPinsByChip() {
 
 PinMap pickPinsFromConfig() {
   // cfg.board is expected to be: "auto" | "s3" | "c6" (lowercase)
-  if (cfg.board == "s3") return PINS_S3;
+  if (cfg.board == "s3")  return PINS_S3;
   if (cfg.board == "exp") return PINS_S3_EXP_BASE;
-  if (cfg.board == "c6") return PINS_C6;
-  if (cfg.board == "c5") return PINS_C5;
+  if (cfg.board == "c6")  return PINS_C6;
+  if (cfg.board == "c5")  return PINS_C5;
+  if (cfg.board == "c3")  return PINS_XIAO_C3;
   return detectPinsByChip(); // "auto" or anything else
 }
 
@@ -99,7 +101,7 @@ void cfgAssignKV(const String& k, const String& v) {
   }
   else if (k == "board") {
     String vv = v; vv.toLowerCase();
-    if (vv == "auto" || vv == "s3" || vv == "exp" || vv == "c5" || vv == "c6") cfg.board = vv;
+    if (vv == "auto" || vv == "s3" || vv == "exp" || vv == "c5" || vv == "c6" || vv == "c3") cfg.board = vv;
   }
   else if (k == "speedUnits") {
     String vv = v; vv.toLowerCase();

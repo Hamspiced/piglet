@@ -3,7 +3,7 @@
 
 **Piglet** is an open-source ESP32-based wardriving platform that scans nearby Wi-Fi networks, records GPS position, saves WiGLE-compatible CSV logs to SD, and provides a real-time web UI for control, uploads, and device status.
 
-Designed for **[Seeed XIAO ESP32-S3](https://wiki.seeedstudio.com/xiao_esp32s3_getting_started/), [XIAO ESP32-C5](https://wiki.seeedstudio.com/xiao_esp32c5_getting_started/), and [XIAO ESP32-C6](https://wiki.seeedstudio.com/xiao_esp32c6_getting_started/)**, Piglet focuses on:
+Designed for **[Seeed XIAO ESP32-S3](https://wiki.seeedstudio.com/xiao_esp32s3_getting_started/), [XIAO ESP32-C5](https://wiki.seeedstudio.com/xiao_esp32c5_getting_started/), [XIAO ESP32-C6](https://wiki.seeedstudio.com/xiao_esp32c6_getting_started/), and [XIAO ESP32-C3](https://wiki.seeedstudio.com/XIAO_ESP32C3_Getting_Started/)**, Piglet focuses on:
 
 - Reliable scanning while in motion  
 - Clean WiGLE-ready data collection  
@@ -124,6 +124,7 @@ All networking, SPI, SD, ESP-Now, and ESP-IDF headers are included in the ESP32 
 - [Seeed XIAO ESP32-S3](https://www.seeedstudio.com/XIAO-ESP32S3-p-5627.html)  
 - [Seeed XIAO ESP32-C5](https://www.seeedstudio.com/Seeed-Studio-XIAO-ESP32C5-p-6609.html) *(required for 5 GHz scanning)*  
 - [Seeed XIAO ESP32-C6](https://www.seeedstudio.com/Seeed-Studio-XIAO-ESP32C6-p-5884.html)  
+- [Seeed XIAO ESP32-C3](https://www.seeedstudio.com/Seeed-XIAO-ESP32C3-p-5431.html) *(2.4 GHz only, headless — set `board=c3`)*  
 - LilyGo T-Dongle C5 *(standalone variant — see above)*
 - [Seeed XIAO ESP32-C5](https://www.seeedstudio.com/Seeed-Studio-XIAO-ESP32C5-p-6609.html)  *(PigletNode — mesh node only, see above)*  
 
@@ -166,7 +167,7 @@ Pin mappings are automatically selected by firmware.
 ### XIAO ESP32-C6 / ESP32-C5
 
 | Function | Pin |
-|----------|-----|
+|----------|----- |
 | I2C SDA | GPIO 23 |
 | I2C SCL | GPIO 24 |
 | GPS RX | GPIO 12 |
@@ -178,6 +179,24 @@ Pin mappings are automatically selected by firmware.
 | SD SCK | GPIO 8 |
 
 **Note:** Only the ESP32-C5 supports 5 GHz Wi-Fi scanning.
+
+### XIAO ESP32-C3
+
+Set `board=c3` in `/wardriver.cfg` or select **XIAO C3** in the Web UI. Auto-detected from chip model on first boot.
+
+| Function | Pin |
+|----------|----- |
+| I2C SDA | GPIO 6 (D4) |
+| I2C SCL | GPIO 7 (D5) |
+| GPS RX | GPIO 20 (D7) |
+| GPS TX | GPIO 21 (D6) |
+| Button | *none* (GPIO 9 = SPI MISO conflict — wire externally if needed) |
+| SD CS | GPIO 2 (D0) |
+| SD MOSI | GPIO 10 (D10) |
+| SD MISO | GPIO 9 (D9) |
+| SD SCK | GPIO 8 (D8) |
+
+**Note:** 2.4 GHz only. No built-in display — attach an optional SSD1306 OLED on D4/D5.
 
 
 ## 3D Printed Cases

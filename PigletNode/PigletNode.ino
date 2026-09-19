@@ -20,7 +20,7 @@
 #include <esp_now.h>
 #include "esp_wifi.h"
 
-#define FIRMWARE_VERSION "v2.57"
+#define FIRMWARE_VERSION "v2.58"
 
 // ================================================================
 //  Board — XIAO ESP32-C5

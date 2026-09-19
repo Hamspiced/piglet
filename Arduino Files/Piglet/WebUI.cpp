@@ -363,6 +363,7 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
           <option value="exp">S3 Expansion</option>
           <option value="c5">XIAO C5</option>
           <option value="c6">XIAO C6</option>
+          <option value="c3">XIAO C3 (2.4 GHz, headless)</option>
         </select>
       </div>
       <div><label>Battery ADC Pin (-1 = off)</label><input id="battPin" type="number" value="-1"></div>
