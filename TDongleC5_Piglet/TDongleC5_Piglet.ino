@@ -43,7 +43,7 @@
 #include "esp32-hal-matrix.h"
 
 // Firmware version
-#define FIRMWARE_VERSION "v2.58"
+#define FIRMWARE_VERSION "v2.59"
 
 // ---------------- Pins (T-DONGLE C5) ----------------
 struct PinMap {
@@ -211,6 +211,23 @@ static int      wigleLastHttpCode = 0;
 
 static const char* WDGWARS_HOST = "wdgwars.pl";
 static const uint16_t WDGWARS_PORT = 443;
+
+// A 202 response only means the CSV was received and queued for import —
+// it does NOT mean the server has finished processing it. Blocking the
+// upload loop for up to 45 s per file waiting on that made both WDGoWars
+// and WiGLE uploads (which run right after it, for the same file) look
+// hung even though the file had already reached the server. Instead, the
+// job is queued here and checked opportunistically from loop() via
+// wdgwarsServicePendingJobs(), without blocking anything.
+struct WdgwarsPendingJob {
+  int      jobId;
+  String   filename;
+  uint32_t queuedAtMs;
+  uint32_t lastCheckMs;
+};
+static std::vector<WdgwarsPendingJob> wdgwarsPendingJobs;
+static const uint32_t WDGWARS_JOB_CHECK_INTERVAL_MS = 4000;            // min gap between checks
+static const uint32_t WDGWARS_JOB_MAX_AGE_MS        = 5UL * 60UL * 1000UL; // give up after 5 min
 
 static const char* WIGLE_HOST = "api.wigle.net";
 static const uint16_t WIGLE_PORT = 443;
@@ -601,6 +618,8 @@ static void appendWigleRow(const String& mac, const String& ssid, const String& 
 // Forward declarations needed by WDGoWars and WiGLE batch functions
 static void tftWigleUploadScreen(uint32_t done, uint32_t total, const String& filename);
 static void forceStatusFullRedraw();
+static void wdgwarsServicePendingJobs();
+static void wdgwarsDrainPendingJobs(uint32_t budgetMs);
 
 // ---- WDGoWars API key test — GET /api/me ----
 static bool wdgwarsTestKey() {
@@ -720,46 +739,132 @@ static bool uploadFileToWdgwars(const String& path) {
   }
   client.stop();
   Serial.printf("[WDGWars] HTTP %d  body: %s\n", code, body.substring(0,100).c_str());
-  // V2 API: HTTP 202 Accepted — async job
+  // V2 API: HTTP 202 Accepted — file received and queued for processing.
+  // Report success immediately instead of blocking here for up to 45 s;
+  // the job result is checked later in the background (see
+  // wdgwarsServicePendingJobs() / wdgwarsDrainPendingJobs() below).
   if (code == 202) {
     int jobId = 0;
     int ji = body.indexOf("\"job_id\":");
     if (ji >= 0) jobId = body.substring(ji + 9).toInt();
     if (jobId <= 0) { uploadLastResult = "WDGW: no job_id"; return false; }
-    Serial.printf("[WDGWars] Job %d submitted, polling...\n", jobId);
-    String jobPath = String("/api/v2/upload-job/") + String(jobId);
-    for (int poll = 1; poll <= 15; poll++) {
-      delay(3000); yield();
-      WiFiClientSecure pc; pc.setInsecure(); pc.setTimeout(15000);
-      if (!pc.connect(WDGWARS_HOST, WDGWARS_PORT)) { continue; }
-      pc.print("GET " + jobPath + " HTTP/1.0\r\n");
-      pc.print(String("Host: ")+WDGWARS_HOST+"\r\n");
-      pc.print(String("X-API-Key: ")+cfg.wdgwarsApiKey+"\r\n");
-      pc.print("Connection: close\r\n\r\n");
-      uint32_t pw = millis();
-      while (!pc.available() && pc.connected() && (millis()-pw)<10000) { delay(100); yield(); }
-      if (!pc.available()) { pc.stop(); continue; }
-      pc.readStringUntil('\n');
-      String pb=""; bool pIn=false;
-      while (pc.connected()||pc.available()) {
-        String ln=pc.readStringUntil('\n'); ln.trim();
-        if (!pIn){if(ln.length()==0) pIn=true;} else{pb+=ln;if(pb.length()>512) break;}
-      }
-      pc.stop();
-      Serial.printf("[WDGWars] Poll %d: %s\n", poll, pb.substring(0,80).c_str());
-      if (pb.indexOf("\"done\"") >= 0) {
-        int imp=0; int ii=pb.indexOf("\"imported\":");
-        if (ii>=0) imp=pb.substring(ii+11).toInt();
-        uploadLastResult = "WDGW OK ("+String(imp)+" net)";
-        return true;
-      }
-      if (pb.indexOf("\"failed\"") >= 0) { uploadLastResult="WDGW: job failed"; return false; }
-    }
-    uploadLastResult = "WDGW: poll timeout"; return false;
+
+    uint32_t nowMs = millis();
+    wdgwarsPendingJobs.push_back({ jobId, filename, nowMs, nowMs });
+    uploadLastResult = "WDGW: queued (job " + String(jobId) + ")";
+    Serial.printf("[WDGWars] Job %d submitted for %s — result will be checked in background\n",
+                  jobId, filename.c_str());
+    return true;
   }
   uploadLastResult = "WDGW fail (" + String(code) + ")";
   Serial.printf("[WDGWars] Upload FAILED HTTP %d: %s\n", code, body.c_str());
   return false;
+}
+
+// ---- WDGoWars background job status check ----
+// Does the actual work of checking a single pending job: one short-lived
+// HTTPS GET, no retries. Removes the job from the queue once it resolves
+// (done/failed) or once it has been pending longer than
+// WDGWARS_JOB_MAX_AGE_MS. Returns true if it made a network attempt (or
+// gave up on an aged-out job), so callers can pace successive checks.
+static bool wdgwarsCheckOnePendingJob() {
+  if (wdgwarsPendingJobs.empty()) return false;
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  uint32_t nowMs = millis();
+
+  int idx = -1;
+  for (size_t i = 0; i < wdgwarsPendingJobs.size(); i++) {
+    if (nowMs - wdgwarsPendingJobs[i].lastCheckMs >= WDGWARS_JOB_CHECK_INTERVAL_MS) {
+      idx = (int)i;
+      break;
+    }
+  }
+  if (idx < 0) return false;
+
+  WdgwarsPendingJob job = wdgwarsPendingJobs[idx];
+
+  if (nowMs - job.queuedAtMs > WDGWARS_JOB_MAX_AGE_MS) {
+    Serial.printf("[WDGWars] Job %d (%s): giving up after %lus with no result\n",
+                  job.jobId, job.filename.c_str(),
+                  (unsigned long)(WDGWARS_JOB_MAX_AGE_MS / 1000));
+    wdgwarsPendingJobs.erase(wdgwarsPendingJobs.begin() + idx);
+    return true;
+  }
+
+  wdgwarsPendingJobs[idx].lastCheckMs = nowMs;
+
+  WiFiClientSecure pc;
+  pc.setInsecure();
+  pc.setTimeout(8000);
+  if (!pc.connect(WDGWARS_HOST, WDGWARS_PORT)) return true;
+
+  String jobPath = String("/api/v2/upload-job/") + String(job.jobId);
+  pc.print("GET " + jobPath + " HTTP/1.0\r\n");
+  pc.print(String("Host: ") + WDGWARS_HOST + "\r\n");
+  pc.print(String("X-API-Key: ") + cfg.wdgwarsApiKey + "\r\n");
+  pc.print("Connection: close\r\n\r\n");
+
+  uint32_t pw = millis();
+  while (!pc.available() && pc.connected() && (millis() - pw) < 6000) { delay(50); yield(); }
+  if (!pc.available()) { pc.stop(); return true; }
+
+  pc.readStringUntil('\n');  // skip HTTP status line
+  String pb = ""; bool pInBody = false;
+  while (pc.connected() || pc.available()) {
+    String ln = pc.readStringUntil('\n'); ln.trim();
+    if (!pInBody) { if (ln.length() == 0) pInBody = true; }
+    else { pb += ln; if (pb.length() > 512) break; }
+  }
+  pc.stop();
+
+  if (pb.indexOf("\"done\"") >= 0) {
+    int imp = 0;
+    int ii = pb.indexOf("\"imported\":");
+    if (ii >= 0) imp = pb.substring(ii + 11).toInt();
+    Serial.printf("[WDGWars] Job %d (%s) done — imported: %d\n",
+                  job.jobId, job.filename.c_str(), imp);
+    wdgwarsPendingJobs.erase(wdgwarsPendingJobs.begin() + idx);
+  } else if (pb.indexOf("\"failed\"") >= 0) {
+    Serial.printf("[WDGWars] Job %d (%s) FAILED server-side\n",
+                  job.jobId, job.filename.c_str());
+    wdgwarsPendingJobs.erase(wdgwarsPendingJobs.begin() + idx);
+  }
+  // else still "processing" — leave queued, checked again later
+
+  return true;
+}
+
+// Call periodically from loop(). Internally rate-limited so it never does
+// more than one short network round-trip per call.
+static void wdgwarsServicePendingJobs() {
+  static uint32_t lastRunMs = 0;
+  uint32_t nowMs = millis();
+  if (nowMs - lastRunMs < WDGWARS_JOB_CHECK_INTERVAL_MS) return;
+  lastRunMs = nowMs;
+  wdgwarsCheckOnePendingJob();
+}
+
+// Best-effort: keep checking pending jobs back-to-back for up to budgetMs.
+// Intended to be called right before intentionally dropping the STA
+// connection (e.g. entering mesh Core mode) so quick jobs still get
+// confirmed instead of being silently abandoned.
+static void wdgwarsDrainPendingJobs(uint32_t budgetMs) {
+  if (wdgwarsPendingJobs.empty()) return;
+
+  for (auto& j : wdgwarsPendingJobs) j.lastCheckMs = 0;
+
+  uint32_t start = millis();
+  while (!wdgwarsPendingJobs.empty() && (millis() - start) < budgetMs) {
+    if (!wdgwarsCheckOnePendingJob()) break;  // WiFi down or nothing due yet
+    delay(200);
+    yield();
+  }
+
+  if (!wdgwarsPendingJobs.empty()) {
+    Serial.printf("[WDGWars] %u job(s) still pending — will not be confirmed (STA disconnecting)\n",
+                  (unsigned)wdgwarsPendingJobs.size());
+  }
 }
 
 // ---- Empty-file guard: true if file has any data beyond the 2 header lines ----
@@ -3531,6 +3636,10 @@ void setup() {
       // (if any) was only needed for auto-upload and must not remain active
       // or ESP-Now channel control will conflict with the STA home channel.
       if (WiFi.status() == WL_CONNECTED || WiFi.getMode() != WIFI_OFF) {
+        // Give any WDGoWars jobs queued during boot upload a brief chance to
+        // resolve before we drop the STA connection they'd need to check on.
+        wdgwarsDrainPendingJobs(5000);
+
         Serial.println("[BOOT] Tearing down STA before Core mode");
         WiFi.disconnect(true, true);
         WiFi.mode(WIFI_OFF);
@@ -3666,6 +3775,11 @@ void loop() {
   // Skip STA transition handler in mesh mode — it calls WiFi.disconnect(wifioff=true)
   // which stops the WiFi driver and deinits ESP-Now.
   if (!meshNodeActive && !meshCoreActive) handleStaTransitions();
+
+  // Check on any WDGoWars jobs queued during the last upload batch. This is
+  // rate-limited internally to at most one short network round-trip per
+  // call, so it never blocks scanning, GPS, or the display.
+  wdgwarsServicePendingJobs();
 
   // Scanning — mesh page handles its own logic; skip normal scan path
   if (currentPage == 4) {

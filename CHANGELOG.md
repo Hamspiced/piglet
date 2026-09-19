@@ -1,5 +1,15 @@
 # Changelog
 
+## v2.59 (2026-09-14)
+
+### Bug Fixes
+- **WDGoWars upload delay** — Uploading to WDGoWars queues the file for async server-side processing (HTTP 202 + job ID), but the firmware was blocking for up to 45 seconds per file (15 poll attempts, 3 s apart) waiting for that job to finish before advancing progress, moving the file to `/uploaded`, or refreshing the display. Since WiGLE uploads run right after WDGoWars for the same file, they appeared delayed too, and the OLED/TFT/web UI progress looked frozen the whole time since nothing refreshed it during the poll. The upload now reports success as soon as the file is accepted (202 + job ID) and checks the job result in the background instead of blocking; progress, file moves, and the display all update immediately. A best-effort check is still run before intentionally dropping the WiFi connection (`autoStartAfterUpload`, entering mesh Core mode) so quick jobs are still confirmed when possible.
+
+### Technical Changes
+- WDGoWars job polling moved out of `uploadFileToWdgwars()` into a background queue serviced from `loop()` (`wdgwarsServicePendingJobs()`), with a bounded best-effort drain (`wdgwarsDrainPendingJobs()`) used right before STA teardown. Applied to both the main Piglet firmware and the T-Dongle C5 standalone firmware.
+
+---
+
 ## v2.58 (2026-07-23)
 
 ### Bug Fixes
