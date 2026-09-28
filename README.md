@@ -388,6 +388,17 @@ rotateScreen180=false
 # Reboot required after changing.
 
 autoStartAfterUpload=false
+
+# ------------------------------------------------------------
+# SD Card SPI Clock Ceiling
+# ------------------------------------------------------------
+# Boot negotiates the fastest SD-over-SPI clock (descending ladder) up to
+# this cap and uses the fastest speed that mounts successfully. Lower this
+# if you see SD write errors/corruption on marginal wiring (e.g. long
+# breadboard jumpers). Default is a commonly-safe ceiling for SD-over-SPI.
+# Reboot required after changing.
+
+sdMaxSpiHz=20000000
 ```
 
 ### Auto-Start Wardriving After Uploads — How to Disable

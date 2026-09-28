@@ -20,6 +20,10 @@ extern uint8_t  jcmkStartIdx;
 extern uint8_t  jcmkEndIdx;
 extern uint32_t jcmkNetworksFound;
 extern uint32_t jcmkSentCount;
+// Count of ESP-Now sends that the radio/driver itself reported as failed
+// (via the send-status callback) -- distinguishes "attempted" from
+// "actually transmitted" since broadcast frames have no delivery ACK at all.
+extern uint32_t jcmkSendFailCount;
 
 // Lifecycle — called from Piglet.ino on page enter/exit
 void enterNodeMode();
@@ -47,6 +51,9 @@ struct CoreNodeInfo {
   uint32_t lastHbMs;
   uint32_t recordsRx;
   bool     isBiscuit;  // true = Biscuit Node protocol (requires full-size 212-byte packets)
+  bool     isPiglet;   // true = confirmed genuine Piglet node (via marker handshake) --
+                        // only these participate in deterministic transmit-slot scheduling
+  uint8_t  slotIndex;  // this node's transmit slot among other Piglet nodes (valid when isPiglet)
 };
 
 // Core state (read from Display.cpp for page 5 rendering)

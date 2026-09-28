@@ -19,6 +19,25 @@ static const uint32_t NODE_SCAN_DWELL_MS  = 80;    // ms per channel (JCMK CHANN
 static const uint32_t NODE_ADMIN_WIN_MS   = 500;   // ch-6 window after each full cycle
 #define JCMK_TEXT_MAX 200
 
+// ---- Piglet-to-Piglet identification + transmit-slot scheduling ----
+// A short marker carried in the otherwise-always-empty text/len fields of the
+// existing CORE_REQUEST/CORE_REPLY/HEARTBEAT messages. Neither real JCMK
+// hardware nor Biscuit nodes look at this payload, so it's fully backward
+// compatible; it only ever activates the new scheduling path when BOTH sides
+// of a pairing are confirmed to be genuine Piglet devices.
+static const char*   PIGLET_MARKER     = "PIGLET1";
+static const uint8_t PIGLET_MARKER_LEN = 7;
+
+// Deterministic transmit-slot width for Piglet-to-Piglet nodes. Each
+// confirmed-Piglet node gets an exclusive [slotIndex*SLOT_MS, +SLOT_MS) window
+// within a repeating cycle (cycle length = SLOT_MS * active-Piglet-node-count),
+// so scan results are sent without colliding with other nodes' transmissions.
+static const uint32_t JCMK_SLOT_MS = 200;
+
+// If a Node hasn't heard anything from its Core in this long, assume it's gone
+// and return to searching (mirrors Biscuit's own CORE_TIMEOUT_MS behavior).
+static const uint32_t JCMK_CORE_TIMEOUT_MS = 30000;
+
 enum JcmkMsgType : uint8_t {
   JCMK_MSG_CORE_REQUEST = 1,
   JCMK_MSG_CORE_REPLY   = 2,
@@ -77,6 +96,7 @@ uint8_t  jcmkEndIdx      = 0;
 uint8_t  jcmkAssignVer   = 0;
 uint32_t jcmkNetworksFound = 0;
 uint32_t jcmkSentCount   = 0;
+uint32_t jcmkSendFailCount = 0;
 
 static uint32_t jcmkHbCounter   = 0;
 static uint32_t jcmkLastHbMs    = 0;
@@ -90,8 +110,44 @@ static bool     nodeScanAdminWin = false;
 static uint32_t nodeScanAdminMs  = 0;
 
 // Pending core-found event — written in ESP-Now callback, consumed in loop
-static volatile bool  jcmkCoreFoundPending = false;
-static uint8_t        jcmkCoreMacPending[6] = {0};
+static volatile bool  jcmkCoreFoundPending    = false;
+static uint8_t        jcmkCoreMacPending[6]   = {0};
+static volatile bool  jcmkCoreIsPigletPending = false;
+
+// Piglet-to-Piglet transmit-slot state (only meaningful when jcmkCoreIsPiglet)
+static bool     jcmkCoreIsPiglet  = false;
+static uint8_t  jcmkSlotIndex     = 0;
+static uint8_t  jcmkSlotCount     = 1;
+static uint32_t jcmkCycleEpochMs  = 0;
+static uint32_t jcmkCoreLastSeenMs = 0;  // for JCMK_CORE_TIMEOUT_MS detection
+
+// Ring buffer of scan-result lines awaiting this node's transmit slot.
+// Scanning (nodeDoScanTick) keeps running at full pace regardless of buffer
+// state; only sending already-found results is deferred to the slot window.
+#define JCMK_PENDING_MAX 64
+struct JcmkPendingLine { char text[96]; };
+static JcmkPendingLine jcmkPendingBuf[JCMK_PENDING_MAX];
+static uint8_t         jcmkPendingHead = 0, jcmkPendingTail = 0;
+
+static bool jcmkPendingEmpty() { return jcmkPendingHead == jcmkPendingTail; }
+
+static bool jcmkPendingPush(const String& line) {
+  uint8_t next = (jcmkPendingTail + 1) % JCMK_PENDING_MAX;
+  if (next == jcmkPendingHead) return false;  // full — drop rather than block scanning
+  size_t n = line.length();
+  if (n >= sizeof(jcmkPendingBuf[0].text)) n = sizeof(jcmkPendingBuf[0].text) - 1;
+  memcpy(jcmkPendingBuf[jcmkPendingTail].text, line.c_str(), n);
+  jcmkPendingBuf[jcmkPendingTail].text[n] = '\0';
+  jcmkPendingTail = next;
+  return true;
+}
+
+static bool jcmkPendingPop(String& out) {
+  if (jcmkPendingEmpty()) return false;
+  out = jcmkPendingBuf[jcmkPendingHead].text;
+  jcmkPendingHead = (jcmkPendingHead + 1) % JCMK_PENDING_MAX;
+  return true;
+}
 
 // ================================================================
 //  Core mode state
@@ -104,6 +160,7 @@ CoreNodeInfo coreNodes[CORE_MAX_NODES] = {};
 static uint8_t  coreAssignVer  = 0;
 static uint32_t coreLastHbMs   = 0;
 static uint32_t coreHbCounter  = 0;
+static uint8_t  corePigletSlotCount = 0;  // active Piglet-confirmed node count; recomputed in coreReassignChannels()
 
 static const uint32_t CORE_HB_MS        = 5000;
 static const uint32_t CORE_NODE_TIMEOUT = 90000;  // 90 s — generous for many-node ESP-Now collisions
@@ -112,7 +169,7 @@ static const uint32_t CORE_NODE_TIMEOUT = 90000;  // 90 s — generous for many-
 #define CORE_REQ_QUEUE  16
 #define CORE_TEXT_QUEUE 192  // sized for burst from 12 nodes × ~15 networks each
 
-struct CorReqSlot  { uint8_t mac[6]; bool isBiscuit; };
+struct CorReqSlot  { uint8_t mac[6]; bool isBiscuit; bool isPiglet; };
 struct CorTextSlot { char    line[JCMK_TEXT_MAX + 1]; };
 
 static CorReqSlot          coreReqBuf[CORE_REQ_QUEUE];
@@ -124,6 +181,15 @@ static volatile uint8_t    coreTextHead = 0, coreTextTail = 0;
 // ================================================================
 //  Local helpers
 // ================================================================
+// True if a received jcmk_text_msg_t carries the Piglet identification marker.
+// `len` is the raw ESP-Now payload length (as delivered to the recv callback).
+static bool jcmkHasPigletMarker(const void* data, int len) {
+  if (len < (int)sizeof(jcmk_text_msg_t)) return false;
+  const jcmk_text_msg_t* tm = (const jcmk_text_msg_t*)data;
+  if (tm->len < PIGLET_MARKER_LEN) return false;
+  return memcmp(tm->text, PIGLET_MARKER, PIGLET_MARKER_LEN) == 0;
+}
+
 static String meshAuthModeToString(wifi_auth_mode_t m) {
   switch (m) {
     case WIFI_AUTH_OPEN:            return "OPEN";
@@ -149,6 +215,16 @@ static void jcmkSetChannel(uint8_t ch) {
   esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
 }
 
+// ESP-Now send-status callback -- the only way to learn whether esp_now_send()
+// actually made it onto the air. esp_now_send() itself only reports whether the
+// driver *accepted* the request, not whether the frame was transmitted; a
+// counter that only tracks calls made (like jcmkSentCount) can look perfectly
+// healthy locally while every frame is silently failing at the radio layer.
+static void jcmkOnSent(const esp_now_send_info_t* txInfo, esp_now_send_status_t status) {
+  (void)txInfo;
+  if (status != ESP_NOW_SEND_SUCCESS) jcmkSendFailCount++;
+}
+
 static bool jcmkAddPeer(const uint8_t* mac) {
   if (esp_now_is_peer_exist(mac)) esp_now_del_peer(mac);
   esp_now_peer_info_t peer = {};
@@ -167,7 +243,11 @@ static void jcmkSendCoreRequest() {
   memcpy(msg.magic, JCMK_MAGIC, 4);
   msg.type    = JCMK_MSG_CORE_REQUEST;
   msg.counter = 0;
-  msg.len     = 0;
+  // Marker identifies this as a genuine Piglet node to a Piglet Core; real
+  // JCMK hardware and Biscuit Cores simply ignore this payload.
+  msg.len     = PIGLET_MARKER_LEN;
+  memcpy(msg.text, PIGLET_MARKER, PIGLET_MARKER_LEN);
+  msg.text[PIGLET_MARKER_LEN] = '\0';
   esp_now_send(JCMK_BCAST, (uint8_t*)&msg, sizeof(msg));
 }
 
@@ -176,8 +256,17 @@ static void jcmkSendHeartbeat() {
   memcpy(msg.magic, JCMK_MAGIC, 4);
   msg.type    = JCMK_MSG_HEARTBEAT;
   msg.counter = ++jcmkHbCounter;
-  msg.len     = 0;
-  esp_now_send(JCMK_BCAST, (uint8_t*)&msg, sizeof(msg));
+  // Carry the marker here too so a Core can learn isPiglet even if it first
+  // (re)discovers this node via a heartbeat rather than a fresh CORE_REQUEST.
+  msg.len     = PIGLET_MARKER_LEN;
+  memcpy(msg.text, PIGLET_MARKER, PIGLET_MARKER_LEN);
+  msg.text[PIGLET_MARKER_LEN] = '\0';
+  // Unicast to the already-known Core (this is only ever called once
+  // jcmkHaveCore is true) instead of broadcasting. Broadcast ESP-Now/802.11
+  // frames have no link-layer ACK or retry -- a dropped broadcast is silently
+  // lost with no way for either side to know, whereas unicast frames are
+  // retried and their delivery status is reported to jcmkOnSent().
+  esp_now_send(jcmkCoreMac, (uint8_t*)&msg, sizeof(msg));
 }
 
 static void jcmkSendText(const String& s) {
@@ -190,7 +279,9 @@ static void jcmkSendText(const String& s) {
   memcpy(msg.text, s.c_str(), slen);
   msg.text[slen] = '\0';
   // Always send full struct size — Biscuit Pro drops variable-length packets < 212 bytes.
-  esp_now_send(JCMK_BCAST, (uint8_t*)&msg, sizeof(msg));
+  // Unicast (see jcmkSendHeartbeat comment above) — only ever called once
+  // jcmkHaveCore is true, i.e. jcmkCoreMac is already a registered peer.
+  esp_now_send(jcmkCoreMac, (uint8_t*)&msg, sizeof(msg));
 }
 
 // ================================================================
@@ -204,7 +295,11 @@ static void coreSendReply(const uint8_t* mac) {
   memcpy(msg.magic, JCMK_MAGIC, 4);
   msg.type    = JCMK_MSG_CORE_REPLY;
   msg.counter = 0;
-  msg.len     = 0;
+  // Marker tells a Piglet node that this Core is also a genuine Piglet, so it
+  // can safely switch to slot-scheduled transmit; ignored by third-party nodes.
+  msg.len     = PIGLET_MARKER_LEN;
+  memcpy(msg.text, PIGLET_MARKER, PIGLET_MARKER_LEN);
+  msg.text[PIGLET_MARKER_LEN] = '\0';
   esp_now_send(mac, (uint8_t*)&msg, sizeof(msg));
 }
 
@@ -273,6 +368,7 @@ static void jcmkOnRecv(const esp_now_recv_info_t* info,
         memcpy(coreReqBuf[coreReqTail].mac, info->src_addr, 6);
         // Biscuit Node always sends full-size packets (212 bytes); JCMK sends 5 bytes.
         coreReqBuf[coreReqTail].isBiscuit = (len >= (int)sizeof(jcmk_text_msg_t));
+        coreReqBuf[coreReqTail].isPiglet  = jcmkHasPigletMarker(data, len);
         coreReqTail = next;
       }
     } else if (type == JCMK_MSG_TEXT && len >= 11) {
@@ -301,6 +397,10 @@ static void jcmkOnRecv(const esp_now_recv_info_t* info,
           if (nxt != coreReqHead) {
             memcpy(coreReqBuf[coreReqTail].mac, info->src_addr, 6);
             coreReqBuf[coreReqTail].isBiscuit = (len >= (int)sizeof(jcmk_text_msg_t));
+            // TEXT carries scan-line data, not the marker -- a node rediscovered
+            // via TEXT (rare; HEARTBEAT/CORE_REQUEST arrive far more often) is
+            // conservatively treated as non-Piglet until its next heartbeat.
+            coreReqBuf[coreReqTail].isPiglet = false;
             coreReqTail = nxt;
           }
         }
@@ -319,6 +419,7 @@ static void jcmkOnRecv(const esp_now_recv_info_t* info,
         if (nxt != coreReqHead) {
           memcpy(coreReqBuf[coreReqTail].mac, info->src_addr, 6);
           coreReqBuf[coreReqTail].isBiscuit = (len >= (int)sizeof(jcmk_text_msg_t));
+          coreReqBuf[coreReqTail].isPiglet  = jcmkHasPigletMarker(data, len);
           coreReqTail = nxt;
         }
       }
@@ -327,13 +428,29 @@ static void jcmkOnRecv(const esp_now_recv_info_t* info,
     // ---- Node role (existing) ----
     if (type == JCMK_MSG_CORE_REPLY && !jcmkHaveCore && !jcmkCoreFoundPending) {
       memcpy(jcmkCoreMacPending, info->src_addr, 6);
+      jcmkCoreIsPigletPending = jcmkHasPigletMarker(data, len);
       jcmkCoreFoundPending = true;
+    } else if (type == JCMK_MSG_HEARTBEAT && jcmkHaveCore
+               && memcmp(info->src_addr, jcmkCoreMac, 6) == 0) {
+      // Core's periodic broadcast: liveness signal for timeout detection, and
+      // (for Piglet pairings) the shared timing anchor for slot scheduling.
+      jcmkCoreLastSeenMs = millis();
+      if (jcmkCoreIsPiglet) jcmkCycleEpochMs = millis();
     } else if (type == JCMK_MSG_ADMIN && len >= (int)sizeof(jcmk_admin_msg_t)) {
+      jcmkCoreLastSeenMs = millis();
+      if (jcmkCoreIsPiglet) jcmkCycleEpochMs = millis();
       const jcmk_admin_msg_t* adm = (const jcmk_admin_msg_t*)data;
       if (adm->assignment_version != jcmkAssignVer) {
         jcmkAssignVer = adm->assignment_version;
         jcmkStartIdx  = adm->start_channel_idx;
         jcmkEndIdx    = adm->end_channel_idx;
+      }
+      // Transmit-slot fields (node_index/node_count) are only meaningful when
+      // paired with a confirmed Piglet Core; refreshed every ADMIN regardless
+      // of assignment_version since Core recomputes them on every send.
+      if (jcmkCoreIsPiglet) {
+        jcmkSlotIndex = adm->node_index;
+        jcmkSlotCount = (adm->node_count > 0) ? adm->node_count : 1;
       }
     }
   }
@@ -342,10 +459,13 @@ static void jcmkOnRecv(const esp_now_recv_info_t* info,
 // ================================================================
 //  Core mode helpers (main loop only — not ISR-safe)
 // ================================================================
-static void coreFindOrAddNode(const uint8_t* mac, bool isBiscuit) {
+static void coreFindOrAddNode(const uint8_t* mac, bool isBiscuit, bool isPiglet) {
   for (uint8_t i = 0; i < CORE_MAX_NODES; i++) {
     if (coreNodes[i].active && memcmp(coreNodes[i].mac, mac, 6) == 0) {
       coreNodes[i].lastHbMs = millis();
+      // A node can go from "not yet confirmed Piglet" to confirmed once its
+      // first HEARTBEAT/CORE_REQUEST with the marker arrives; never downgrade.
+      if (isPiglet) coreNodes[i].isPiglet = true;
       return;  // already registered
     }
   }
@@ -355,6 +475,8 @@ static void coreFindOrAddNode(const uint8_t* mac, bool isBiscuit) {
       coreNodes[i].lastHbMs  = millis();
       coreNodes[i].recordsRx = 0;
       coreNodes[i].isBiscuit = isBiscuit;
+      coreNodes[i].isPiglet  = isPiglet;
+      coreNodes[i].slotIndex = 0;  // assigned by coreReassignChannels() below
       memcpy(coreNodes[i].mac, mac, 6);
       coreNodeCount++;
       jcmkAddPeer(mac);
@@ -363,7 +485,7 @@ static void coreFindOrAddNode(const uint8_t* mac, bool isBiscuit) {
       // MAC wasn't yet in the peer list when esp_now_send() was called.
       coreSendReply(mac);
       Serial.printf("[CORE] New %s node %d: %02X:%02X:%02X:%02X:%02X:%02X\n",
-        isBiscuit ? "Biscuit" : "JCMK",
+        isPiglet ? "Piglet" : (isBiscuit ? "Biscuit" : "JCMK"),
         i, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
       return;
     }
@@ -391,6 +513,16 @@ static void coreReassignChannels() {
   }
   coreAssignVer++;
 
+  // Assign deterministic transmit-slot indices among Piglet-confirmed nodes
+  // only -- JCMK/Biscuit nodes don't participate in slot scheduling and are
+  // completely unaffected by this (their node_index/node_count keep the
+  // legacy per-all-nodes numbering, which both already ignore anyway).
+  uint8_t pigletIdx = 0;
+  for (uint8_t n = 0; n < count; n++) {
+    if (coreNodes[slots[n]].isPiglet) coreNodes[slots[n]].slotIndex = pigletIdx++;
+  }
+  corePigletSlotCount = pigletIdx;
+
   // Send assignment to each node using its protocol:
   // - Biscuit: MSG_ROLE_ASSIGN (type=5, text[0]=ROLE_WIFI) + MSG_CONFIG_UPDATE (type=10, channel string)
   // - JCMK:    jcmk_admin_msg_t (type=5, packed binary channel indices)
@@ -404,16 +536,22 @@ static void coreReassignChannels() {
       jcmk_admin_msg_t msg;
       memcpy(msg.magic, JCMK_MAGIC, 4);
       msg.type               = JCMK_MSG_ADMIN;
-      msg.node_count         = count;
       msg.assignment_version = coreAssignVer;
-      msg.node_index         = n;
       msg.start_channel_idx  = coreNodes[slot].startIdx;
       msg.end_channel_idx    = coreNodes[slot].endIdx;
+      if (coreNodes[slot].isPiglet) {
+        msg.node_index = coreNodes[slot].slotIndex;
+        msg.node_count = corePigletSlotCount;
+      } else {
+        msg.node_index = n;      // legacy semantics for non-Piglet peers (unused by them)
+        msg.node_count = count;
+      }
       esp_now_send(coreNodes[slot].mac, (uint8_t*)&msg, sizeof(msg));
     }
     delay(10);
   }
-  Serial.printf("[CORE] Reassigned channels: %d nodes v%d\n", count, coreAssignVer);
+  Serial.printf("[CORE] Reassigned channels: %d nodes v%d (%d Piglet slot%s)\n",
+    count, coreAssignVer, corePigletSlotCount, corePigletSlotCount == 1 ? "" : "s");
 }
 
 // Re-send the current ADMIN assignment to every node.
@@ -431,11 +569,16 @@ static void coreResendAdminToAll() {
       jcmk_admin_msg_t msg;
       memcpy(msg.magic, JCMK_MAGIC, 4);
       msg.type               = JCMK_MSG_ADMIN;
-      msg.node_count         = coreNodeCount;
       msg.assignment_version = coreAssignVer;
-      msg.node_index         = n;
       msg.start_channel_idx  = coreNodes[i].startIdx;
       msg.end_channel_idx    = coreNodes[i].endIdx;
+      if (coreNodes[i].isPiglet) {
+        msg.node_index = coreNodes[i].slotIndex;
+        msg.node_count = corePigletSlotCount;
+      } else {
+        msg.node_index = n;
+        msg.node_count = coreNodeCount;
+      }
       esp_now_send(coreNodes[i].mac, (uint8_t*)&msg, sizeof(msg));
     }
     n++;
@@ -542,24 +685,71 @@ static void nodeDoScanTick() {
 
   if (n > 0) {
     jcmkNetworksFound += (uint32_t)n;
-    // Return to ch 6 before any ESP-Now send (JCMK sendBroadcastStringPlain pattern).
-    // The scan left the radio on the scan channel; Core listens only on ch 6.
-    jcmkSetChannel(JCMK_ESPNOW_CH);
-    for (int i = 0; i < n; i++) {
-      String bssid = WiFi.BSSIDstr(i);
-      String ssid  = WiFi.SSID(i);
-      String auth  = meshAuthModeToString(WiFi.encryptionType(i));
-      int    ch    = WiFi.channel(i);
-      int    rssi  = WiFi.RSSI(i);
-      String line  = bssid + "," + ssid + "," + auth + ","
-                   + String(ch) + "," + String(rssi) + ",W";
-      jcmkSendText(line);
-      jcmkSentCount++;
+
+    if (!jcmkCoreIsPiglet) {
+      // Legacy immediate-send path: non-Piglet Core (real JCMK hardware or
+      // Biscuit Pro), or Core type not yet confirmed. Unchanged from before.
+      jcmkSetChannel(JCMK_ESPNOW_CH);
+      for (int i = 0; i < n; i++) {
+        String bssid = WiFi.BSSIDstr(i);
+        String ssid  = WiFi.SSID(i);
+        String auth  = meshAuthModeToString(WiFi.encryptionType(i));
+        int    ch    = WiFi.channel(i);
+        int    rssi  = WiFi.RSSI(i);
+        String line  = bssid + "," + ssid + "," + auth + ","
+                     + String(ch) + "," + String(rssi) + ",W";
+        jcmkSendText(line);
+        jcmkSentCount++;
+      }
+    } else {
+      // Piglet-to-Piglet: buffer results instead of sending immediately.
+      // Scanning keeps running at full pace, untouched by other nodes'
+      // schedules -- jcmkPigletSlotTick() flushes this buffer only during
+      // this node's own deterministic transmit slot.
+      for (int i = 0; i < n; i++) {
+        String bssid = WiFi.BSSIDstr(i);
+        String ssid  = WiFi.SSID(i);
+        String auth  = meshAuthModeToString(WiFi.encryptionType(i));
+        int    ch    = WiFi.channel(i);
+        int    rssi  = WiFi.RSSI(i);
+        String line  = bssid + "," + ssid + "," + auth + ","
+                     + String(ch) + "," + String(rssi) + ",W";
+        jcmkPendingPush(line);
+      }
     }
   }
   WiFi.scanDelete();
   nodeScanActive = false;
   nodeScanChOffset++;
+}
+
+// ================================================================
+//  Piglet-to-Piglet deterministic transmit-slot flush (see MeshNode plan).
+//  Only ever active when jcmkCoreIsPiglet is true; otherwise a no-op, so
+//  non-Piglet pairings are completely unaffected. Never interrupts an
+//  in-flight scan (only runs in the natural gap between channel scans),
+//  so a node's own scanning loop is never slowed down by this.
+// ================================================================
+static void jcmkPigletSlotTick() {
+  if (!jcmkCoreIsPiglet) return;
+  if (nodeScanActive) return;      // never interrupt a live async scan
+  if (jcmkPendingEmpty()) return;
+
+  uint32_t slotCount = (jcmkSlotCount > 0) ? jcmkSlotCount : 1;
+  uint32_t cycleMs   = JCMK_SLOT_MS * slotCount;
+  uint32_t cyclePos  = (millis() - jcmkCycleEpochMs) % cycleMs;
+  uint32_t slotStart = (uint32_t)jcmkSlotIndex * JCMK_SLOT_MS;
+
+  if (cyclePos < slotStart || cyclePos >= slotStart + JCMK_SLOT_MS) return;  // not my turn yet
+
+  jcmkSetChannel(JCMK_ESPNOW_CH);
+  String line;
+  uint8_t sent = 0;
+  while (sent < 16 && jcmkPendingPop(line)) {
+    jcmkSendText(line);
+    jcmkSentCount++;
+    sent++;
+  }
 }
 
 // ================================================================
@@ -570,8 +760,17 @@ void enterNodeMode() {
   meshNodeActive        = false;
   jcmkHaveCore          = false;
   jcmkCoreFoundPending  = false;
+  jcmkCoreIsPigletPending = false;
+  jcmkCoreIsPiglet      = false;
+  jcmkSlotIndex         = 0;
+  jcmkSlotCount         = 1;
+  jcmkCycleEpochMs      = 0;
+  jcmkCoreLastSeenMs    = 0;
+  jcmkPendingHead       = 0;
+  jcmkPendingTail       = 0;
   jcmkNetworksFound     = 0;
   jcmkSentCount         = 0;
+  jcmkSendFailCount     = 0;
   jcmkHbCounter         = 0;
   jcmkLastHbMs          = 0;
   jcmkLastReqMs         = 0;
@@ -608,6 +807,7 @@ void enterNodeMode() {
     return;
   }
   esp_now_register_recv_cb(jcmkOnRecv);
+  esp_now_register_send_cb(jcmkOnSent);
 
   // Lock radio to JCMK ESP-Now home channel AFTER init (matches JCMK pattern)
   delay(50);
@@ -686,6 +886,7 @@ void enterCoreMode() {
     return;
   }
   esp_now_register_recv_cb(jcmkOnRecv);
+  esp_now_register_send_cb(jcmkOnSent);
   delay(50);
   jcmkSetChannel(JCMK_ESPNOW_CH);
   // Verify the channel actually stuck
@@ -726,7 +927,7 @@ void coreModeTick() {
   while (coreReqHead != coreReqTail) {
     uint8_t i = coreReqHead;
     coreReqHead = (coreReqHead + 1) % CORE_REQ_QUEUE;
-    coreFindOrAddNode(coreReqBuf[i].mac, coreReqBuf[i].isBiscuit);
+    coreFindOrAddNode(coreReqBuf[i].mac, coreReqBuf[i].isBiscuit, coreReqBuf[i].isPiglet);
     coreReassignChannels();
   }
 
@@ -770,12 +971,34 @@ void nodeModeTick() {
   if (jcmkCoreFoundPending) {
     jcmkCoreFoundPending = false;
     memcpy(jcmkCoreMac, jcmkCoreMacPending, 6);
-    jcmkHaveCore    = true;
-    jcmkReqInterval = JCMK_REQ_INIT_MS;
+    jcmkHaveCore       = true;
+    jcmkCoreIsPiglet   = jcmkCoreIsPigletPending;
+    jcmkCoreLastSeenMs = now;
+    jcmkCycleEpochMs   = now;
+    jcmkReqInterval    = JCMK_REQ_INIT_MS;
     jcmkAddPeer(jcmkCoreMac);
-    Serial.printf("[MESH] Core: %02X:%02X:%02X:%02X:%02X:%02X\n",
+    Serial.printf("[MESH] Core: %02X:%02X:%02X:%02X:%02X:%02X%s\n",
       jcmkCoreMac[0], jcmkCoreMac[1], jcmkCoreMac[2],
-      jcmkCoreMac[3], jcmkCoreMac[4], jcmkCoreMac[5]);
+      jcmkCoreMac[3], jcmkCoreMac[4], jcmkCoreMac[5],
+      jcmkCoreIsPiglet ? " (Piglet — slot scheduling active)" : "");
+  }
+
+  // Core-timeout detection: if the Core goes silent, stop scanning/sending
+  // into the void and return to actively searching for a (possibly new) Core.
+  if (jcmkHaveCore && (now - jcmkCoreLastSeenMs >= JCMK_CORE_TIMEOUT_MS)) {
+    Serial.println("[MESH] Core timed out — returning to search");
+    if (esp_now_is_peer_exist(jcmkCoreMac)) esp_now_del_peer(jcmkCoreMac);
+    jcmkHaveCore     = false;
+    jcmkCoreIsPiglet = false;
+    jcmkAssignVer    = 0;
+    jcmkStartIdx     = 0;
+    jcmkEndIdx       = JCMK_NUM_CHANNELS - 1;
+    jcmkSlotIndex    = 0;
+    jcmkSlotCount    = 1;
+    jcmkPendingHead  = jcmkPendingTail = 0;  // drop any buffered-but-unsent results
+    nodeScanActive   = false;
+    nodeScanAdminWin = false;
+    jcmkReqInterval  = JCMK_REQ_INIT_MS;
   }
 
   // CORE_REQUEST with backoff (only while radio is free)
@@ -794,8 +1017,13 @@ void nodeModeTick() {
     jcmkSendHeartbeat();
   }
 
-  // Per-channel async scan — runs continuously while connected to Core
-  if (jcmkHaveCore) nodeDoScanTick();
+  // Per-channel async scan — runs continuously while connected to Core.
+  // jcmkPigletSlotTick() only ever acts for confirmed-Piglet pairings, and
+  // only in the gap between scans, so it never affects scan timing itself.
+  if (jcmkHaveCore) {
+    jcmkPigletSlotTick();
+    nodeDoScanTick();
+  }
 }
 
 // ================================================================
@@ -909,17 +1137,23 @@ void drawPageMeshNode() {
     display.print("ENOW:");
     display.print(JCMK_ESPNOW_CH);
 
-    // Row 4 (y=44): networks found
+    // Row 4 (y=44): networks found + Core hint
     display.setCursor(0, 44);
     display.print("Found:");
     display.print(jcmkNetworksFound);
+    display.setCursor(70, 44);
+    display.print("Hold=Core");
 
-    // Row 5 (y=53): records sent + hint
+    // Row 5 (y=53): records sent + radio-level send failures.
+    // "Sent" only means esp_now_send() was called; "Fail" reflects the
+    // actual delivery-status callback, so a healthy Sent count with a
+    // climbing Fail count means the radio itself is dropping the frames.
     display.setCursor(0, 53);
     display.print("Sent:");
     display.print(jcmkSentCount);
-    display.setCursor(66, 53);
-    display.print("Hold=Core");
+    display.setCursor(70, 53);
+    display.print("Fail:");
+    display.print(jcmkSendFailCount);
   }
 
   display.display();

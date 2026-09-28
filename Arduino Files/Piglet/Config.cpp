@@ -133,6 +133,10 @@ void cfgAssignKV(const String& k, const String& v) {
     String vv = v; vv.toLowerCase();
     cfg.autoStartAfterUpload = (vv == "true" || vv == "1");
   }
+  else if (k == "sdMaxSpiHz") {
+    long hz = v.toInt();
+    if (hz >= 400000 && hz <= 40000000) cfg.sdMaxSpiHz = (uint32_t)hz;  // sanity-clamp to a plausible SPI range
+  }
 }
 
 // ---------------- Load / Save ----------------
@@ -299,6 +303,12 @@ bool saveConfigToSD() {
   f.println("# true = wardrive right after uploads complete (headless mode).");
   f.println("# false = stay on home WiFi, keep web UI accessible (default).");
   f.print("autoStartAfterUpload="); f.println(cfg.autoStartAfterUpload ? "true" : "false");
+
+  f.println("");
+  f.println("# SD-over-SPI clock ceiling in Hz. Boot negotiates the fastest speed up to");
+  f.println("# this that mounts successfully. Lower if you see SD write errors/corruption");
+  f.println("# on marginal wiring (default 20000000 = 20 MHz).");
+  f.print("sdMaxSpiHz="); f.println(cfg.sdMaxSpiHz);
 
   f.flush();
   f.close();

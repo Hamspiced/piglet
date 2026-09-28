@@ -48,6 +48,13 @@ struct Config {
   // The web UI is still reachable if you connect to the Wardriver AP later,
   // but the device will not hold the STA link open. Requires reboot.
   bool autoStartAfterUpload = false;
+
+  // Ceiling for SD-over-SPI clock negotiation (Hz). Boot tries a descending
+  // ladder of speeds up to this cap and uses the fastest one that mounts
+  // successfully. Lower this if you see SD write errors/corruption on
+  // marginal wiring (e.g. long breadboard jumpers); default is a commonly-
+  // safe ceiling for SD-over-SPI. Requires reboot.
+  uint32_t sdMaxSpiHz = 20000000;
 };
 
 const PinMap& detectPinsByChip();

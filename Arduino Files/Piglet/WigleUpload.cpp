@@ -169,12 +169,20 @@ bool uploadFileToWigle(const String& path) {
     return false;
   }
   if (!SD.exists(path)) {
-    Serial.println("[WiGLE] File does not exist on SD");
-    uploadLastResult = "File missing";
-    return false;
+    Serial.println("[WiGLE] File missing -- attempting SD recovery");
+    if (!sdTryRecover() || !SD.exists(path)) {
+      Serial.println("[WiGLE] File does not exist on SD");
+      uploadLastResult = "File missing";
+      return false;
+    }
+    Serial.println("[WiGLE] SD recovered -- file found");
   }
 
   File f = SD.open(path, FILE_READ);
+  if (!f) {
+    Serial.println("[WiGLE] Failed to open file -- attempting SD recovery");
+    if (sdTryRecover()) f = SD.open(path, FILE_READ);
+  }
   if (!f) {
     Serial.println("[WiGLE] Failed to open file");
     uploadLastResult = "Open fail";
@@ -211,6 +219,8 @@ bool uploadFileToWigle(const String& path) {
   // Retry TLS connect
   bool connected = false;
   for (int attempt = 1; attempt <= 3; attempt++) {
+    Serial.printf("[WiGLE] Free heap before connect (attempt %d/3): %u bytes\n",
+                  attempt, (unsigned)ESP.getFreeHeap());
     if (client.connect(WIGLE_HOST, WIGLE_PORT)) { 
       connected = true;
       break;
@@ -239,15 +249,29 @@ bool uploadFileToWigle(const String& path) {
   // Body
   client.print(pre);
 
-  // Stream the file
+  // Stream the file, tracking actual bytes sent so a short/failed SD read
+  // (e.g. SD card under stress) is detected and aborted cleanly instead of
+  // silently sending a body shorter than the Content-Length already sent.
+  uint32_t fileSent = 0;
   uint8_t buf[1024];
   while (true) {
     int n = f.read(buf, sizeof(buf));
     if (n <= 0) break;
-    client.write(buf, n);
+    size_t w = client.write(buf, n);
+    fileSent += (uint32_t)w;
+    if (w != (size_t)n) break;  // short write -- socket/SD trouble, stop here
     yield();
   }
   f.close();
+
+  if (fileSent != fileSize) {
+    client.stop();
+    uploadLastResult = "Read/write error (body short)";
+    Serial.printf("[WiGLE] Body incomplete: sent %u of %u bytes -- aborting\n",
+                  (unsigned)fileSent, (unsigned)fileSize);
+    return false;
+  }
+
   client.print(post);
   client.flush();
 
@@ -261,6 +285,7 @@ bool uploadFileToWigle(const String& path) {
   if (!client.available()) {
     client.stop();
     uploadLastResult = "No response";
+    Serial.println("[WiGLE] No response from server (connection closed or timed out)");
     return false;
   }
 
@@ -292,6 +317,7 @@ bool uploadFileToWigle(const String& path) {
   }
 
   uploadLastResult = "Upload failed (" + String(code) + ")";
+  Serial.printf("[WiGLE] Upload FAILED HTTP %d\n", code);
   return false;
 }
 
@@ -401,11 +427,19 @@ bool uploadFileToWdgwars(const String& path) {
     return false;
   }
   if (!SD.exists(path)) {
-    Serial.println("[WDGWars] File does not exist");
-    return false;
+    Serial.println("[WDGWars] File does not exist -- attempting SD recovery");
+    if (!sdTryRecover() || !SD.exists(path)) {
+      Serial.println("[WDGWars] File does not exist");
+      return false;
+    }
+    Serial.println("[WDGWars] SD recovered -- file found");
   }
 
   File f = SD.open(path, FILE_READ);
+  if (!f) {
+    Serial.println("[WDGWars] Failed to open file -- attempting SD recovery");
+    if (sdTryRecover()) f = SD.open(path, FILE_READ);
+  }
   if (!f) {
     Serial.println("[WDGWars] Failed to open file");
     return false;
@@ -431,6 +465,8 @@ bool uploadFileToWdgwars(const String& path) {
 
   bool connected = false;
   for (int attempt = 1; attempt <= 3; attempt++) {
+    Serial.printf("[WDGWars] Free heap before connect (attempt %d/3): %u bytes\n",
+                  attempt, (unsigned)ESP.getFreeHeap());
     if (client.connect(WDGWARS_HOST, WDGWARS_PORT)) {
       connected = true;
       break;
@@ -678,10 +714,30 @@ void wdgwarsDrainPendingJobs(uint32_t budgetMs) {
 
 // ---- Empty-file guard ----
 // Returns true if the CSV contains at least one data row beyond the two
-// mandatory WiGLE header lines.  Opens, reads two lines, checks for more.
-static bool csvHasDataRows(const String& path) {
+// mandatory WiGLE header lines. Opens, reads two lines, checks for more.
+// `outSize` (optional) receives the file's byte size for diagnostic logging.
+//
+// IMPORTANT: if the file can't even be opened, this returns true ("assume it
+// has data") rather than false. Callers only delete a file when this returns
+// false, so a transient SD/SPI error must never look identical to "verified
+// empty" -- that conflation previously caused real, non-empty files to be
+// deleted en masse whenever the SD card hit a rough patch mid-session.
+static bool csvHasDataRows(const String& path, uint32_t* outSize = nullptr) {
+  if (outSize) *outSize = 0;
+
   File f = SD.open(path, FILE_READ);
-  if (!f) return false;
+  if (!f) {
+    Serial.printf("[SD] csvHasDataRows: could not open %s -- attempting SD recovery\n",
+                  pathBasename(path).c_str());
+    if (sdTryRecover()) f = SD.open(path, FILE_READ);
+  }
+  if (!f) {
+    Serial.printf("[SD] csvHasDataRows: could not open %s -- assuming it HAS data (not deleting)\n",
+                  pathBasename(path).c_str());
+    return true;
+  }
+
+  if (outSize) *outSize = f.size();
 
   // Skip the two header lines
   for (int i = 0; i < 2; i++) {
@@ -716,9 +772,12 @@ void deleteEmptyCsvs() {
   root.close();
 
   for (const String& path : toDelete) {
-    if (!csvHasDataRows(path)) {
-      Serial.printf("[CLEANUP] Empty CSV, deleting: %s\n", pathBasename(path).c_str());
-      SD.remove(path);
+    uint32_t sz = 0;
+    if (!csvHasDataRows(path, &sz)) {
+      Serial.printf("[CLEANUP] Empty CSV (%u bytes), deleting: %s\n", (unsigned)sz, pathBasename(path).c_str());
+      if (!SD.remove(path)) {
+        Serial.printf("[CLEANUP] WARNING: SD.remove failed for %s -- file left in place\n", pathBasename(path).c_str());
+      }
     }
   }
 }
@@ -802,15 +861,23 @@ uint32_t uploadAllCsvsToWigle(int maxFiles) {
   for (size_t i = 0; i < paths.size(); i++) {
     uploadCurrentFile = paths[i];
     updateOLED(0);
+    Serial.printf("[UPLOAD] File %u/%u: %s (heap free: %u bytes)\n",
+                  (unsigned)(i + 1), (unsigned)paths.size(),
+                  pathBasename(paths[i]).c_str(), (unsigned)ESP.getFreeHeap());
 
     // Guard: skip and delete header-only files (no scan data worth uploading)
-    if (!csvHasDataRows(paths[i])) {
-      Serial.printf("[UPLOAD] Empty CSV (no data rows), deleting: %s\n",
-                    pathBasename(paths[i]).c_str());
-      SD.remove(paths[i]);
-      uploadDoneFiles++;
-      updateOLED(0);
-      continue;
+    {
+      uint32_t emptySz = 0;
+      if (!csvHasDataRows(paths[i], &emptySz)) {
+        Serial.printf("[UPLOAD] Empty CSV (%u bytes, no data rows), deleting: %s\n",
+                      (unsigned)emptySz, pathBasename(paths[i]).c_str());
+        if (!SD.remove(paths[i])) {
+          Serial.printf("[UPLOAD] WARNING: SD.remove failed for %s -- file left in place\n", pathBasename(paths[i]).c_str());
+        }
+        uploadDoneFiles++;
+        updateOLED(0);
+        continue;
+      }
     }
 
     // Step 1: WDGoWars first (if API key configured)
@@ -924,15 +991,23 @@ uint32_t uploadAllCsvsToWdgwars(int maxFiles) {
   for (size_t i = 0; i < paths.size(); i++) {
     uploadCurrentFile = paths[i];
     updateOLED(0);
+    Serial.printf("[UPLOAD] File %u/%u: %s (heap free: %u bytes)\n",
+                  (unsigned)(i + 1), (unsigned)paths.size(),
+                  pathBasename(paths[i]).c_str(), (unsigned)ESP.getFreeHeap());
 
     // Guard: skip and delete header-only files
-    if (!csvHasDataRows(paths[i])) {
-      Serial.printf("[UPLOAD] Empty CSV (no data rows), deleting: %s\n",
-                    pathBasename(paths[i]).c_str());
-      SD.remove(paths[i]);
-      uploadDoneFiles++;
-      updateOLED(0);
-      continue;
+    {
+      uint32_t emptySz = 0;
+      if (!csvHasDataRows(paths[i], &emptySz)) {
+        Serial.printf("[UPLOAD] Empty CSV (%u bytes, no data rows), deleting: %s\n",
+                      (unsigned)emptySz, pathBasename(paths[i]).c_str());
+        if (!SD.remove(paths[i])) {
+          Serial.printf("[UPLOAD] WARNING: SD.remove failed for %s -- file left in place\n", pathBasename(paths[i]).c_str());
+        }
+        uploadDoneFiles++;
+        updateOLED(0);
+        continue;
+      }
     }
 
     bool ok = uploadFileToWdgwars(paths[i]);

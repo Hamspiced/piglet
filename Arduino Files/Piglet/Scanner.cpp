@@ -48,6 +48,10 @@ static void processScanResults(int n) {
 
   uint32_t wrote = 0;
   for (int i = 0; i < n; i++) {
+    // Periodic cooperative yield so a large batch (dense-area scan) doesn't
+    // monopolize the CPU between appendWigleRow()'s own flush-triggered yields.
+    if ((i & 0x0F) == 15) yield();
+
     int ch = WiFi.channel(i);
     bool chUnknown = (ch == 0);
     bool is2g = (ch >= 1 && ch <= 14) || chUnknown;

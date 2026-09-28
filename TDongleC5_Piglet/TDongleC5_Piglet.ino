@@ -43,7 +43,7 @@
 #include "esp32-hal-matrix.h"
 
 // Firmware version
-#define FIRMWARE_VERSION "v2.59"
+#define FIRMWARE_VERSION "v2.62"
 
 // ---------------- Pins (T-DONGLE C5) ----------------
 struct PinMap {
@@ -142,6 +142,11 @@ struct Config {
   String meshModeOnBoot = "none";
   // Rotate TFT screen 180° (true = upside-down mount). Requires reboot.
   bool rotateScreen180 = false;
+  // Ceiling for SD-over-SPI clock negotiation (Hz). Boot tries a descending
+  // ladder of speeds up to this cap and uses the fastest one that mounts
+  // successfully. Lower this if you see SD write errors/corruption on
+  // marginal wiring; default is a commonly-safe ceiling for SD-over-SPI.
+  uint32_t sdMaxSpiHz = 20000000;
 };
 
 Config cfg;
@@ -399,6 +404,10 @@ static void cfgAssignKV(const String& k, const String& v) {
   else if (k == "deviceName")      cfg.deviceName = v;
   else if (k == "meshModeOnBoot") { String vv = v; vv.toLowerCase(); if (vv == "core" || vv == "node" || vv == "none") cfg.meshModeOnBoot = vv; }
   else if (k == "rotateScreen180") { String vv = v; vv.toLowerCase(); cfg.rotateScreen180 = (vv == "true" || vv == "1"); }
+  else if (k == "sdMaxSpiHz") {
+    long hz = v.toInt();
+    if (hz >= 400000 && hz <= 40000000) cfg.sdMaxSpiHz = (uint32_t)hz;  // sanity-clamp to a plausible SPI range
+  }
 }
 
 static bool saveConfigToSD() {
@@ -427,6 +436,9 @@ static bool saveConfigToSD() {
   f.print("meshModeOnBoot=");  f.println(cfg.meshModeOnBoot);
   f.println("# Rotate screen 180 degrees (true = upside-down mount). Requires reboot.");
   f.print("rotateScreen180="); f.println(cfg.rotateScreen180 ? "true" : "false");
+  f.println("# SD-over-SPI clock ceiling in Hz (default 20000000 = 20 MHz). Lower if you");
+  f.println("# see SD write errors/corruption on marginal wiring.");
+  f.print("sdMaxSpiHz="); f.println(cfg.sdMaxSpiHz);
 
   f.flush(); f.close();
   Serial.println("[CFG] Saved OK");
@@ -542,6 +554,27 @@ static bool openLogFile() {
   return true;
 }
 
+// Copy `in` into fixed buffer `out` (size outSize), doubling any embedded
+// double-quote characters per CSV escaping rules (RFC4180-style). Truncates
+// safely rather than overflowing if the (unexpectedly long/malformed) input
+// wouldn't fit.
+static void csvEscapeQuotes(const String& in, char* out, size_t outSize) {
+  size_t o = 0;
+  size_t n = in.length();
+  for (size_t i = 0; i < n; i++) {
+    char c = in[i];
+    if (c == '"') {
+      if (o + 2 >= outSize) break;  // no room left for the doubled quote
+      out[o++] = '"';
+      out[o++] = '"';
+    } else {
+      if (o + 1 >= outSize) break;
+      out[o++] = c;
+    }
+  }
+  out[o] = '\0';
+}
+
 static void appendWigleRow(const String& mac, const String& ssid, const String& auth,
                            const String& firstSeen, int channel, int rssi,
                            double lat, double lon, double altM, double accM) {
@@ -554,28 +587,32 @@ static void appendWigleRow(const String& mac, const String& ssid, const String& 
     if (!openLogFile()) return;
   }
 
-  String safeSsid = ssid;
-  safeSsid.replace("\"", "\"\"");
-
-  String line;
-  line.reserve(256);
-  line += mac; line += ",";
-  line += "\""; line += safeSsid; line += "\",";
-  line += auth; line += ",";
-  line += firstSeen; line += ",";
-  line += String(channel); line += ",";
   // Frequency in MHz (WiGLE 1.6)
   uint32_t freq = 0;
   if      (channel >= 1  && channel <= 13) freq = 2407u + (uint32_t)channel * 5;
   else if (channel == 14)                  freq = 2484u;
   else if (channel >= 32)                  freq = 5000u + (uint32_t)channel * 5;
-  line += String(freq); line += ",";
-  line += String(rssi); line += ",";
-  line += String(lat, 6); line += ",";
-  line += String(lon, 6); line += ",";
-  line += String(altM, 1); line += ",";
-  line += String(accM, 1); line += ",";
-  line += ",,WIFI"; // RCOIs (empty), MfgrId (empty), Type
+
+  // Build the row into fixed stack buffers instead of chaining Arduino
+  // String concatenation (each `+=` above used to allocate/copy/free on the
+  // heap). This runs once per scan result and can fire hundreds of times
+  // per batch in dense areas, so per-row heap churn adds up fast.
+  char safeSsid[70];  // SSID is at most 32 bytes; worst case (all quotes) doubles to 64
+  csvEscapeQuotes(ssid, safeSsid, sizeof(safeSsid));
+
+  char line[256];
+  int len = snprintf(line, sizeof(line),
+                      "%s,\"%s\",%s,%s,%d,%u,%d,%.6f,%.6f,%.1f,%.1f,,,WIFI",
+                      mac.c_str(), safeSsid, auth.c_str(), firstSeen.c_str(),
+                      channel, (unsigned)freq, rssi, lat, lon, altM, accM);
+  if (len < 0) {
+    Serial.println("[SD] appendWigleRow: encoding error, row skipped");
+    return;
+  }
+  if ((size_t)len >= sizeof(line)) {
+    Serial.printf("[SD] appendWigleRow: row truncated (needed %d bytes, buffer %u) — check SSID\n",
+                  len, (unsigned)sizeof(line));
+  }
 
   digitalWrite(PINS.tft_cs, HIGH);
   size_t written = logFile.println(line);
@@ -584,7 +621,7 @@ static void appendWigleRow(const String& mac, const String& ssid, const String& 
   // Detect silent write failure — if println() returns 0 for a non-empty line,
   // the SD card or file handle is broken. Attempt to reopen the log file once;
   // if that also fails, mark SD as unusable until next boot.
-  if (written == 0 && line.length() > 0) {
+  if (written == 0 && len > 0) {
     static uint8_t consecFails = 0;
     consecFails++;
     Serial.printf("[SD] Write failed (%u consecutive)\n", consecFails);
@@ -603,13 +640,18 @@ static void appendWigleRow(const String& mac, const String& ssid, const String& 
     return;
   }
 
+  // Flush less often to avoid stalls (SD writes can block hard). Threshold
+  // tightened from 25 to 16 lines so large batches get broken into smaller
+  // chunks; yield() after each flush gives WiFi/GPS/web-server/watchdog a
+  // chance to run between chunks instead of only after the whole batch.
   static uint32_t lastFlushMs = 0;
   static uint32_t linesSinceFlush = 0;
   linesSinceFlush++;
 
-  if (linesSinceFlush >= 25 || (millis() - lastFlushMs) >= 2000) {
+  if (linesSinceFlush >= 16 || (millis() - lastFlushMs) >= 2000) {
     digitalWrite(PINS.tft_cs, HIGH);
     logFile.flush();
+    yield();
     lastFlushMs = millis();
     linesSinceFlush = 0;
   }
@@ -620,6 +662,8 @@ static void tftWigleUploadScreen(uint32_t done, uint32_t total, const String& fi
 static void forceStatusFullRedraw();
 static void wdgwarsServicePendingJobs();
 static void wdgwarsDrainPendingJobs(uint32_t budgetMs);
+static bool initSD_SharedSPI();
+static bool sdTryRecover();
 
 // ---- WDGoWars API key test — GET /api/me ----
 static bool wdgwarsTestKey() {
@@ -673,10 +717,24 @@ static bool uploadFileToWdgwars(const String& path) {
   if (WiFi.status() != WL_CONNECTED) return false;
   if (cfg.wdgwarsApiKey.length() < 8) return false;
   digitalWrite(PINS.tft_cs, HIGH);
-  if (!SD.exists(path)) return false;
+  if (!SD.exists(path)) {
+    Serial.println("[WDGWars] File does not exist -- attempting SD recovery");
+    if (!sdTryRecover() || !SD.exists(path)) {
+      Serial.println("[WDGWars] File does not exist");
+      return false;
+    }
+    Serial.println("[WDGWars] SD recovered -- file found");
+  }
 
   File f = SD.open(path, FILE_READ);
-  if (!f) return false;
+  if (!f) {
+    Serial.println("[WDGWars] Failed to open file -- attempting SD recovery");
+    if (sdTryRecover()) f = SD.open(path, FILE_READ);
+  }
+  if (!f) {
+    Serial.println("[WDGWars] Failed to open file");
+    return false;
+  }
 
   String boundary = "----Piglet-WDGWARS-BOUNDARY";
   String filename = pathBasename(path);
@@ -688,10 +746,13 @@ static bool uploadFileToWdgwars(const String& path) {
   client.setInsecure(); client.setTimeout(25000);
   bool connected = false;
   for (int att=1; att<=3; att++) {
+    Serial.printf("[WDGWars] Free heap before connect (attempt %d/3): %u bytes\n",
+                  att, (unsigned)ESP.getFreeHeap());
     if (client.connect(WDGWARS_HOST, WDGWARS_PORT)) { connected=true; break; }
+    Serial.printf("[WDGWars] TLS connect failed (attempt %d/3)\n", att);
     client.stop(); delay(500); yield();
   }
-  if (!connected) { uploadLastResult = "WDGW: TLS connect fail"; f.close(); return false; }
+  if (!connected) { uploadLastResult = "WDGW: TLS connect fail"; Serial.println("[WDGWars] TLS connect failed after 3 attempts"); f.close(); return false; }
 
   client.print("POST /api/v2/upload-csv HTTP/1.0\r\n");
   client.print(String("Host: ")+WDGWARS_HOST+"\r\n");
@@ -867,10 +928,48 @@ static void wdgwarsDrainPendingJobs(uint32_t budgetMs) {
   }
 }
 
+// ---- SD bus recovery ----
+// After sustained heavy SD I/O (large batch uploads at high SPI clock), the
+// SD/SPI bus can wedge, causing SD.exists()/SD.open() to fail even though
+// the underlying file is intact on the card. Re-running the full boot-time
+// init dance (initSD_SharedSPI) usually clears it, since it already handles
+// this board's shared TFT/SD SPI bus quirks. Rate-limited so a genuinely
+// dead card doesn't get hammered with a remount attempt on every file.
+static uint32_t sdLastRecoverMs = 0;
+static bool sdTryRecover() {
+  uint32_t now = millis();
+  if (now - sdLastRecoverMs < 4000) return false;
+  sdLastRecoverMs = now;
+
+  Serial.println("[SD] Attempting SD bus recovery (full re-init)...");
+  bool ok = initSD_SharedSPI();
+  sdOk = ok;
+  Serial.printf("[SD] Recovery %s\n", ok ? "OK" : "FAILED");
+  return ok;
+}
+
 // ---- Empty-file guard: true if file has any data beyond the 2 header lines ----
-static bool csvHasDataRows(const String& path) {
+// `outSize` (optional) receives the file's byte size for diagnostic logging.
+//
+// IMPORTANT: if the file can't even be opened, this returns true ("assume it
+// has data") rather than false. Callers only delete a file when this returns
+// false, so a transient SD/SPI error must never look identical to "verified
+// empty" -- that conflation previously caused real, non-empty files to be
+// deleted en masse whenever the SD card hit a rough patch mid-session.
+static bool csvHasDataRows(const String& path, uint32_t* outSize = nullptr) {
+  if (outSize) *outSize = 0;
   File f = SD.open(path, FILE_READ);
-  if (!f) return false;
+  if (!f) {
+    Serial.printf("[SD] csvHasDataRows: could not open %s -- attempting SD recovery\n",
+                  pathBasename(path).c_str());
+    if (sdTryRecover()) f = SD.open(path, FILE_READ);
+  }
+  if (!f) {
+    Serial.printf("[SD] csvHasDataRows: could not open %s -- assuming it HAS data (not deleting)\n",
+                  pathBasename(path).c_str());
+    return true;
+  }
+  if (outSize) *outSize = f.size();
   for (int i=0; i<2; i++) { if(!f.available()){f.close();return false;} f.readStringUntil('\n'); }
   bool hasData = f.available()>0;
   f.close();
@@ -906,7 +1005,16 @@ static uint32_t uploadAllCsvsToWdgwars() {
   for(size_t i=0;i<paths.size();i++){
     uploadCurrentFile=paths[i];
     tftWigleUploadScreen(uploadDoneFiles,uploadTotalFiles,pathBasename(uploadCurrentFile));
-    if(!csvHasDataRows(paths[i])){Serial.printf("[UPLOAD] Empty CSV, deleting: %s\n",pathBasename(paths[i]).c_str());SD.remove(paths[i]);uploadDoneFiles++;continue;}
+    Serial.printf("[UPLOAD] File %u/%u: %s (heap free: %u bytes)\n",
+                  (unsigned)(i + 1), (unsigned)paths.size(),
+                  pathBasename(paths[i]).c_str(), (unsigned)ESP.getFreeHeap());
+    { uint32_t emptySz = 0;
+      if(!csvHasDataRows(paths[i], &emptySz)){
+        Serial.printf("[UPLOAD] Empty CSV (%u bytes), deleting: %s\n", (unsigned)emptySz, pathBasename(paths[i]).c_str());
+        if (!SD.remove(paths[i])) Serial.printf("[UPLOAD] WARNING: SD.remove failed for %s -- file left in place\n", pathBasename(paths[i]).c_str());
+        uploadDoneFiles++;continue;
+      }
+    }
     bool ok=uploadFileToWdgwars(paths[i]);
     if(ok){okCount++;moveToUploaded(paths[i]);}else{uploadFailedFiles++;}
     uploadDoneFiles++;
@@ -923,7 +1031,14 @@ static uint32_t uploadAllCsvsToWdgwars() {
 static bool moveToUploaded(const String& srcPath) {
   if (!sdOk) return false;
   digitalWrite(PINS.tft_cs, HIGH);
-  if (!SD.exists(srcPath)) return false;
+  if (!SD.exists(srcPath)) {
+    Serial.println("[SD] moveToUploaded: source missing, attempting recovery");
+    if (!sdTryRecover() || !SD.exists(srcPath)) {
+      Serial.println("[SD] moveToUploaded: source missing");
+      return false;
+    }
+    Serial.println("[SD] moveToUploaded: SD recovered, source found");
+  }
   if (!SD.exists("/uploaded")) SD.mkdir("/uploaded");
 
   String dstPath = String("/uploaded/") + pathBasename(srcPath);
@@ -984,9 +1099,20 @@ static bool uploadFileToWigle(const String& path) {
   if (cfg.wigleBasicToken.length() < 8) { uploadLastResult = "No token set"; return false; }
 
   digitalWrite(PINS.tft_cs, HIGH);
-  if (!SD.exists(path)) { uploadLastResult = "File missing"; return false; }
+  if (!SD.exists(path)) {
+    Serial.println("[WiGLE] File missing -- attempting SD recovery");
+    if (!sdTryRecover() || !SD.exists(path)) {
+      uploadLastResult = "File missing";
+      return false;
+    }
+    Serial.println("[WiGLE] SD recovered -- file found");
+  }
 
   File f = SD.open(path, FILE_READ);
+  if (!f) {
+    Serial.println("[WiGLE] Failed to open file -- attempting SD recovery");
+    if (sdTryRecover()) f = SD.open(path, FILE_READ);
+  }
   if (!f) { uploadLastResult = "Open fail"; return false; }
 
   String boundary = "----Piglet-WARDRIVE-BOUNDARY";
@@ -998,6 +1124,7 @@ static bool uploadFileToWigle(const String& path) {
   WiFiClientSecure client;
   client.setInsecure();
   client.setTimeout(25000);
+  Serial.printf("[WiGLE] Free heap before connect: %u bytes\n", (unsigned)ESP.getFreeHeap());
   if (!client.connect(WIGLE_HOST, WIGLE_PORT)) { uploadLastResult = "TLS connect fail"; f.close(); return false; }
 
   client.print(String("POST /api/v2/file/upload HTTP/1.0\r\nHost: ") + WIGLE_HOST +
@@ -1006,9 +1133,30 @@ static bool uploadFileToWigle(const String& path) {
                "\r\nContent-Length: " + String(contentLen) + "\r\nConnection: close\r\n\r\n");
   client.print(pre);
 
+  // Stream the file, tracking actual bytes sent so a short/failed SD read
+  // (e.g. SD card under stress) is detected and aborted cleanly instead of
+  // silently sending a body shorter than the Content-Length already sent.
+  uint32_t fileSent = 0;
   uint8_t buf[1024];
-  while (true) { int n = f.read(buf, sizeof(buf)); if (n <= 0) break; client.write(buf, n); delay(0); }
+  while (true) {
+    int n = f.read(buf, sizeof(buf));
+    if (n <= 0) break;
+    size_t w = client.write(buf, n);
+    fileSent += (uint32_t)w;
+    if (w != (size_t)n) break;
+    delay(0);
+  }
   f.close();
+
+  uint32_t fileSize = contentLen - (uint32_t)pre.length() - (uint32_t)post.length();
+  if (fileSent != fileSize) {
+    client.stop();
+    uploadLastResult = "Read/write error (body short)";
+    Serial.printf("[WiGLE] Body incomplete: sent %u of %u bytes -- aborting\n",
+                  (unsigned)fileSent, (unsigned)fileSize);
+    return false;
+  }
+
   client.print(post);
 
   String status = client.readStringUntil('\n'); status.trim();
@@ -1023,6 +1171,7 @@ static bool uploadFileToWigle(const String& path) {
 
   if (code == 200) { uploadLastResult = "Uploaded OK (200)"; return true; }
   uploadLastResult = "Upload failed (" + String(code) + ")";
+  Serial.printf("[WiGLE] Upload FAILED HTTP %d\n", code);
   return false;
 }
 
@@ -1081,13 +1230,21 @@ static uint32_t uploadAllCsvsToWigle(int maxFiles = -1) {
   uint32_t okCount = 0;
   for (size_t i = 0; i < paths.size(); i++) {
     uploadCurrentFile = paths[i];
+    Serial.printf("[UPLOAD] File %u/%u: %s (heap free: %u bytes)\n",
+                  (unsigned)(i + 1), (unsigned)paths.size(),
+                  pathBasename(paths[i]).c_str(), (unsigned)ESP.getFreeHeap());
 
     // Skip and delete header-only files
-    if (!csvHasDataRows(paths[i])) {
-      Serial.printf("[UPLOAD] Empty CSV, deleting: %s\n", pathBasename(paths[i]).c_str());
-      SD.remove(paths[i]);
-      uploadDoneFiles++;
-      continue;
+    {
+      uint32_t emptySz = 0;
+      if (!csvHasDataRows(paths[i], &emptySz)) {
+        Serial.printf("[UPLOAD] Empty CSV (%u bytes), deleting: %s\n", (unsigned)emptySz, pathBasename(paths[i]).c_str());
+        if (!SD.remove(paths[i])) {
+          Serial.printf("[UPLOAD] WARNING: SD.remove failed for %s -- file left in place\n", pathBasename(paths[i]).c_str());
+        }
+        uploadDoneFiles++;
+        continue;
+      }
     }
 
     // Step 1: WDGoWars first (if configured)
@@ -1875,6 +2032,25 @@ static const uint32_t NODE_SCAN_DWELL_MS  = 80;    // ms per channel (JCMK CHANN
 static const uint32_t NODE_ADMIN_WIN_MS   = 500;   // ch-6 window after each scan cycle
 #define JCMK_TEXT_MAX 200
 
+// ---- Piglet-to-Piglet identification + transmit-slot scheduling ----
+// A short marker carried in the otherwise-always-empty text/len fields of the
+// existing CORE_REQUEST/CORE_REPLY/HEARTBEAT messages. Neither real JCMK
+// hardware nor Biscuit nodes look at this payload, so it's fully backward
+// compatible; it only ever activates the new scheduling path when BOTH sides
+// of a pairing are confirmed to be genuine Piglet devices.
+static const char*   PIGLET_MARKER     = "PIGLET1";
+static const uint8_t PIGLET_MARKER_LEN = 7;
+
+// Deterministic transmit-slot width for Piglet-to-Piglet nodes. Each
+// confirmed-Piglet node gets an exclusive [slotIndex*SLOT_MS, +SLOT_MS) window
+// within a repeating cycle (cycle length = SLOT_MS * active-Piglet-node-count),
+// so scan results are sent without colliding with other nodes' transmissions.
+static const uint32_t JCMK_SLOT_MS = 200;
+
+// If a Node hasn't heard anything from its Core in this long, assume it's gone
+// and return to searching (mirrors Biscuit's own CORE_TIMEOUT_MS behavior).
+static const uint32_t JCMK_CORE_TIMEOUT_MS = 30000;
+
 enum JcmkMsgType : uint8_t {
   JCMK_MSG_CORE_REQUEST = 1,
   JCMK_MSG_CORE_REPLY   = 2,
@@ -1931,6 +2107,7 @@ static uint8_t  jcmkEndIdx      = 0;  // set in enterNodeMode
 static uint8_t  jcmkAssignVer   = 0;
 static uint32_t jcmkNetworksFound = 0;  // raw networks seen each session
 static uint32_t jcmkSentCount   = 0;
+static uint32_t jcmkSendFailCount = 0;
 static uint32_t jcmkHbCounter   = 0;
 static uint32_t jcmkLastHbMs    = 0;
 static uint32_t jcmkLastReqMs   = 0;
@@ -1943,8 +2120,44 @@ static bool     nodeScanAdminWin = false;
 static uint32_t nodeScanAdminMs  = 0;
 
 // Pending core-found event — set from ESP-Now callback, consumed in loop
-static volatile bool  jcmkCoreFoundPending = false;
-static uint8_t        jcmkCoreMacPending[6] = {0};
+static volatile bool  jcmkCoreFoundPending    = false;
+static uint8_t        jcmkCoreMacPending[6]   = {0};
+static volatile bool  jcmkCoreIsPigletPending = false;
+
+// Piglet-to-Piglet transmit-slot state (only meaningful when jcmkCoreIsPiglet)
+static bool     jcmkCoreIsPiglet   = false;
+static uint8_t  jcmkSlotIndex      = 0;
+static uint8_t  jcmkSlotCount      = 1;
+static uint32_t jcmkCycleEpochMs   = 0;
+static uint32_t jcmkCoreLastSeenMs = 0;  // for JCMK_CORE_TIMEOUT_MS detection
+
+// Ring buffer of scan-result lines awaiting this node's transmit slot.
+// Scanning (nodeDoScanTick) keeps running at full pace regardless of buffer
+// state; only sending already-found results is deferred to the slot window.
+#define JCMK_PENDING_MAX 64
+struct JcmkPendingLine { char text[96]; };
+static JcmkPendingLine jcmkPendingBuf[JCMK_PENDING_MAX];
+static uint8_t         jcmkPendingHead = 0, jcmkPendingTail = 0;
+
+static bool jcmkPendingEmpty() { return jcmkPendingHead == jcmkPendingTail; }
+
+static bool jcmkPendingPush(const String& line) {
+  uint8_t next = (jcmkPendingTail + 1) % JCMK_PENDING_MAX;
+  if (next == jcmkPendingHead) return false;  // full — drop rather than block scanning
+  size_t n = line.length();
+  if (n >= sizeof(jcmkPendingBuf[0].text)) n = sizeof(jcmkPendingBuf[0].text) - 1;
+  memcpy(jcmkPendingBuf[jcmkPendingTail].text, line.c_str(), n);
+  jcmkPendingBuf[jcmkPendingTail].text[n] = '\0';
+  jcmkPendingTail = next;
+  return true;
+}
+
+static bool jcmkPendingPop(String& out) {
+  if (jcmkPendingEmpty()) return false;
+  out = jcmkPendingBuf[jcmkPendingHead].text;
+  jcmkPendingHead = (jcmkPendingHead + 1) % JCMK_PENDING_MAX;
+  return true;
+}
 
 // ---- Core mode state ----
 #define CORE_MAX_NODES 12
@@ -1955,6 +2168,8 @@ struct CoreNodeInfo {
   uint32_t lastHbMs;
   uint32_t recordsRx;
   bool     isBiscuit;  // true = Biscuit Node protocol (requires full-size 212-byte packets)
+  bool     isPiglet;   // true = confirmed genuine Piglet node (via marker handshake)
+  uint8_t  slotIndex;  // this node's transmit slot among other Piglet nodes (valid when isPiglet)
 };
 static bool         meshCoreActive  = false;
 static uint32_t     coreRecordsRx   = 0;
@@ -1963,12 +2178,13 @@ static CoreNodeInfo coreNodes[CORE_MAX_NODES] = {};
 static uint8_t      coreAssignVer   = 0;
 static uint32_t     coreLastHbMs    = 0;
 static uint32_t     coreHbCounter   = 0;
+static uint8_t      corePigletSlotCount = 0;  // active Piglet-confirmed node count; recomputed in coreReassignChannels()
 static const uint32_t CORE_HB_MS         = 5000;
 static const uint32_t CORE_NODE_TIMEOUT  = 90000;  // 90 s — generous for many-node ESP-Now collisions
 
 #define CORE_REQ_QUEUE  16
 #define CORE_TEXT_QUEUE 192  // sized for burst from 12 nodes x ~15 networks each
-struct CorReqSlot  { uint8_t mac[6]; bool isBiscuit; };
+struct CorReqSlot  { uint8_t mac[6]; bool isBiscuit; bool isPiglet; };
 struct CorTextSlot { char    line[JCMK_TEXT_MAX + 1]; };
 static CorReqSlot         coreReqBuf[CORE_REQ_QUEUE];
 static volatile uint8_t   coreReqHead = 0, coreReqTail = 0;
@@ -1982,6 +2198,16 @@ static void jcmkSetChannel(uint8_t ch) {
   // a prior STA connection causes the driver to revert to the home router channel.
   // Direct esp_wifi_set_channel() works correctly when the STA is not connected.
   esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
+}
+
+// ESP-Now send-status callback -- the only way to learn whether esp_now_send()
+// actually made it onto the air. esp_now_send() itself only reports whether the
+// driver *accepted* the request, not whether the frame was transmitted; a
+// counter that only tracks calls made (like jcmkSentCount) can look perfectly
+// healthy locally while every frame is silently failing at the radio layer.
+static void jcmkOnSent(const esp_now_send_info_t* txInfo, esp_now_send_status_t status) {
+  (void)txInfo;
+  if (status != ESP_NOW_SEND_SUCCESS) jcmkSendFailCount++;
 }
 
 static bool jcmkAddPeer(const uint8_t* mac) {
@@ -2002,7 +2228,11 @@ static void jcmkSendCoreRequest() {
   memcpy(msg.magic, JCMK_MAGIC, 4);
   msg.type    = JCMK_MSG_CORE_REQUEST;
   msg.counter = 0;
-  msg.len     = 0;
+  // Marker identifies this as a genuine Piglet node to a Piglet Core; real
+  // JCMK hardware and Biscuit Cores simply ignore this payload.
+  msg.len     = PIGLET_MARKER_LEN;
+  memcpy(msg.text, PIGLET_MARKER, PIGLET_MARKER_LEN);
+  msg.text[PIGLET_MARKER_LEN] = '\0';
   esp_now_send(JCMK_BCAST, (uint8_t*)&msg, sizeof(msg));
 }
 
@@ -2011,8 +2241,17 @@ static void jcmkSendHeartbeat() {
   memcpy(msg.magic, JCMK_MAGIC, 4);
   msg.type    = JCMK_MSG_HEARTBEAT;
   msg.counter = ++jcmkHbCounter;
-  msg.len     = 0;
-  esp_now_send(JCMK_BCAST, (uint8_t*)&msg, sizeof(msg));
+  // Carry the marker here too so a Core can learn isPiglet even if it first
+  // (re)discovers this node via a heartbeat rather than a fresh CORE_REQUEST.
+  msg.len     = PIGLET_MARKER_LEN;
+  memcpy(msg.text, PIGLET_MARKER, PIGLET_MARKER_LEN);
+  msg.text[PIGLET_MARKER_LEN] = '\0';
+  // Unicast to the already-known Core (this is only ever called once
+  // jcmkHaveCore is true) instead of broadcasting. Broadcast ESP-Now/802.11
+  // frames have no link-layer ACK or retry -- a dropped broadcast is silently
+  // lost with no way for either side to know, whereas unicast frames are
+  // retried and their delivery status is reported to jcmkOnSent().
+  esp_now_send(jcmkCoreMac, (uint8_t*)&msg, sizeof(msg));
 }
 
 static void jcmkSendText(const String& s) {
@@ -2025,7 +2264,18 @@ static void jcmkSendText(const String& s) {
   memcpy(msg.text, s.c_str(), slen);
   msg.text[slen] = '\0';
   // Always send full struct size — Biscuit Pro drops variable-length packets < 212 bytes.
-  esp_now_send(JCMK_BCAST, (uint8_t*)&msg, sizeof(msg));
+  // Unicast (see jcmkSendHeartbeat comment above) — only ever called once
+  // jcmkHaveCore is true, i.e. jcmkCoreMac is already a registered peer.
+  esp_now_send(jcmkCoreMac, (uint8_t*)&msg, sizeof(msg));
+}
+
+// True if a received jcmk_text_msg_t carries the Piglet identification marker.
+// `len` is the raw ESP-Now payload length (as delivered to the recv callback).
+static bool jcmkHasPigletMarker(const void* data, int len) {
+  if (len < (int)sizeof(jcmk_text_msg_t)) return false;
+  const jcmk_text_msg_t* tm = (const jcmk_text_msg_t*)data;
+  if (tm->len < PIGLET_MARKER_LEN) return false;
+  return memcmp(tm->text, PIGLET_MARKER, PIGLET_MARKER_LEN) == 0;
 }
 
 // ---- Core forward decls (used inside jcmkOnRecv callback) ----
@@ -2037,7 +2287,11 @@ static void coreSendReply(const uint8_t* mac) {
   memcpy(msg.magic, JCMK_MAGIC, 4);
   msg.type    = JCMK_MSG_CORE_REPLY;
   msg.counter = 0;
-  msg.len     = 0;
+  // Marker tells a Piglet node that this Core is also a genuine Piglet, so it
+  // can safely switch to slot-scheduled transmit; ignored by third-party nodes.
+  msg.len     = PIGLET_MARKER_LEN;
+  memcpy(msg.text, PIGLET_MARKER, PIGLET_MARKER_LEN);
+  msg.text[PIGLET_MARKER_LEN] = '\0';
   esp_now_send(mac, (uint8_t*)&msg, sizeof(msg));
 }
 
@@ -2099,6 +2353,7 @@ static void jcmkOnRecv(const esp_now_recv_info_t* info,
       if (next != coreReqHead) {
         memcpy(coreReqBuf[coreReqTail].mac, info->src_addr, 6);
         coreReqBuf[coreReqTail].isBiscuit = (len >= (int)sizeof(jcmk_text_msg_t));
+        coreReqBuf[coreReqTail].isPiglet  = jcmkHasPigletMarker(data, len);
         coreReqTail = next;
       }
     } else if (type == JCMK_MSG_TEXT && len >= 11) {
@@ -2125,6 +2380,9 @@ static void jcmkOnRecv(const esp_now_recv_info_t* info,
           if (nxt != coreReqHead) {
             memcpy(coreReqBuf[coreReqTail].mac, info->src_addr, 6);
             coreReqBuf[coreReqTail].isBiscuit = (len >= (int)sizeof(jcmk_text_msg_t));
+            // TEXT carries scan-line data, not the marker -- conservatively
+            // treat as non-Piglet until the node's next heartbeat.
+            coreReqBuf[coreReqTail].isPiglet = false;
             coreReqTail = nxt;
           }
         }
@@ -2143,6 +2401,7 @@ static void jcmkOnRecv(const esp_now_recv_info_t* info,
         if (nxt != coreReqHead) {
           memcpy(coreReqBuf[coreReqTail].mac, info->src_addr, 6);
           coreReqBuf[coreReqTail].isBiscuit = (len >= (int)sizeof(jcmk_text_msg_t));
+          coreReqBuf[coreReqTail].isPiglet  = jcmkHasPigletMarker(data, len);
           coreReqTail = nxt;
         }
       }
@@ -2150,35 +2409,53 @@ static void jcmkOnRecv(const esp_now_recv_info_t* info,
   } else {
     if (type == JCMK_MSG_CORE_REPLY && !jcmkHaveCore && !jcmkCoreFoundPending) {
       memcpy(jcmkCoreMacPending, info->src_addr, 6);
+      jcmkCoreIsPigletPending = jcmkHasPigletMarker(data, len);
       jcmkCoreFoundPending = true;
+    } else if (type == JCMK_MSG_HEARTBEAT && jcmkHaveCore
+               && memcmp(info->src_addr, jcmkCoreMac, 6) == 0) {
+      // Core's periodic broadcast: liveness signal for timeout detection, and
+      // (for Piglet pairings) the shared timing anchor for slot scheduling.
+      jcmkCoreLastSeenMs = millis();
+      if (jcmkCoreIsPiglet) jcmkCycleEpochMs = millis();
     } else if (type == JCMK_MSG_ADMIN && len >= (int)sizeof(jcmk_admin_msg_t)) {
+      jcmkCoreLastSeenMs = millis();
+      if (jcmkCoreIsPiglet) jcmkCycleEpochMs = millis();
       const jcmk_admin_msg_t* adm = (const jcmk_admin_msg_t*)data;
       if (adm->assignment_version != jcmkAssignVer) {
         jcmkAssignVer = adm->assignment_version;
         jcmkStartIdx  = adm->start_channel_idx;
         jcmkEndIdx    = adm->end_channel_idx;
       }
+      // Transmit-slot fields are only meaningful when paired with a confirmed
+      // Piglet Core; refreshed every ADMIN regardless of assignment_version.
+      if (jcmkCoreIsPiglet) {
+        jcmkSlotIndex = adm->node_index;
+        jcmkSlotCount = (adm->node_count > 0) ? adm->node_count : 1;
+      }
     }
   }
 }
 
 // ---- Core mode helpers (main loop only) ----
-static void coreFindOrAddNode(const uint8_t* mac, bool isBiscuit) {
+static void coreFindOrAddNode(const uint8_t* mac, bool isBiscuit, bool isPiglet) {
   for (uint8_t i = 0; i < CORE_MAX_NODES; i++) {
     if (coreNodes[i].active && memcmp(coreNodes[i].mac, mac, 6) == 0) {
-      coreNodes[i].lastHbMs = millis(); return;
+      coreNodes[i].lastHbMs = millis();
+      if (isPiglet) coreNodes[i].isPiglet = true;  // never downgrade once confirmed
+      return;
     }
   }
   for (uint8_t i = 0; i < CORE_MAX_NODES; i++) {
     if (!coreNodes[i].active) {
       coreNodes[i].active = true; coreNodes[i].lastHbMs = millis();
       coreNodes[i].recordsRx = 0; coreNodes[i].isBiscuit = isBiscuit;
+      coreNodes[i].isPiglet = isPiglet; coreNodes[i].slotIndex = 0;
       memcpy(coreNodes[i].mac, mac, 6);
       coreNodeCount++; jcmkAddPeer(mac);
       // Re-send CORE_REPLY now that the peer is registered.
       coreSendReply(mac);
       Serial.printf("[CORE] New %s node %d: %02X:%02X:%02X:%02X:%02X:%02X\n",
-        isBiscuit ? "Biscuit" : "JCMK",
+        isPiglet ? "Piglet" : (isBiscuit ? "Biscuit" : "JCMK"),
         i, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
       return;
     }
@@ -2196,6 +2473,15 @@ static void coreReassignChannels() {
     startIdx += perNode;
   }
   coreAssignVer++;
+
+  // Assign deterministic transmit-slot indices among Piglet-confirmed nodes
+  // only -- JCMK/Biscuit nodes don't participate and are unaffected.
+  uint8_t pigletIdx = 0;
+  for (uint8_t n = 0; n < count; n++) {
+    if (coreNodes[slots[n]].isPiglet) coreNodes[slots[n]].slotIndex = pigletIdx++;
+  }
+  corePigletSlotCount = pigletIdx;
+
   for (uint8_t n = 0; n < count; n++) {
     uint8_t slot = slots[n];
     if (coreNodes[slot].isBiscuit) {
@@ -2204,15 +2490,21 @@ static void coreReassignChannels() {
                                    coreNodes[slot].endIdx);
     } else {
       jcmk_admin_msg_t msg; memcpy(msg.magic, JCMK_MAGIC, 4);
-      msg.type = JCMK_MSG_ADMIN; msg.node_count = count;
+      msg.type = JCMK_MSG_ADMIN;
       msg.assignment_version = coreAssignVer;
-      msg.node_index = n; msg.start_channel_idx = coreNodes[slot].startIdx;
+      msg.start_channel_idx = coreNodes[slot].startIdx;
       msg.end_channel_idx = coreNodes[slot].endIdx;
+      if (coreNodes[slot].isPiglet) {
+        msg.node_index = coreNodes[slot].slotIndex;
+        msg.node_count = corePigletSlotCount;
+      } else {
+        msg.node_index = n; msg.node_count = count;
+      }
       esp_now_send(coreNodes[slot].mac, (uint8_t*)&msg, sizeof(msg));
     }
     delay(10);
   }
-  Serial.printf("[CORE] Reassigned: %d nodes v%d\n", count, coreAssignVer);
+  Serial.printf("[CORE] Reassigned: %d nodes v%d (%d Piglet slots)\n", count, coreAssignVer, corePigletSlotCount);
 }
 
 // Re-send the current assignment to every node using its protocol.
@@ -2227,10 +2519,16 @@ static void coreResendAdminToAll() {
                                    coreNodes[i].endIdx);
     } else {
       jcmk_admin_msg_t msg; memcpy(msg.magic, JCMK_MAGIC, 4);
-      msg.type = JCMK_MSG_ADMIN; msg.node_count = coreNodeCount;
+      msg.type = JCMK_MSG_ADMIN;
       msg.assignment_version = coreAssignVer;
-      msg.node_index = n; msg.start_channel_idx = coreNodes[i].startIdx;
+      msg.start_channel_idx = coreNodes[i].startIdx;
       msg.end_channel_idx = coreNodes[i].endIdx;
+      if (coreNodes[i].isPiglet) {
+        msg.node_index = coreNodes[i].slotIndex;
+        msg.node_count = corePigletSlotCount;
+      } else {
+        msg.node_index = n; msg.node_count = coreNodeCount;
+      }
       esp_now_send(coreNodes[i].mac, (uint8_t*)&msg, sizeof(msg));
     }
     n++;
@@ -2283,6 +2581,7 @@ static void enterCoreMode() {
   esp_err_t err=esp_now_init();
   if (err!=ESP_OK) { Serial.printf("[CORE] init failed: %d\n",(int)err); return; }
   esp_now_register_recv_cb(jcmkOnRecv);
+  esp_now_register_send_cb(jcmkOnSent);
   delay(50); jcmkSetChannel(JCMK_ESPNOW_CH);
   { uint8_t pri; wifi_second_chan_t sec; esp_wifi_get_channel(&pri, &sec);
     Serial.printf("[CORE] Channel after set: %d (target=%d)%s\n", pri, JCMK_ESPNOW_CH,
@@ -2313,7 +2612,8 @@ static void coreModeTick() {
   uint32_t now=millis();
   while (coreReqHead!=coreReqTail) {
     uint8_t i=coreReqHead; coreReqHead=(coreReqHead+1)%CORE_REQ_QUEUE;
-    coreFindOrAddNode(coreReqBuf[i].mac, coreReqBuf[i].isBiscuit); coreReassignChannels();
+    coreFindOrAddNode(coreReqBuf[i].mac, coreReqBuf[i].isBiscuit, coreReqBuf[i].isPiglet);
+    coreReassignChannels();
   }
   while (coreTextHead!=coreTextTail) {
     uint8_t i=coreTextHead; coreTextHead=(coreTextHead+1)%CORE_TEXT_QUEUE;
@@ -2385,25 +2685,73 @@ static void nodeDoScanTick() {
 
   if (n > 0) {
     jcmkNetworksFound += (uint32_t)n;
-    // Return to ch 6 before any ESP-Now send (JCMK sendBroadcastStringPlain pattern).
-    // The scan left the radio on the scan channel; Core listens only on ch 6.
-    jcmkSetChannel(JCMK_ESPNOW_CH);
-    for (int i = 0; i < n; i++) {
-      String bssid = WiFi.BSSIDstr(i);
-      String ssid  = WiFi.SSID(i);
-      String auth  = authModeToString(WiFi.encryptionType(i));
-      int    ch    = WiFi.channel(i);
-      int    rssi  = WiFi.RSSI(i);
-      String line  = bssid + "," + ssid + "," + auth + ","
-                   + String(ch) + "," + String(rssi) + ",W";
-      jcmkSendText(line);
-      jcmkSentCount++;
+
+    if (!jcmkCoreIsPiglet) {
+      // Legacy immediate-send path: non-Piglet Core (real JCMK hardware or
+      // Biscuit Pro), or Core type not yet confirmed. Unchanged from before.
+      jcmkSetChannel(JCMK_ESPNOW_CH);
+      for (int i = 0; i < n; i++) {
+        String bssid = WiFi.BSSIDstr(i);
+        String ssid  = WiFi.SSID(i);
+        String auth  = authModeToString(WiFi.encryptionType(i));
+        int    ch    = WiFi.channel(i);
+        int    rssi  = WiFi.RSSI(i);
+        String line  = bssid + "," + ssid + "," + auth + ","
+                     + String(ch) + "," + String(rssi) + ",W";
+        jcmkSendText(line);
+        jcmkSentCount++;
+      }
+      ledPulseGreen();
+    } else {
+      // Piglet-to-Piglet: buffer results instead of sending immediately.
+      // Scanning keeps running at full pace, untouched by other nodes'
+      // schedules -- jcmkPigletSlotTick() flushes this buffer only during
+      // this node's own deterministic transmit slot.
+      for (int i = 0; i < n; i++) {
+        String bssid = WiFi.BSSIDstr(i);
+        String ssid  = WiFi.SSID(i);
+        String auth  = authModeToString(WiFi.encryptionType(i));
+        int    ch    = WiFi.channel(i);
+        int    rssi  = WiFi.RSSI(i);
+        String line  = bssid + "," + ssid + "," + auth + ","
+                     + String(ch) + "," + String(rssi) + ",W";
+        jcmkPendingPush(line);
+      }
     }
-    ledPulseGreen();
   }
   WiFi.scanDelete();
   nodeScanActive = false;
   nodeScanChOffset++;
+}
+
+// ================================================================
+//  Piglet-to-Piglet deterministic transmit-slot flush. Only ever active
+//  when jcmkCoreIsPiglet is true; otherwise a no-op, so non-Piglet
+//  pairings are completely unaffected. Never interrupts an in-flight
+//  scan (only runs in the natural gap between channel scans), so a
+//  node's own scanning loop is never slowed down by this.
+// ================================================================
+static void jcmkPigletSlotTick() {
+  if (!jcmkCoreIsPiglet) return;
+  if (nodeScanActive) return;      // never interrupt a live async scan
+  if (jcmkPendingEmpty()) return;
+
+  uint32_t slotCount = (jcmkSlotCount > 0) ? jcmkSlotCount : 1;
+  uint32_t cycleMs   = JCMK_SLOT_MS * slotCount;
+  uint32_t cyclePos  = (millis() - jcmkCycleEpochMs) % cycleMs;
+  uint32_t slotStart = (uint32_t)jcmkSlotIndex * JCMK_SLOT_MS;
+
+  if (cyclePos < slotStart || cyclePos >= slotStart + JCMK_SLOT_MS) return;  // not my turn yet
+
+  jcmkSetChannel(JCMK_ESPNOW_CH);
+  String line;
+  uint8_t sent = 0;
+  while (sent < 16 && jcmkPendingPop(line)) {
+    jcmkSendText(line);
+    jcmkSentCount++;
+    sent++;
+  }
+  ledPulseGreen();
 }
 
 // Enter mesh node mode — call on page 4 entry
@@ -2412,8 +2760,17 @@ static void enterNodeMode() {
   meshNodeActive        = false;
   jcmkHaveCore          = false;
   jcmkCoreFoundPending  = false;
+  jcmkCoreIsPigletPending = false;
+  jcmkCoreIsPiglet      = false;
+  jcmkSlotIndex         = 0;
+  jcmkSlotCount         = 1;
+  jcmkCycleEpochMs      = 0;
+  jcmkCoreLastSeenMs    = 0;
+  jcmkPendingHead       = 0;
+  jcmkPendingTail       = 0;
   jcmkNetworksFound     = 0;
   jcmkSentCount         = 0;
+  jcmkSendFailCount     = 0;
   jcmkHbCounter         = 0;
   jcmkLastHbMs          = 0;
   jcmkLastReqMs         = 0;
@@ -2445,6 +2802,7 @@ static void enterNodeMode() {
     return;
   }
   esp_now_register_recv_cb(jcmkOnRecv);
+  esp_now_register_send_cb(jcmkOnSent);
 
   delay(50);
   jcmkSetChannel(JCMK_ESPNOW_CH);
@@ -2495,12 +2853,34 @@ static void nodeModeTick() {
   if (jcmkCoreFoundPending) {
     jcmkCoreFoundPending = false;
     memcpy(jcmkCoreMac, jcmkCoreMacPending, 6);
-    jcmkHaveCore    = true;
-    jcmkReqInterval = JCMK_REQ_INIT_MS;
+    jcmkHaveCore       = true;
+    jcmkCoreIsPiglet   = jcmkCoreIsPigletPending;
+    jcmkCoreLastSeenMs = now;
+    jcmkCycleEpochMs   = now;
+    jcmkReqInterval    = JCMK_REQ_INIT_MS;
     jcmkAddPeer(jcmkCoreMac);
-    Serial.printf("[MESH] Core: %02X:%02X:%02X:%02X:%02X:%02X\n",
+    Serial.printf("[MESH] Core: %02X:%02X:%02X:%02X:%02X:%02X%s\n",
       jcmkCoreMac[0], jcmkCoreMac[1], jcmkCoreMac[2],
-      jcmkCoreMac[3], jcmkCoreMac[4], jcmkCoreMac[5]);
+      jcmkCoreMac[3], jcmkCoreMac[4], jcmkCoreMac[5],
+      jcmkCoreIsPiglet ? " (Piglet — slot scheduling active)" : "");
+  }
+
+  // Core-timeout detection: if the Core goes silent, stop scanning/sending
+  // into the void and return to actively searching for a (possibly new) Core.
+  if (jcmkHaveCore && (now - jcmkCoreLastSeenMs >= JCMK_CORE_TIMEOUT_MS)) {
+    Serial.println("[MESH] Core timed out — returning to search");
+    if (esp_now_is_peer_exist(jcmkCoreMac)) esp_now_del_peer(jcmkCoreMac);
+    jcmkHaveCore     = false;
+    jcmkCoreIsPiglet = false;
+    jcmkAssignVer    = 0;
+    jcmkStartIdx     = 0;
+    jcmkEndIdx       = JCMK_NUM_CHANNELS - 1;
+    jcmkSlotIndex    = 0;
+    jcmkSlotCount    = 1;
+    jcmkPendingHead  = jcmkPendingTail = 0;  // drop any buffered-but-unsent results
+    nodeScanActive   = false;
+    nodeScanAdminWin = false;
+    jcmkReqInterval  = JCMK_REQ_INIT_MS;
   }
 
   // CORE_REQUEST with backoff (only while radio is free)
@@ -2519,8 +2899,13 @@ static void nodeModeTick() {
     jcmkSendHeartbeat();
   }
 
-  // Per-channel async scan — runs continuously while connected to Core
-  if (jcmkHaveCore) nodeDoScanTick();
+  // Per-channel async scan — runs continuously while connected to Core.
+  // jcmkPigletSlotTick() only ever acts for confirmed-Piglet pairings, and
+  // only in the gap between scans, so it never affects scan timing itself.
+  if (jcmkHaveCore) {
+    jcmkPigletSlotTick();
+    nodeDoScanTick();
+  }
 }
 
 // ================================================================
@@ -2640,11 +3025,17 @@ static void drawPageMeshNode() {
     tft.fillRect(0, 77, W, 10, BLACK); tft.setCursor(2, 78);
     tft.print("Sent: "); tft.print(jcmkSentCount);
 
+    // "Sent" only means esp_now_send() was called; "Fail" reflects the
+    // actual delivery-status callback, so a healthy Sent count with a
+    // climbing Fail count means the radio itself is dropping the frames.
     tft.fillRect(0, 90, W, 10, BLACK); tft.setCursor(2, 91);
+    tft.print("Fail: "); tft.print(jcmkSendFailCount);
+
+    tft.fillRect(0, 103, W, 10, BLACK); tft.setCursor(2, 104);
     tft.print("ENOW ch: "); tft.print(JCMK_ESPNOW_CH);
 
     // Hold hint
-    tft.fillRect(0, 104, W, 10, BLACK); tft.setCursor(2, 105);
+    tft.fillRect(0, 117, W, 10, BLACK); tft.setCursor(2, 118);
     tft.setTextColor(0x4208, BLACK); tft.print("Hold btn = Core mode");
     tft.setTextColor(WHITE, BLACK);
   }
@@ -2676,8 +3067,16 @@ static bool initSD_SharedSPI() {
   digitalWrite(PINS.tft_cs, HIGH);
   delay(100);
 
-  const uint32_t freqs[] = { 100000, 200000, 400000, 1000000, 2000000, 4000000, 8000000 };
+  // Try fastest-first (descending), capped by cfg.sdMaxSpiHz, and stop at the
+  // first speed that mounts successfully. NOTE: this previously iterated
+  // ascending and returned on first success -- since low speeds almost
+  // always work, the card was effectively always pinned to 100 kHz and
+  // never got a chance to negotiate anywhere near its real capability.
+  uint32_t capHz = (cfg.sdMaxSpiHz > 0) ? cfg.sdMaxSpiHz : 20000000;
+  const uint32_t freqs[] = { 20000000, 16000000, 12000000, 8000000, 4000000, 2000000, 1000000, 400000, 200000, 100000 };
   for (size_t i = 0; i < sizeof(freqs)/sizeof(freqs[0]); i++) {
+    if (freqs[i] > capHz) continue;  // skip entries above the configured cap
+
     SD.end(); delay(20);
     Serial.printf("[SD] SD.begin(CS=%d) @ %lu Hz ... ", PINS.sd_cs, (unsigned long)freqs[i]);
     bool ok = SD.begin(PINS.sd_cs, SPI, freqs[i]);
@@ -2686,7 +3085,8 @@ static bool initSD_SharedSPI() {
     if (ok) {
       uint8_t type = SD.cardType();
       if (type == CARD_NONE) { SD.end(); continue; }
-      Serial.printf("[SD] cardType=%u, size=%llu MB\n", type, SD.cardSize() / (1024ULL * 1024ULL));
+      Serial.printf("[SD] Running at %lu Hz, cardType=%u, size=%llu MB\n",
+                    (unsigned long)freqs[i], type, SD.cardSize() / (1024ULL * 1024ULL));
       if (!SD.exists("/logs")) SD.mkdir("/logs");
       if (!SD.exists("/uploaded")) SD.mkdir("/uploaded");
       return true;
@@ -2922,9 +3322,12 @@ static void handleCleanup() {
       root.close();
     }
     for (const String& path : toDelete) {
-      if (!csvHasDataRows(path)) {
-        Serial.printf("[CLEANUP] Deleting empty CSV: %s\n", pathBasename(path).c_str());
-        SD.remove(path);
+      uint32_t sz = 0;
+      if (!csvHasDataRows(path, &sz)) {
+        Serial.printf("[CLEANUP] Empty CSV (%u bytes), deleting: %s\n", (unsigned)sz, pathBasename(path).c_str());
+        if (!SD.remove(path)) {
+          Serial.printf("[CLEANUP] WARNING: SD.remove failed for %s -- file left in place\n", pathBasename(path).c_str());
+        }
       }
     }
   }
@@ -3255,6 +3658,10 @@ static void processScanResults(int n) {
 
   uint32_t wrote = 0;
   for (int i = 0; i < n; i++) {
+    // Periodic cooperative yield so a large batch (dense-area scan) doesn't
+    // monopolize the CPU between appendWigleRow()'s own flush-triggered yields.
+    if ((i & 0x0F) == 15) yield();
+
     int ch = WiFi.channel(i);
     bool chUnknown = (ch == 0);
     bool is2g = (ch >= 1 && ch <= 14) || chUnknown;
@@ -3590,8 +3997,13 @@ void setup() {
         }
         root.close();
       }
-      for (const String& path : toDelete)
-        if (!csvHasDataRows(path)) { Serial.printf("[CLEANUP] Deleting: %s\n", pathBasename(path).c_str()); SD.remove(path); }
+      for (const String& path : toDelete) {
+        uint32_t sz = 0;
+        if (!csvHasDataRows(path, &sz)) {
+          Serial.printf("[CLEANUP] Empty CSV (%u bytes), deleting: %s\n", (unsigned)sz, pathBasename(path).c_str());
+          if (!SD.remove(path)) Serial.printf("[CLEANUP] WARNING: SD.remove failed for %s -- file left in place\n", pathBasename(path).c_str());
+        }
+      }
     }
   }
 

@@ -51,14 +51,72 @@ bool isAllowedDataPath(const String& p) {
   return p.startsWith("/logs/") || p.startsWith("/uploaded/");
 }
 
+// ---- SD clock negotiation ----
+// Tries a descending list of SPI clock speeds (fastest first, capped by
+// cfg.sdMaxSpiHz) and returns as soon as one mounts successfully, so the
+// card runs as fast as the wiring/card actually supports instead of being
+// pinned to a conservative fixed speed.
+bool sdBeginBestClock(uint8_t csPin) {
+  static const uint32_t kLadder[] = {
+    20000000, 16000000, 12000000, 8000000, 4000000, 1000000
+  };
+  uint32_t capHz = (cfg.sdMaxSpiHz > 0) ? cfg.sdMaxSpiHz : 20000000;
+
+  for (size_t i = 0; i < sizeof(kLadder) / sizeof(kLadder[0]); i++) {
+    uint32_t hz = kLadder[i];
+    if (hz > capHz) continue;  // skip entries above the configured cap
+
+    if (SD.begin(csPin, SPI, hz)) {
+      Serial.printf("[SD] Running at %lu Hz\n", (unsigned long)hz);
+      return true;
+    }
+    SD.end();
+  }
+
+  // Last-resort attempt at the cap's own value in case it doesn't match a
+  // ladder rung exactly (e.g. a user set sdMaxSpiHz=25000000).
+  if (capHz > 0 && SD.begin(csPin, SPI, capHz)) {
+    Serial.printf("[SD] Running at %lu Hz\n", (unsigned long)capHz);
+    return true;
+  }
+
+  return false;
+}
+
+// ---- SD bus recovery ----
+// After sustained heavy SD I/O (large batch uploads at high SPI clock), the
+// SD/SPI bus can wedge, causing SD.exists()/SD.open() to fail even though
+// the underlying file is intact on the card. A full unmount + remount at
+// the negotiated best clock usually clears it. Rate-limited so a genuinely
+// dead card doesn't get hammered with a remount attempt on every file.
+static uint32_t sdLastRecoverMs = 0;
+bool sdTryRecover() {
+  uint32_t now = millis();
+  if (now - sdLastRecoverMs < 4000) return false;
+  sdLastRecoverMs = now;
+
+  Serial.println("[SD] Attempting SD bus recovery (SD.end + reinit)...");
+  SD.end();
+  delay(50);
+  bool ok = sdBeginBestClock(pins.sd_cs);
+  sdOk = ok;
+  Serial.printf("[SD] Recovery %s\n", ok ? "OK" : "FAILED");
+  return ok;
+}
+
 // ---- Move to uploaded ----
 
 bool moveToUploaded(const String& srcPath) {
   if (!sdOk) return false;
   if (!SD.exists(srcPath)) {
-    Serial.print("[SD] moveToUploaded: source missing: ");
+    Serial.print("[SD] moveToUploaded: source missing, attempting recovery: ");
     Serial.println(srcPath);
-    return false;
+    if (!sdTryRecover() || !SD.exists(srcPath)) {
+      Serial.print("[SD] moveToUploaded: source missing: ");
+      Serial.println(srcPath);
+      return false;
+    }
+    Serial.println("[SD] moveToUploaded: SD recovered, source found");
   }
 
   // Ensure folder exists
@@ -231,6 +289,27 @@ void closeLogFile() {
   }
 }
 
+// Copy `in` into fixed buffer `out` (size outSize), doubling any embedded
+// double-quote characters per CSV escaping rules (RFC4180-style). Truncates
+// safely rather than overflowing if the (unexpectedly long/malformed) input
+// wouldn't fit.
+static void csvEscapeQuotes(const String& in, char* out, size_t outSize) {
+  size_t o = 0;
+  size_t n = in.length();
+  for (size_t i = 0; i < n; i++) {
+    char c = in[i];
+    if (c == '"') {
+      if (o + 2 >= outSize) break;  // no room left for the doubled quote
+      out[o++] = '"';
+      out[o++] = '"';
+    } else {
+      if (o + 1 >= outSize) break;
+      out[o++] = c;
+    }
+  }
+  out[o] = '\0';
+}
+
 void appendWigleRow(const String& mac, const String& ssid, const String& auth,
                     const String& firstSeen, int channel, int rssi,
                     double lat, double lon, double altM, double accM) {
@@ -243,28 +322,32 @@ void appendWigleRow(const String& mac, const String& ssid, const String& auth,
     if (!openLogFile()) return;
   }
 
-  String safeSsid = ssid;
-  safeSsid.replace("\"", "\"\"");
-
-  String line;
-  line.reserve(256);
-  line += mac; line += ",";
-  line += "\""; line += safeSsid; line += "\",";
-  line += auth; line += ",";
-  line += firstSeen; line += ",";
-  line += String(channel); line += ",";
   // Frequency in MHz derived from channel number (WiGLE 1.6 requirement)
   uint32_t freq = 0;
   if      (channel >= 1  && channel <= 13) freq = 2407u + (uint32_t)channel * 5;
   else if (channel == 14)                  freq = 2484u;
   else if (channel >= 32)                  freq = 5000u + (uint32_t)channel * 5;
-  line += String(freq); line += ",";
-  line += String(rssi); line += ",";
-  line += String(lat, 6); line += ",";
-  line += String(lon, 6); line += ",";
-  line += String(altM, 1); line += ",";
-  line += String(accM, 1); line += ",";
-  line += ",,WIFI"; // RCOIs (empty), MfgrId (empty), Type
+
+  // Build the row into fixed stack buffers instead of chaining Arduino
+  // String concatenation (each `+=` above used to allocate/copy/free on the
+  // heap). This runs once per scan result and can fire hundreds of times
+  // per batch in dense areas, so per-row heap churn adds up fast.
+  char safeSsid[70];  // SSID is at most 32 bytes; worst case (all quotes) doubles to 64
+  csvEscapeQuotes(ssid, safeSsid, sizeof(safeSsid));
+
+  char line[256];
+  int len = snprintf(line, sizeof(line),
+                      "%s,\"%s\",%s,%s,%d,%u,%d,%.6f,%.6f,%.1f,%.1f,,,WIFI",
+                      mac.c_str(), safeSsid, auth.c_str(), firstSeen.c_str(),
+                      channel, (unsigned)freq, rssi, lat, lon, altM, accM);
+  if (len < 0) {
+    Serial.println("[SD] appendWigleRow: encoding error, row skipped");
+    return;
+  }
+  if ((size_t)len >= sizeof(line)) {
+    Serial.printf("[SD] appendWigleRow: row truncated (needed %d bytes, buffer %u) — check SSID\n",
+                  len, (unsigned)sizeof(line));
+  }
 
   size_t written = logFile.println(line);
   csvRowCount++;
@@ -272,7 +355,7 @@ void appendWigleRow(const String& mac, const String& ssid, const String& auth,
   // Detect silent write failure — if println() returns 0 for a non-empty line,
   // the SD card or file handle is broken. Attempt to reopen the log file once;
   // if that also fails, mark SD as unusable until next boot.
-  if (written == 0 && line.length() > 0) {
+  if (written == 0 && len > 0) {
     static uint8_t consecFails = 0;
     consecFails++;
     Serial.printf("[SD] Write failed (%u consecutive)\n", consecFails);
@@ -291,15 +374,19 @@ void appendWigleRow(const String& mac, const String& ssid, const String& auth,
     return;
   }
 
-  // Flush less often to avoid stalls (SD writes can block hard)
+  // Flush less often to avoid stalls (SD writes can block hard). Threshold
+  // tightened from 25 to 16 lines so large batches get broken into smaller
+  // chunks; yield() after each flush gives WiFi/GPS/web-server/watchdog a
+  // chance to run between chunks instead of only after the whole batch.
   static uint32_t lastFlushMs = 0;
   static uint32_t linesSinceFlush = 0;
 
   linesSinceFlush++;
 
   uint32_t nowMs = millis();
-  if (linesSinceFlush >= 25 || (nowMs - lastFlushMs) >= 2000) {
+  if (linesSinceFlush >= 16 || (nowMs - lastFlushMs) >= 2000) {
     logFile.flush();
+    yield();
     lastFlushMs = nowMs;
     linesSinceFlush = 0;
   }
