@@ -85,8 +85,8 @@ imports every finished drive. No card reader, no Wi-Fi.
 | Host → Piglet | Piglet → host |
 |---|---|
 | `@PIGLET HELLO` | `@PH <fw> <chip> <mac> sd=<0\|1>` |
-| `@PIGLET LIST` | `@PL BEGIN`, `@PL F <path>\t<size>\t<active 0\|1>` per CSV in `/logs` and `/uploaded`, `@PL END <count>` |
-| `@PIGLET GET <path> [offset]` | `@PG BEGIN <path> <size> <offset>`, `@PG D <seq> <crc32> <base64 of 144 bytes>` …, `@PG END <path> <size> <sent>`, or `@PG ERR <reason>` |
+| `@PIGLET LIST` | `@PL BEGIN`, `@PL F <path>\t<size>\t<active 0\|1>\t<mtime>` per CSV in `/logs` and `/uploaded` (`mtime`: v2.61+), `@PL END <count>` |
+| `@PIGLET GET <path> [offset]` | `@PG BEGIN <path> <size> <offset>`, `@PG D <seq> <crc32> <base64 of 144 bytes>` …, `@PG END <path> <size> <sent>`, or `@PG ERR <reason>` (`read-error <offset>`: the SD card couldn't read that spot) |
 
 - **Read-only:** only `/logs/*.csv` and `/uploaded/*.csv` are served.
 - **Integrity:** every data line carries its own CRC32, and `offset` (a multiple

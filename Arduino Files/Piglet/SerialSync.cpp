@@ -67,7 +67,11 @@ static void cmdList() {
           String path = normalizeSdPath(dir, f.name());
           if (path.endsWith(".csv") || path.endsWith(".CSV")) {
             bool active = (path == currentCsvPath);
-            sendLine("@PL F " + path + "\t" + String((uint32_t)f.size()) + "\t" + (active ? "1" : "0"));
+            // 4th field: last-write time (epoch, 0 if unknown). Piglet sets
+            // its clock from GPS, so a finished drive carries a real time and
+            // hosts can fetch the newest drives first.
+            sendLine("@PL F " + path + "\t" + String((uint32_t)f.size()) + "\t" +
+                     (active ? "1" : "0") + "\t" + String((uint32_t)f.getLastWrite()));
             count++;
           }
         }
@@ -104,9 +108,10 @@ static void cmdGet(const String& path, uint32_t offset) {
   uint8_t buf[CHUNK];
   uint32_t sent = offset, seq = offset / CHUNK;
   bool aborted = false;
+  bool readError = false;
   while (true) {
     int n = f.read(buf, CHUNK);
-    if (n <= 0) break;
+    if (n <= 0) { readError = (sent < size); break; }
     char crc[10];
     snprintf(crc, sizeof(crc), "%08lX", (unsigned long)crc32Update(0, buf, (size_t)n));
     String line = "@PG D " + String(seq++) + " " + crc + " " + base64::encode(buf, (size_t)n);
@@ -116,7 +121,8 @@ static void cmdGet(const String& path, uint32_t offset) {
     if ((seq & 15) == 0) delay(1);    // let the idle task / WDT breathe
   }
   f.close();
-  if (!aborted) sendLine("@PG END " + path + " " + String(size) + " " + String(sent));
+  if (readError)     sendLine("@PG ERR read-error " + String(sent));   // bad SD sector: retrying won't help
+  else if (!aborted) sendLine("@PG END " + path + " " + String(size) + " " + String(sent));
   esp_log_level_set("*", prevLevel);
 }
 

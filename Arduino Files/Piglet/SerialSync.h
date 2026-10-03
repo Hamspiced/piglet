@@ -9,12 +9,12 @@
 // Protocol (host -> Piglet, one line each, '\n' terminated):
 //   @PIGLET HELLO           -> @PH <fw> <chip> <mac> sd=<0|1>
 //   @PIGLET LIST            -> @PL BEGIN
-//                              @PL F <path>\t<size>\t<active 0|1>   (per CSV)
+//                              @PL F <path>\t<size>\t<active 0|1>\t<mtime epoch>
 //                              @PL END <count>
 //   @PIGLET GET <path> [off] -> @PG BEGIN <path> <size> <off>
 //                              @PG D <seq> <crc32 hex> <base64 of up to 144 bytes>
 //                              @PG END <path> <size> <bytes sent through>
-//                              (or @PG ERR <reason>)
+//                              (or @PG ERR <reason>; `read-error <off>` = SD read failed)
 //   `off` resumes a transfer (multiple of 144); every data line carries its
 //   own CRC32 so a host can detect a damaged chunk and resume right there.
 // Only /logs/*.csv and /uploaded/*.csv are served (read-only). Other output
