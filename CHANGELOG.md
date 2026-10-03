@@ -1,5 +1,17 @@
 # Changelog
 
+## v2.60 (2026-10-03)
+
+### New Features
+- **USB serial file sync** — a host can list and download the SD-card CSV logs over the USB port (`@PIGLET HELLO` / `LIST` / `GET <path> [offset]`), so a solo drive can be imported by just plugging Piglet in (e.g. into Ragnar). Read-only, limited to `/logs` and `/uploaded`; each 144-byte chunk is base64 with its own CRC32, and transfers resume at an offset. See README "USB Serial File Sync".
+
+### Technical Changes
+- New `SerialSync.cpp/.h`, polled at the top of `loop()` (covers normal, Core and mesh-node modes).
+- Data lines are sized to fit the 256-byte HW CDC TX buffer on the C3/C5/C6; ESP-IDF logging is muted while serving a file.
+- The device id in `@PH` is the Wi-Fi STA MAC (`esp_read_mac`), because `ESP.getEfuseMac()` is a 64-bit EUI on the C5/C6.
+
+---
+
 ## v2.59 (2026-09-14)
 
 ### Bug Fixes

@@ -75,6 +75,31 @@ Set `meshModeOnBoot` in `/wardriver.cfg` to automatically enter mesh mode after 
 When `core` or `node` is set the SoftAP window is **skipped entirely** (ESP-Now owns the WiFi stack and the AP would be non-functional). The device goes straight from boot uploads to the mesh page. Set via the web UI **Mesh Mode On Boot** dropdown or directly in `/wardriver.cfg`.
 
 
+## USB Serial File Sync (v2.60+)
+
+The main Piglet firmware lets a host pull the CSV logs off the SD card over the
+**same USB port** it uses for the live stream. Plug Piglet into a host such as
+[Ragnar](https://github.com/PierreGode/Ragnar) after a solo drive, and the host
+imports every finished drive. No card reader, no Wi-Fi.
+
+| Host → Piglet | Piglet → host |
+|---|---|
+| `@PIGLET HELLO` | `@PH <fw> <chip> <mac> sd=<0\|1>` |
+| `@PIGLET LIST` | `@PL BEGIN`, `@PL F <path>\t<size>\t<active 0\|1>` per CSV in `/logs` and `/uploaded`, `@PL END <count>` |
+| `@PIGLET GET <path> [offset]` | `@PG BEGIN <path> <size> <offset>`, `@PG D <seq> <crc32> <base64 of 144 bytes>` …, `@PG END <path> <size> <sent>`, or `@PG ERR <reason>` |
+
+- **Read-only:** only `/logs/*.csv` and `/uploaded/*.csv` are served.
+- **Integrity:** every data line carries its own CRC32, and `offset` (a multiple
+  of 144) resumes an interrupted transfer.
+- **Clean output:** ESP-IDF logging is muted while a file is served, so driver
+  log lines can't land inside data lines.
+- **Mixed output:** other output (boot log, the live CSV mirror) can appear
+  between protocol lines; hosts match the `@P` prefixes.
+- **Speed:** about 140 KiB/s on an ESP32-C5. Scanning pauses while a file is
+  being sent.
+
+Implemented in `Arduino Files/Piglet/SerialSync.cpp` and polled from `loop()`.
+
 ## PigletNode — Standalone Mesh Node
 
 A minimal, standalone firmware for the **Seeed XIAO ESP32-C5** in the `PigletNode/` folder. No display, GPS, or SD card required — flash it and it automatically pairs with any Piglet running in Core mode and begins scanning.
