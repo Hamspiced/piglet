@@ -35,6 +35,7 @@
 #include "WigleUpload.h"
 #include "WebUI.h"
 #include "MeshNode.h"
+#include "SerialSync.h"
 
 // -------- Battery Test (uncomment to enable) --------
 #include "battery_test.h"
@@ -568,6 +569,9 @@ void setup() {
 //  loop()
 // ================================================================
 void loop() {
+  // USB serial file sync (a host pulls the SD CSV logs, e.g. after a solo drive)
+  serialSyncPoll();
+
   // Web server
   server.handleClient();
 

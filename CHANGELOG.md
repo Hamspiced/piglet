@@ -1,5 +1,22 @@
 # Changelog
 
+## v2.63 (2026-10-04)
+
+### New Features
+- **USB serial file sync** — a host can list and download the SD-card CSV logs over the USB serial port, so a solo drive can be imported by plugging Piglet into a computer or a companion device (e.g. [Ragnar](https://github.com/PierreGode/Ragnar)) without a card reader or Wi-Fi. Commands: `@PIGLET HELLO`, `@PIGLET LIST`, `@PIGLET GET <path> [offset]`. See README "USB Serial File Sync".
+  - Read-only, limited to `/logs/*.csv` and `/uploaded/*.csv`.
+  - Each 144-byte chunk is sent as base64 with its own CRC32, and transfers resume at an offset after a damaged chunk or a stall.
+  - `LIST` reports each file's size, whether it is the file being written right now, and its last-write time (real once the clock is set from GPS), so hosts can fetch the newest drive first.
+  - An SD read failure is reported as `@PG ERR read-error <offset>` instead of ending the transfer early.
+  - `HELLO` reports firmware, chip, Wi-Fi MAC, the last reset reason and uptime, and whether the SD card is ready.
+
+### Technical Changes
+- New `SerialSync.cpp/.h`, polled at the top of `loop()` (normal, Core and mesh-node modes). It does nothing unless a command arrives.
+- Data lines are sized to fit the 256-byte HW CDC TX buffer on the C3/C5/C6, and ESP-IDF logging is muted while a file is served, so Wi-Fi driver log lines can't land inside a data line.
+- The device id is the Wi-Fi STA MAC (`esp_read_mac`), because `ESP.getEfuseMac()` returns a 64-bit EUI on the C5/C6.
+
+---
+
 ## v2.62 (2026-09-28)
 
 ### Upload Speed
