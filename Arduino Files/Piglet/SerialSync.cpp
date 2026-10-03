@@ -49,8 +49,12 @@ static String macString() {
 }
 
 static void cmdHello() {
+  // rst/up: why and how long ago this Piglet last booted, so a host can tell
+  // a crash or watchdog reset during a transfer (4 panic, 5/6/7 watchdogs)
+  // from a plain power-on (1). Kept before sd= for older hosts' parsing.
   sendLine(String("@PH ") + FIRMWARE_VERSION + " " + ESP.getChipModel() + " " +
-           macString() + " sd=" + (sdOk ? "1" : "0"));
+           macString() + " rst=" + String((int)esp_reset_reason()) +
+           " up=" + String(millis() / 1000) + " sd=" + (sdOk ? "1" : "0"));
 }
 
 static void cmdList() {

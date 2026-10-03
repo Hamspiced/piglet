@@ -4,6 +4,7 @@
 
 ### Improvements
 - **USB serial file sync:** `@PL F` lines now end with each file's last-write time (epoch), so hosts can fetch the newest drive first. Piglet sets its clock from GPS, so finished drives carry real times.
+- **USB serial file sync:** `@PH` now reports `rst=<esp_reset_reason>` and `up=<seconds>` (before `sd=`, so older hosts still parse it), so a host can tell a crash or watchdog reset during a transfer from a power-on.
 - **USB serial file sync:** a failed SD read during `GET` is reported as `@PG ERR read-error <offset>` instead of ending the reply early, so hosts stop at once rather than resuming the same bad spot.
 
 ---

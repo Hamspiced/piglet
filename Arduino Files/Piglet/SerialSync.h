@@ -7,7 +7,7 @@
 // command is being served.
 //
 // Protocol (host -> Piglet, one line each, '\n' terminated):
-//   @PIGLET HELLO           -> @PH <fw> <chip> <mac> sd=<0|1>
+//   @PIGLET HELLO           -> @PH <fw> <chip> <mac> rst=<reset reason> up=<s> sd=<0|1>
 //   @PIGLET LIST            -> @PL BEGIN
 //                              @PL F <path>\t<size>\t<active 0|1>\t<mtime epoch>
 //                              @PL END <count>
