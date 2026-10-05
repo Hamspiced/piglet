@@ -2123,6 +2123,9 @@ static uint32_t nodeScanAdminMs  = 0;
 static volatile bool  jcmkCoreFoundPending    = false;
 static uint8_t        jcmkCoreMacPending[6]   = {0};
 static volatile bool  jcmkCoreIsPigletPending = false;
+static volatile bool  biscuitPlainReplyPending = false;
+static uint8_t biscuitChannels[JCMK_NUM_CHANNELS + 2];
+static volatile uint8_t biscuitChannelCount = 0;
 
 // Piglet-to-Piglet transmit-slot state (only meaningful when jcmkCoreIsPiglet)
 static bool     jcmkCoreIsPiglet   = false;
@@ -2269,6 +2272,18 @@ static void jcmkSendText(const String& s) {
   esp_now_send(jcmkCoreMac, (uint8_t*)&msg, sizeof(msg));
 }
 
+static void biscuitSendControl(uint8_t type, uint32_t counter = 0, const char* text = nullptr) {
+  jcmk_text_msg_t msg = {};
+  memcpy(msg.magic, JCMK_MAGIC, 4);
+  msg.type = type;
+  msg.counter = counter;
+  if (text) {
+    msg.len = strlen(text);
+    memcpy(msg.text, text, msg.len);
+  }
+  esp_now_send(jcmkCoreMac, (uint8_t*)&msg, sizeof(msg));
+}
+
 // True if a received jcmk_text_msg_t carries the Piglet identification marker.
 // `len` is the raw ESP-Now payload length (as delivered to the recv callback).
 static bool jcmkHasPigletMarker(const void* data, int len) {
@@ -2276,6 +2291,50 @@ static bool jcmkHasPigletMarker(const void* data, int len) {
   const jcmk_text_msg_t* tm = (const jcmk_text_msg_t*)data;
   if (tm->len < PIGLET_MARKER_LEN) return false;
   return memcmp(tm->text, PIGLET_MARKER, PIGLET_MARKER_LEN) == 0;
+}
+
+static bool biscuitHasPlainReply(const void* data, int len) {
+  if (len < (int)sizeof(jcmk_text_msg_t)) return false;
+  const jcmk_text_msg_t* msg = (const jcmk_text_msg_t*)data;
+  size_t n = msg->len < JCMK_TEXT_MAX ? msg->len : JCMK_TEXT_MAX;
+  for (size_t i = 0; i + 9 <= n; i++) {
+    if (memcmp(msg->text + i, "encrypt=0", 9) == 0) return true;
+  }
+  return false;
+}
+
+static void biscuitSetChannels(const jcmk_text_msg_t* msg) {
+  if (msg->len < 9 || msg->len > JCMK_TEXT_MAX || memcmp(msg->text, "channels=", 9)) {
+    biscuitChannelCount = 0;
+    return;
+  }
+  char text[JCMK_TEXT_MAX + 1];
+  memcpy(text, msg->text, msg->len);
+  text[msg->len] = '\0';
+  char* end = strchr(text, ';');
+  if (end) *end = '\0';
+  uint8_t channels[JCMK_NUM_CHANNELS + 2];
+  uint8_t count = 0;
+  for (char* token = text + 9; *token && count < JCMK_NUM_CHANNELS + 2;) {
+    char* next;
+    long channel = strtol(token, &next, 10);
+    if (next == token || channel < 1 || channel > 255 || (*next && *next != ',')) {
+      count = 0;
+      break;
+    }
+    if (channel == 104 || channel == 108) {
+      channels[count++] = (uint8_t)channel;
+    } else {
+      for (uint8_t i = 0; i < JCMK_NUM_CHANNELS; i++) {
+        if (JCMK_CHANNELS[i] == channel) { channels[count++] = (uint8_t)channel; break; }
+      }
+    }
+    if (!*next) break;
+    token = next + 1;
+  }
+  memcpy(biscuitChannels, channels, count);
+  biscuitChannelCount = count;
+  nodeScanChOffset = 0;
 }
 
 // ---- Core forward decls (used inside jcmkOnRecv callback) ----
@@ -2410,6 +2469,7 @@ static void jcmkOnRecv(const esp_now_recv_info_t* info,
     if (type == JCMK_MSG_CORE_REPLY && !jcmkHaveCore && !jcmkCoreFoundPending) {
       memcpy(jcmkCoreMacPending, info->src_addr, 6);
       jcmkCoreIsPigletPending = jcmkHasPigletMarker(data, len);
+      biscuitPlainReplyPending = biscuitHasPlainReply(data, len);
       jcmkCoreFoundPending = true;
     } else if (type == JCMK_MSG_HEARTBEAT && jcmkHaveCore
                && memcmp(info->src_addr, jcmkCoreMac, 6) == 0) {
@@ -2417,6 +2477,16 @@ static void jcmkOnRecv(const esp_now_recv_info_t* info,
       // (for Piglet pairings) the shared timing anchor for slot scheduling.
       jcmkCoreLastSeenMs = millis();
       if (jcmkCoreIsPiglet) jcmkCycleEpochMs = millis();
+    } else if (jcmkHaveCore && memcmp(info->src_addr, jcmkCoreMac, 6) == 0
+               && len >= (int)sizeof(jcmk_text_msg_t) && type == JCMK_MSG_ADMIN) {
+      const jcmk_text_msg_t* msg = (const jcmk_text_msg_t*)data;
+      jcmkCoreLastSeenMs = millis();
+      biscuitSendControl(15, msg->len ? (uint8_t)msg->text[0] : msg->counter & 0xFF);
+    } else if (jcmkHaveCore && memcmp(info->src_addr, jcmkCoreMac, 6) == 0
+               && len >= (int)sizeof(jcmk_text_msg_t) && type == 10) {
+      jcmkCoreLastSeenMs = millis();
+      if (biscuitPlainReplyPending) biscuitSetChannels((const jcmk_text_msg_t*)data);
+      biscuitSendControl(11);
     } else if (type == JCMK_MSG_ADMIN && len >= (int)sizeof(jcmk_admin_msg_t)) {
       jcmkCoreLastSeenMs = millis();
       if (jcmkCoreIsPiglet) jcmkCycleEpochMs = millis();
@@ -2640,8 +2710,8 @@ static void coreModeTick() {
 //  window (heartbeat + NODE_ADMIN_WIN_MS) before the next cycle.
 // ================================================================
 static void nodeDoScanTick() {
-  uint8_t numCh = (jcmkEndIdx >= jcmkStartIdx)
-                ? (jcmkEndIdx - jcmkStartIdx + 1) : 0;
+  uint8_t numCh = biscuitChannelCount ? biscuitChannelCount :
+                  ((jcmkEndIdx >= jcmkStartIdx) ? (jcmkEndIdx - jcmkStartIdx + 1) : 0);
   if (numCh == 0) return;
 
   // Admin window: radio is on ch 6, heartbeat already sent, just waiting
@@ -2665,8 +2735,8 @@ static void nodeDoScanTick() {
     }
 
     uint8_t chIdx = jcmkStartIdx + nodeScanChOffset;
-    if (chIdx >= JCMK_NUM_CHANNELS) { nodeScanChOffset++; return; }
-    uint8_t channel = JCMK_CHANNELS[chIdx];
+    if (!biscuitChannelCount && chIdx >= JCMK_NUM_CHANNELS) { nodeScanChOffset++; return; }
+    uint8_t channel = biscuitChannelCount ? biscuitChannels[nodeScanChOffset] : JCMK_CHANNELS[chIdx];
 
     // Async scan of this single channel only (no blocking)
     int16_t rc = WiFi.scanNetworks(/*async*/true, /*hidden*/true,
@@ -2694,6 +2764,17 @@ static void nodeDoScanTick() {
         String bssid = WiFi.BSSIDstr(i);
         String ssid  = WiFi.SSID(i);
         String auth  = authModeToString(WiFi.encryptionType(i));
+        if (biscuitPlainReplyPending) {
+          if (auth == "OPEN") auth = "[OPEN]";
+          else if (auth == "WEP") auth = "[WEP]";
+          else if (auth == "WPA") auth = "[WPA_PSK]";
+          else if (auth == "WPA2") auth = "[WPA2_PSK]";
+          else if (auth == "WPA3") auth = "[WPA3_PSK]";
+          else if (auth == "WPAWPA2") auth = "[WPA_WPA2_PSK]";
+          else if (auth == "WPA2EAP") auth = "[WPA2_ENTERPRISE]";
+          else if (auth == "WPA2WPA3") auth = "[WPA2_WPA3_PSK]";
+          else auth = "[UNDEFINED]";
+        }
         int    ch    = WiFi.channel(i);
         int    rssi  = WiFi.RSSI(i);
         String line  = bssid + "," + ssid + "," + auth + ","
@@ -2781,6 +2862,7 @@ static void enterNodeMode() {
   nodeScanActive        = false;
   nodeScanChOffset      = 0;
   nodeScanAdminWin      = false;
+  biscuitChannelCount   = 0;
 
   // Mesh mode owns the WiFi stack — prevent stopAPIfAllowed() from firing
   // WiFi.disconnect(true,true) after esp_now_init() would kill the ESP-Now driver.
@@ -2859,6 +2941,12 @@ static void nodeModeTick() {
     jcmkCycleEpochMs   = now;
     jcmkReqInterval    = JCMK_REQ_INIT_MS;
     jcmkAddPeer(jcmkCoreMac);
+    if (biscuitPlainReplyPending) {
+      jcmkSetChannel(JCMK_ESPNOW_CH);
+      biscuitSendControl(7, 0, "Piglet:" FIRMWARE_VERSION);
+      nodeScanAdminWin = true;
+      nodeScanAdminMs = now;
+    }
     Serial.printf("[MESH] Core: %02X:%02X:%02X:%02X:%02X:%02X%s\n",
       jcmkCoreMac[0], jcmkCoreMac[1], jcmkCoreMac[2],
       jcmkCoreMac[3], jcmkCoreMac[4], jcmkCoreMac[5],
@@ -2880,6 +2968,7 @@ static void nodeModeTick() {
     jcmkPendingHead  = jcmkPendingTail = 0;  // drop any buffered-but-unsent results
     nodeScanActive   = false;
     nodeScanAdminWin = false;
+    biscuitChannelCount = 0;
     jcmkReqInterval  = JCMK_REQ_INIT_MS;
   }
 

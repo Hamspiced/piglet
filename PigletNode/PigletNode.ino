@@ -94,6 +94,7 @@ static const uint8_t NUM_CHANNELS = (uint8_t)(sizeof(CHANNELS));
 // ================================================================
 static bool     nodeActive    = false;
 static bool     haveCore      = false;
+static bool     plainBiscuit  = false;
 static uint8_t  coreMac[6]   = {0};
 static uint8_t  startIdx      = 0;
 static uint8_t  endIdx        = NUM_CHANNELS - 1;  // default = all channels
@@ -115,6 +116,9 @@ static uint32_t scanAdminMs   = 0;
 // Pending core-found event (set from ESP-Now callback, consumed in loop)
 static volatile bool coreFoundPending  = false;
 static uint8_t       coreMacPending[6] = {0};
+static volatile bool plainBiscuitPending = false;
+static uint8_t biscuitChannels[NUM_CHANNELS + 2];
+static volatile uint8_t biscuitChannelCount = 0;
 
 // ================================================================
 //  LED
@@ -167,7 +171,7 @@ static void sendHeartbeat() {
   memcpy(msg.magic, JCMK_MAGIC, 4);
   msg.type    = MSG_HEARTBEAT;
   msg.counter = ++hbCounter;
-  esp_now_send(JCMK_BCAST, (uint8_t*)&msg, sizeof(msg));
+  esp_now_send(plainBiscuit ? coreMac : JCMK_BCAST, (uint8_t*)&msg, sizeof(msg));
 }
 
 static void sendText(const String& s) {
@@ -180,7 +184,63 @@ static void sendText(const String& s) {
   memcpy(msg.text, s.c_str(), slen);
   msg.text[slen] = '\0';
   // Always full struct size — Biscuit Pro drops packets < 212 bytes.
-  esp_now_send(JCMK_BCAST, (uint8_t*)&msg, sizeof(msg));
+  esp_now_send(plainBiscuit ? coreMac : JCMK_BCAST, (uint8_t*)&msg, sizeof(msg));
+}
+
+static void sendControl(uint8_t type, uint32_t counter = 0, const char* text = nullptr) {
+  jcmk_text_msg_t msg = {};
+  memcpy(msg.magic, JCMK_MAGIC, 4);
+  msg.type = type;
+  msg.counter = counter;
+  if (text) {
+    msg.len = strlen(text);
+    memcpy(msg.text, text, msg.len);
+  }
+  esp_now_send(coreMac, (uint8_t*)&msg, sizeof(msg));
+}
+
+static bool hasPlainReply(const void* data, int len) {
+  if (len < (int)sizeof(jcmk_text_msg_t)) return false;
+  const jcmk_text_msg_t* msg = (const jcmk_text_msg_t*)data;
+  size_t n = msg->len < JCMK_TEXT_MAX ? msg->len : JCMK_TEXT_MAX;
+  for (size_t i = 0; i + 9 <= n; i++) {
+    if (memcmp(msg->text + i, "encrypt=0", 9) == 0) return true;
+  }
+  return false;
+}
+
+static void biscuitSetChannels(const jcmk_text_msg_t* msg) {
+  if (msg->len < 9 || msg->len > JCMK_TEXT_MAX || memcmp(msg->text, "channels=", 9)) {
+    biscuitChannelCount = 0;
+    return;
+  }
+  char text[JCMK_TEXT_MAX + 1];
+  memcpy(text, msg->text, msg->len);
+  text[msg->len] = '\0';
+  char* end = strchr(text, ';');
+  if (end) *end = '\0';
+  uint8_t channels[NUM_CHANNELS + 2];
+  uint8_t count = 0;
+  for (char* token = text + 9; *token && count < NUM_CHANNELS + 2;) {
+    char* next;
+    long channel = strtol(token, &next, 10);
+    if (next == token || channel < 1 || channel > 255 || (*next && *next != ',')) {
+      count = 0;
+      break;
+    }
+    if (channel == 104 || channel == 108) {
+      channels[count++] = (uint8_t)channel;
+    } else {
+      for (uint8_t i = 0; i < NUM_CHANNELS; i++) {
+        if (CHANNELS[i] == channel) { channels[count++] = (uint8_t)channel; break; }
+      }
+    }
+    if (!*next) break;
+    token = next + 1;
+  }
+  memcpy(biscuitChannels, channels, count);
+  biscuitChannelCount = count;
+  scanChOffset = 0;
 }
 
 static String authStr(wifi_auth_mode_t m) {
@@ -207,7 +267,20 @@ static void onRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len
 
   if (type == MSG_CORE_REPLY && !haveCore && !coreFoundPending) {
     memcpy(coreMacPending, info->src_addr, 6);
+    plainBiscuitPending = hasPlainReply(data, len);
     coreFoundPending = true;
+
+  } else if (haveCore && memcmp(info->src_addr, coreMac, 6) == 0
+             && len >= (int)sizeof(jcmk_text_msg_t) && type == MSG_ADMIN) {
+    const jcmk_text_msg_t* msg = (const jcmk_text_msg_t*)data;
+    lastAdminMs = millis();
+    sendControl(15, msg->len ? (uint8_t)msg->text[0] : msg->counter & 0xFF);
+
+  } else if (haveCore && memcmp(info->src_addr, coreMac, 6) == 0
+             && len >= (int)sizeof(jcmk_text_msg_t) && type == 10) {
+    lastAdminMs = millis();
+    if (plainBiscuit) biscuitSetChannels((const jcmk_text_msg_t*)data);
+    sendControl(11);
 
   } else if (type == MSG_ADMIN && len >= (int)sizeof(jcmk_admin_msg_t)) {
     // ---- JCMK binary admin (Piglet Core, JCMK Core) ----
@@ -222,46 +295,6 @@ static void onRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len
     }
     lastAdminMs = millis();
 
-  } else if (type == 10 && len >= 11) {
-    // ---- Biscuit MSG_CONFIG_UPDATE (type 10) ----
-    // Payload: jcmk_text_msg_t with text = "channels=1,2,...;dwell=N"
-    // Parse the channel list and map actual channel numbers back to CHANNELS[] indices.
-    const jcmk_text_msg_t* tm = (const jcmk_text_msg_t*)data;
-    uint16_t slen = (tm->len < JCMK_TEXT_MAX) ? tm->len : JCMK_TEXT_MAX;
-    char buf[JCMK_TEXT_MAX + 1];
-    memcpy(buf, tm->text, slen);
-    buf[slen] = '\0';
-
-    // Find "channels=" prefix
-    const char* chStart = strstr(buf, "channels=");
-    if (chStart) {
-      chStart += 9;  // skip "channels="
-      uint8_t first = 0xFF, last = 0xFF;
-      const char* p = chStart;
-      while (*p && *p != ';') {
-        int ch = atoi(p);
-        // Find index of this channel number in CHANNELS[]
-        for (uint8_t i = 0; i < NUM_CHANNELS; i++) {
-          if (CHANNELS[i] == (uint8_t)ch) {
-            if (first == 0xFF) first = i;
-            last = i;
-            break;
-          }
-        }
-        // Advance past this number
-        while (*p && *p != ',' && *p != ';') p++;
-        if (*p == ',') p++;
-      }
-      if (first != 0xFF) {
-        startIdx  = first;
-        endIdx    = last;
-        assignVer = (assignVer == 255) ? 1 : assignVer + 1;  // mark as assigned
-        Serial.printf("[NODE] Biscuit config: ch %d-%d (idx %d-%d)\n",
-          CHANNELS[startIdx], CHANNELS[endIdx], startIdx, endIdx);
-      }
-    }
-    lastAdminMs = millis();
-
   } else if (type == MSG_HEARTBEAT && haveCore) {
     // Core is still alive — reset timeout
     lastAdminMs = millis();
@@ -273,6 +306,8 @@ static void onRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len
 // ================================================================
 static void resetToSearching() {
   haveCore     = false;
+  plainBiscuit = false;
+  biscuitChannelCount = 0;
   assignVer    = 0;
   startIdx     = 0;
   endIdx       = NUM_CHANNELS - 1;  // default = all channels until Core assigns a range
@@ -296,7 +331,8 @@ static void resetToSearching() {
 //  Per-channel async scan tick
 // ================================================================
 static void scanTick() {
-  uint8_t numCh = (endIdx >= startIdx) ? (endIdx - startIdx + 1) : 0;
+  uint8_t numCh = biscuitChannelCount ? biscuitChannelCount :
+                  ((endIdx >= startIdx) ? (endIdx - startIdx + 1) : 0);
   if (numCh == 0) return;
 
   // Admin window: radio is on ch 6, waiting before next cycle
@@ -321,8 +357,8 @@ static void scanTick() {
     }
 
     uint8_t chIdx = startIdx + scanChOffset;
-    if (chIdx >= NUM_CHANNELS) { scanChOffset++; return; }
-    uint8_t channel = CHANNELS[chIdx];
+    if (!biscuitChannelCount && chIdx >= NUM_CHANNELS) { scanChOffset++; return; }
+    uint8_t channel = biscuitChannelCount ? biscuitChannels[scanChOffset] : CHANNELS[chIdx];
 
     int16_t rc = WiFi.scanNetworks(/*async*/true, /*hidden*/true,
                                    /*passive*/false, SCAN_DWELL_MS, channel);
@@ -343,8 +379,21 @@ static void scanTick() {
     // Return to ch 6 before sending (Core only listens on ch 6)
     setChannel(ESPNOW_CH);
     for (int i = 0; i < n; i++) {
-      String line = WiFi.BSSIDstr(i) + "," + WiFi.SSID(i) + ","
-                  + authStr(WiFi.encryptionType(i)) + ","
+      String ssid = WiFi.SSID(i);
+      String auth = authStr(WiFi.encryptionType(i));
+      if (plainBiscuit) {
+        if (auth == "OPEN") auth = "[OPEN]";
+        else if (auth == "WEP") auth = "[WEP]";
+        else if (auth == "WPA") auth = "[WPA_PSK]";
+        else if (auth == "WPA2") auth = "[WPA2_PSK]";
+        else if (auth == "WPA3") auth = "[WPA3_PSK]";
+        else if (auth == "WPAWPA2") auth = "[WPA_WPA2_PSK]";
+        else if (auth == "WPA2EAP") auth = "[WPA2_ENTERPRISE]";
+        else if (auth == "WPA2WPA3") auth = "[WPA2_WPA3_PSK]";
+        else auth = "[UNDEFINED]";
+      }
+      String line = WiFi.BSSIDstr(i) + "," + ssid + ","
+                  + auth + ","
                   + String(WiFi.channel(i)) + "," + String(WiFi.RSSI(i)) + ",W";
       sendText(line);
       netSent++;
@@ -367,9 +416,16 @@ static void nodeTick() {
     coreFoundPending = false;
     memcpy(coreMac, coreMacPending, 6);
     haveCore    = true;
+    plainBiscuit = plainBiscuitPending;
     reqInterval = REQ_INIT_MS;
     lastAdminMs = now;
     addPeer(coreMac);
+    if (plainBiscuit) {
+      setChannel(ESPNOW_CH);
+      sendControl(7, 0, "Piglet:" FIRMWARE_VERSION);
+      scanAdminWin = true;
+      scanAdminMs = now;
+    }
     Serial.printf("[NODE] Core found: %02X:%02X:%02X:%02X:%02X:%02X\n",
       coreMac[0], coreMac[1], coreMac[2], coreMac[3], coreMac[4], coreMac[5]);
   }
