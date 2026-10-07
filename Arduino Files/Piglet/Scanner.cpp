@@ -29,6 +29,9 @@ double   lastLat = 0, lastLon = 0, lastAlt = 0, lastAcc = 0;
 uint32_t lastGpsValidMs = 0;          // millis() when position was last cached
 const uint32_t GPS_CACHE_MAX_MS = 180000UL;  // discard cache after 3 min
 
+// See Scanner.h — set below when cfg.homeSsid is seen in a scan result.
+bool homeNetworkSeen = false;
+
 // ---- Result processor (shared between sync and async paths) ----
 static void processScanResults(int n) {
   if (n <= 0) { WiFi.scanDelete(); return; }
@@ -66,11 +69,17 @@ static void processScanResults(int n) {
     int    rssi   = WiFi.RSSI(i);
     String authStr = authModeToString(WiFi.encryptionType(i));
 
+    // Exact, case-sensitive match against the configured home network —
+    // lets the device notice it has returned home mid-drive instead of
+    // only checking at boot.
+    if (!homeNetworkSeen && cfg.homeSsid.length() > 0 && ssid == cfg.homeSsid) {
+      homeNetworkSeen = true;
+    }
+
     if (is2g) networksFound2G++;
     else      networksFound5G++;
 
-    appendWigleRow(mac, ssid, authStr, firstSeen, ch, rssi, lat, lon, altM, accM);
-    wrote++;
+    if (appendWigleRow(mac, ssid, authStr, firstSeen, ch, rssi, lat, lon, altM, accM)) wrote++;
   }
 
   WiFi.scanDelete();

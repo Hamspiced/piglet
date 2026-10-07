@@ -1,5 +1,19 @@
 # Changelog
 
+## v2.63 (2026-10-07)
+
+### New Features
+- **Network Whitelist** — up to 10 SSIDs can now be configured to be scanned but never written to the WiGLE CSV log. Matching is exact and case-sensitive; whitelisted networks still count toward the Found totals, they're simply skipped when logging. Manage the list from the web UI's Configuration card ("Network Whitelist" textarea, one SSID per line) or directly via the new `ssidWhitelist1`–`ssidWhitelist10` keys in `/wardriver.cfg`. Applied to both the main Piglet firmware and the T-Dongle C5 standalone firmware.
+- **Home network auto-return** — if the configured `homeSsid` is seen in a scan result while wardriving, the device now stops scanning, connects to it, and automatically uploads pending CSVs (same upload flow used at boot), instead of only connecting at boot. Normal wardriving resumes automatically once the connection is lost (e.g. driving back out of range), using the existing STA-disconnect recovery logic. Connection attempts are rate-limited to once per 30 seconds to avoid repeated retries while lingering near the edge of range. Applied to both the main Piglet firmware and the T-Dongle C5 standalone firmware.
+
+### Bug Fixes
+- **Mesh Node interop with plain-reply Biscuit Cores** — a Biscuit Core running in unencrypted-reply mode ("encrypt=0") uses a different post-discovery handshake (admin ack / channel-config ack control messages, type 15 and 11) and sends its channel assignment as a raw channel list rather than the standard JCMK admin message. A Piglet Node now detects this mode from the CORE_REPLY, completes the extra handshake, honors the Biscuit-assigned channel list for scanning, and rewrites auth-mode strings into Biscuit's bracketed format (e.g. `[WPA2_PSK]`) when forwarding scan results. Also identifies itself to the Core with a `Piglet:<version>` tag in its text field so coordinator UIs can recognize Piglet nodes distinctly. Applied to the main Piglet firmware, the T-Dongle C5 standalone firmware, and PigletNode. Contributed by Hedge (Biscuit Shop).
+
+### Configuration
+- New config options: `ssidWhitelist1` through `ssidWhitelist10` — SSIDs excluded from CSV logging (empty by default).
+
+---
+
 ## v2.62 (2026-09-28)
 
 ### Upload Speed

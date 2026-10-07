@@ -43,7 +43,7 @@
 #include "esp32-hal-matrix.h"
 
 // Firmware version
-#define FIRMWARE_VERSION "v2.62"
+#define FIRMWARE_VERSION "v2.63"
 
 // ---------------- Pins (T-DONGLE C5) ----------------
 struct PinMap {
@@ -147,6 +147,9 @@ struct Config {
   // successfully. Lower this if you see SD write errors/corruption on
   // marginal wiring; default is a commonly-safe ceiling for SD-over-SPI.
   uint32_t sdMaxSpiHz = 20000000;
+  // Up to 10 SSIDs that will never be logged (exact, case-sensitive match).
+  // Empty slots never match, so blank/hidden SSIDs are not accidentally filtered.
+  String ssidWhitelist[10];
 };
 
 Config cfg;
@@ -179,6 +182,11 @@ static uint32_t prevUploadTotal = 0;
 // Scan control
 static bool userScanOverride = false;
 static bool autoPaused = false;
+
+// Set when the configured home SSID (cfg.homeSsid) is seen in a scan result
+// while wardriving. Consumed by checkHomeNetworkReturn(), which connects to
+// it and runs the upload flow, then clears the flag.
+static bool homeNetworkSeen = false;
 
 // AP window
 static uint32_t apStartMs = 0;
@@ -408,6 +416,10 @@ static void cfgAssignKV(const String& k, const String& v) {
     long hz = v.toInt();
     if (hz >= 400000 && hz <= 40000000) cfg.sdMaxSpiHz = (uint32_t)hz;  // sanity-clamp to a plausible SPI range
   }
+  else if (k.startsWith("ssidWhitelist")) {
+    int idx = k.substring(13).toInt();
+    if (idx >= 1 && idx <= 10) cfg.ssidWhitelist[idx - 1] = v;  // assign even if empty, to allow clearing
+  }
 }
 
 static bool saveConfigToSD() {
@@ -439,6 +451,10 @@ static bool saveConfigToSD() {
   f.println("# SD-over-SPI clock ceiling in Hz (default 20000000 = 20 MHz). Lower if you");
   f.println("# see SD write errors/corruption on marginal wiring.");
   f.print("sdMaxSpiHz="); f.println(cfg.sdMaxSpiHz);
+  f.println("# SSIDs that will never be logged (up to 10, exact case-sensitive match).");
+  for (int i = 0; i < 10; i++) {
+    f.print("ssidWhitelist"); f.print(i + 1); f.print("="); f.println(cfg.ssidWhitelist[i]);
+  }
 
   f.flush(); f.close();
   Serial.println("[CFG] Saved OK");
@@ -575,16 +591,23 @@ static void csvEscapeQuotes(const String& in, char* out, size_t outSize) {
   out[o] = '\0';
 }
 
-static void appendWigleRow(const String& mac, const String& ssid, const String& auth,
+// Returns true if the row was actually written to the log file, false if it
+// was skipped for any reason (SD unavailable, whitelist match, encoding error).
+static bool appendWigleRow(const String& mac, const String& ssid, const String& auth,
                            const String& firstSeen, int channel, int rssi,
                            double lat, double lon, double altM, double accM) {
-  if (!sdOk || !logFile) return;
+  if (!sdOk || !logFile) return false;
+
+  // Skip logging for any SSID present in the whitelist (exact, case-sensitive match)
+  for (int i = 0; i < 10; i++) {
+    if (cfg.ssidWhitelist[i].length() > 0 && cfg.ssidWhitelist[i] == ssid) return false;
+  }
 
   // Rotate CSV before it exceeds the WDGoWars 15 MB upload limit
   if (csvRowCount >= CSV_MAX_ROWS) {
     Serial.println("[SD] CSV row limit reached, rotating log file");
     closeLogFile();
-    if (!openLogFile()) return;
+    if (!openLogFile()) return false;
   }
 
   // Frequency in MHz (WiGLE 1.6)
@@ -607,7 +630,7 @@ static void appendWigleRow(const String& mac, const String& ssid, const String& 
                       channel, (unsigned)freq, rssi, lat, lon, altM, accM);
   if (len < 0) {
     Serial.println("[SD] appendWigleRow: encoding error, row skipped");
-    return;
+    return false;
   }
   if ((size_t)len >= sizeof(line)) {
     Serial.printf("[SD] appendWigleRow: row truncated (needed %d bytes, buffer %u) — check SSID\n",
@@ -637,7 +660,7 @@ static void appendWigleRow(const String& mac, const String& ssid, const String& 
         sdOk = false;
       }
     }
-    return;
+    return false;
   }
 
   // Flush less often to avoid stalls (SD writes can block hard). Threshold
@@ -655,6 +678,7 @@ static void appendWigleRow(const String& mac, const String& ssid, const String& 
     lastFlushMs = millis();
     linesSinceFlush = 0;
   }
+  return true;
 }
 
 // Forward declarations needed by WDGoWars and WiGLE batch functions
@@ -2109,6 +2133,12 @@ static uint32_t jcmkNetworksFound = 0;  // raw networks seen each session
 static uint32_t jcmkSentCount   = 0;
 static uint32_t jcmkSendFailCount = 0;
 static uint32_t jcmkHbCounter   = 0;
+// Separate, always-incrementing counter for TEXT (scan-result) messages --
+// see the comment in the main Piglet firmware's MeshNode.cpp for why reusing
+// jcmkHbCounter here caused every TEXT message in a cycle to share an
+// identical, stale counter value (which can look like a duplicate to a Core
+// that dedupes by (sender, counter), silently dropping all of them).
+static uint32_t jcmkTextCounter = 0;
 static uint32_t jcmkLastHbMs    = 0;
 static uint32_t jcmkLastReqMs   = 0;
 static uint32_t jcmkReqInterval = JCMK_REQ_INIT_MS;
@@ -2123,6 +2153,9 @@ static uint32_t nodeScanAdminMs  = 0;
 static volatile bool  jcmkCoreFoundPending    = false;
 static uint8_t        jcmkCoreMacPending[6]   = {0};
 static volatile bool  jcmkCoreIsPigletPending = false;
+static volatile bool  biscuitPlainReplyPending = false;
+static uint8_t biscuitChannels[JCMK_NUM_CHANNELS + 2];
+static volatile uint8_t biscuitChannelCount = 0;
 
 // Piglet-to-Piglet transmit-slot state (only meaningful when jcmkCoreIsPiglet)
 static bool     jcmkCoreIsPiglet   = false;
@@ -2206,8 +2239,14 @@ static void jcmkSetChannel(uint8_t ch) {
 // counter that only tracks calls made (like jcmkSentCount) can look perfectly
 // healthy locally while every frame is silently failing at the radio layer.
 static void jcmkOnSent(const esp_now_send_info_t* txInfo, esp_now_send_status_t status) {
-  (void)txInfo;
-  if (status != ESP_NOW_SEND_SUCCESS) jcmkSendFailCount++;
+  if (status != ESP_NOW_SEND_SUCCESS) {
+    jcmkSendFailCount++;
+    if (txInfo && txInfo->des_addr) {
+      const uint8_t* d = txInfo->des_addr;
+      Serial.printf("[MESH] Send FAILED (no ACK) to %02X:%02X:%02X:%02X:%02X:%02X\n",
+        d[0], d[1], d[2], d[3], d[4], d[5]);
+    }
+  }
 }
 
 static bool jcmkAddPeer(const uint8_t* mac) {
@@ -2246,26 +2285,57 @@ static void jcmkSendHeartbeat() {
   msg.len     = PIGLET_MARKER_LEN;
   memcpy(msg.text, PIGLET_MARKER, PIGLET_MARKER_LEN);
   msg.text[PIGLET_MARKER_LEN] = '\0';
-  // Unicast to the already-known Core (this is only ever called once
-  // jcmkHaveCore is true) instead of broadcasting. Broadcast ESP-Now/802.11
-  // frames have no link-layer ACK or retry -- a dropped broadcast is silently
-  // lost with no way for either side to know, whereas unicast frames are
-  // retried and their delivery status is reported to jcmkOnSent().
-  esp_now_send(jcmkCoreMac, (uint8_t*)&msg, sizeof(msg));
+  // Unicast only for a confirmed Piglet-to-Piglet pairing, where we control
+  // peer registration on both ends and gain real link-layer retry/ACK.
+  // Broadcast for everything else (real JCMK hardware / Biscuit): field
+  // testing against real Biscuit hardware showed unicast frames getting a
+  // 100% "no ACK" failure rate even though esp_now_send() itself always
+  // accepted them -- i.e. the Biscuit's ESP-Now stack doesn't ack unicast
+  // from a sender it hasn't itself registered as a peer. Broadcast frames
+  // don't require the receiver to have the sender peered at all, which is
+  // exactly why the discovery handshake (also broadcast) works fine.
+  const uint8_t* dest = jcmkCoreIsPiglet ? jcmkCoreMac : JCMK_BCAST;
+  esp_err_t err = esp_now_send(dest, (uint8_t*)&msg, sizeof(msg));
+  if (err != ESP_OK) {
+    uint8_t pri; wifi_second_chan_t sec; esp_wifi_get_channel(&pri, &sec);
+    Serial.printf("[MESH] HEARTBEAT send() rejected: err=%d ch=%d dest=%02X:%02X:%02X:%02X:%02X:%02X\n",
+      (int)err, pri, dest[0], dest[1], dest[2], dest[3], dest[4], dest[5]);
+  }
 }
 
 static void jcmkSendText(const String& s) {
   jcmk_text_msg_t msg = {};
   memcpy(msg.magic, JCMK_MAGIC, 4);
   msg.type    = JCMK_MSG_TEXT;
-  msg.counter = jcmkHbCounter;
+  msg.counter = ++jcmkTextCounter;
   uint16_t slen = (uint16_t)((s.length() < JCMK_TEXT_MAX) ? s.length() : JCMK_TEXT_MAX);
   msg.len = slen;
   memcpy(msg.text, s.c_str(), slen);
   msg.text[slen] = '\0';
   // Always send full struct size — Biscuit Pro drops variable-length packets < 212 bytes.
-  // Unicast (see jcmkSendHeartbeat comment above) — only ever called once
-  // jcmkHaveCore is true, i.e. jcmkCoreMac is already a registered peer.
+  // Unicast only for confirmed Piglet-to-Piglet pairings (see jcmkSendHeartbeat
+  // comment above for why broadcast is required for real JCMK/Biscuit hardware).
+  const uint8_t* dest = jcmkCoreIsPiglet ? jcmkCoreMac : JCMK_BCAST;
+  esp_err_t err = esp_now_send(dest, (uint8_t*)&msg, sizeof(msg));
+  if (err != ESP_OK) {
+    uint8_t pri; wifi_second_chan_t sec; esp_wifi_get_channel(&pri, &sec);
+    Serial.printf("[MESH] TEXT send() rejected: err=%d ch=%d dest=%02X:%02X:%02X:%02X:%02X:%02X\n",
+      (int)err, pri, dest[0], dest[1], dest[2], dest[3], dest[4], dest[5]);
+  }
+}
+
+// Generic Biscuit protocol-control reply, always unicast to the Core. Used
+// for the type=15 (admin ack) and type=11 (config ack) handshake messages a
+// plain-reply Biscuit Core expects during node registration.
+static void biscuitSendControl(uint8_t type, uint32_t counter = 0, const char* text = nullptr) {
+  jcmk_text_msg_t msg = {};
+  memcpy(msg.magic, JCMK_MAGIC, 4);
+  msg.type = type;
+  msg.counter = counter;
+  if (text) {
+    msg.len = strlen(text);
+    memcpy(msg.text, text, msg.len);
+  }
   esp_now_send(jcmkCoreMac, (uint8_t*)&msg, sizeof(msg));
 }
 
@@ -2276,6 +2346,62 @@ static bool jcmkHasPigletMarker(const void* data, int len) {
   const jcmk_text_msg_t* tm = (const jcmk_text_msg_t*)data;
   if (tm->len < PIGLET_MARKER_LEN) return false;
   return memcmp(tm->text, PIGLET_MARKER, PIGLET_MARKER_LEN) == 0;
+}
+
+// True if a received CORE_REPLY indicates a Biscuit Core running in
+// unencrypted-reply mode (carries "encrypt=0" somewhere in its text field).
+static bool biscuitHasPlainReply(const void* data, int len) {
+  if (len < (int)sizeof(jcmk_text_msg_t)) return false;
+  const jcmk_text_msg_t* msg = (const jcmk_text_msg_t*)data;
+  size_t n = msg->len < JCMK_TEXT_MAX ? msg->len : JCMK_TEXT_MAX;
+  for (size_t i = 0; i + 9 <= n; i++) {
+    if (memcmp(msg->text + i, "encrypt=0", 9) == 0) return true;
+  }
+  return false;
+}
+
+// Parses a Biscuit "channels=1,2,...;dwell=N" config message into
+// biscuitChannels[]/biscuitChannelCount, restarting the scan cycle from the
+// new list. Only used for plain-reply Biscuit pairings.
+// Takes the raw ESP-Now payload (like jcmkHasPigletMarker/biscuitHasPlainReply
+// above) rather than a jcmk_text_msg_t* parameter -- the Arduino .ino sketch
+// preprocessor auto-generates function prototypes near the top of the file,
+// before the jcmk_text_msg_t typedef is defined further down, which breaks
+// compilation for any top-level function taking that type directly.
+static void biscuitSetChannels(const void* data, int len) {
+  if (len < (int)sizeof(jcmk_text_msg_t)) { biscuitChannelCount = 0; return; }
+  const jcmk_text_msg_t* msg = (const jcmk_text_msg_t*)data;
+  if (msg->len < 9 || msg->len > JCMK_TEXT_MAX || memcmp(msg->text, "channels=", 9)) {
+    biscuitChannelCount = 0;
+    return;
+  }
+  char text[JCMK_TEXT_MAX + 1];
+  memcpy(text, msg->text, msg->len);
+  text[msg->len] = '\0';
+  char* end = strchr(text, ';');
+  if (end) *end = '\0';
+  uint8_t channels[JCMK_NUM_CHANNELS + 2];
+  uint8_t count = 0;
+  for (char* token = text + 9; *token && count < JCMK_NUM_CHANNELS + 2;) {
+    char* next;
+    long channel = strtol(token, &next, 10);
+    if (next == token || channel < 1 || channel > 255 || (*next && *next != ',')) {
+      count = 0;
+      break;
+    }
+    if (channel == 104 || channel == 108) {
+      channels[count++] = (uint8_t)channel;
+    } else {
+      for (uint8_t i = 0; i < JCMK_NUM_CHANNELS; i++) {
+        if (JCMK_CHANNELS[i] == channel) { channels[count++] = (uint8_t)channel; break; }
+      }
+    }
+    if (!*next) break;
+    token = next + 1;
+  }
+  memcpy(biscuitChannels, channels, count);
+  biscuitChannelCount = count;
+  nodeScanChOffset = 0;
 }
 
 // ---- Core forward decls (used inside jcmkOnRecv callback) ----
@@ -2410,6 +2536,7 @@ static void jcmkOnRecv(const esp_now_recv_info_t* info,
     if (type == JCMK_MSG_CORE_REPLY && !jcmkHaveCore && !jcmkCoreFoundPending) {
       memcpy(jcmkCoreMacPending, info->src_addr, 6);
       jcmkCoreIsPigletPending = jcmkHasPigletMarker(data, len);
+      biscuitPlainReplyPending = biscuitHasPlainReply(data, len);
       jcmkCoreFoundPending = true;
     } else if (type == JCMK_MSG_HEARTBEAT && jcmkHaveCore
                && memcmp(info->src_addr, jcmkCoreMac, 6) == 0) {
@@ -2417,6 +2544,20 @@ static void jcmkOnRecv(const esp_now_recv_info_t* info,
       // (for Piglet pairings) the shared timing anchor for slot scheduling.
       jcmkCoreLastSeenMs = millis();
       if (jcmkCoreIsPiglet) jcmkCycleEpochMs = millis();
+    } else if (jcmkHaveCore && memcmp(info->src_addr, jcmkCoreMac, 6) == 0
+               && len >= (int)sizeof(jcmk_text_msg_t) && type == JCMK_MSG_ADMIN) {
+      // Plain-reply Biscuit admin handshake step: ack with type=15, echoing
+      // back the first text byte (or low byte of counter as a fallback).
+      const jcmk_text_msg_t* msg = (const jcmk_text_msg_t*)data;
+      jcmkCoreLastSeenMs = millis();
+      biscuitSendControl(15, msg->len ? (uint8_t)msg->text[0] : msg->counter & 0xFF);
+    } else if (jcmkHaveCore && memcmp(info->src_addr, jcmkCoreMac, 6) == 0
+               && len >= (int)sizeof(jcmk_text_msg_t) && type == 10) {
+      // Plain-reply Biscuit channel-config message (MSG_CONFIG_UPDATE) --
+      // parse the assigned channel list, then ack with type=11.
+      jcmkCoreLastSeenMs = millis();
+      if (biscuitPlainReplyPending) biscuitSetChannels(data, len);
+      biscuitSendControl(11);
     } else if (type == JCMK_MSG_ADMIN && len >= (int)sizeof(jcmk_admin_msg_t)) {
       jcmkCoreLastSeenMs = millis();
       if (jcmkCoreIsPiglet) jcmkCycleEpochMs = millis();
@@ -2558,8 +2699,9 @@ static void coreParseAndLogText(const char* line) {
   if (gpsHasFix) { lat=gps.location.lat(); lon=gps.location.lng();
                    altM=gps.altitude.meters(); accM=gps.hdop.hdop(); }
   digitalWrite(PINS.tft_cs, HIGH);
-  appendWigleRow(bssid, ssid, auth, iso8601NowUTC(), ch, rssi, lat, lon, altM, accM);
-  coreRecordsRx++;
+  if (appendWigleRow(bssid, ssid, auth, iso8601NowUTC(), ch, rssi, lat, lon, altM, accM)) {
+    coreRecordsRx++;
+  }
 }
 
 static void enterCoreMode() {
@@ -2640,8 +2782,8 @@ static void coreModeTick() {
 //  window (heartbeat + NODE_ADMIN_WIN_MS) before the next cycle.
 // ================================================================
 static void nodeDoScanTick() {
-  uint8_t numCh = (jcmkEndIdx >= jcmkStartIdx)
-                ? (jcmkEndIdx - jcmkStartIdx + 1) : 0;
+  uint8_t numCh = biscuitChannelCount ? biscuitChannelCount :
+                  ((jcmkEndIdx >= jcmkStartIdx) ? (jcmkEndIdx - jcmkStartIdx + 1) : 0);
   if (numCh == 0) return;
 
   // Admin window: radio is on ch 6, heartbeat already sent, just waiting
@@ -2665,8 +2807,8 @@ static void nodeDoScanTick() {
     }
 
     uint8_t chIdx = jcmkStartIdx + nodeScanChOffset;
-    if (chIdx >= JCMK_NUM_CHANNELS) { nodeScanChOffset++; return; }
-    uint8_t channel = JCMK_CHANNELS[chIdx];
+    if (!biscuitChannelCount && chIdx >= JCMK_NUM_CHANNELS) { nodeScanChOffset++; return; }
+    uint8_t channel = biscuitChannelCount ? biscuitChannels[nodeScanChOffset] : JCMK_CHANNELS[chIdx];
 
     // Async scan of this single channel only (no blocking)
     int16_t rc = WiFi.scanNetworks(/*async*/true, /*hidden*/true,
@@ -2694,10 +2836,25 @@ static void nodeDoScanTick() {
         String bssid = WiFi.BSSIDstr(i);
         String ssid  = WiFi.SSID(i);
         String auth  = authModeToString(WiFi.encryptionType(i));
+        if (biscuitPlainReplyPending) {
+          if (auth == "OPEN") auth = "[OPEN]";
+          else if (auth == "WEP") auth = "[WEP]";
+          else if (auth == "WPA") auth = "[WPA_PSK]";
+          else if (auth == "WPA2") auth = "[WPA2_PSK]";
+          else if (auth == "WPA3") auth = "[WPA3_PSK]";
+          else if (auth == "WPAWPA2") auth = "[WPA_WPA2_PSK]";
+          else if (auth == "WPA2EAP") auth = "[WPA2_ENTERPRISE]";
+          else if (auth == "WPA2WPA3") auth = "[WPA2_WPA3_PSK]";
+          else auth = "[UNDEFINED]";
+        }
         int    ch    = WiFi.channel(i);
         int    rssi  = WiFi.RSSI(i);
         String line  = bssid + "," + ssid + "," + auth + ","
                      + String(ch) + "," + String(rssi) + ",W";
+        // Log the exact payload content -- we've verified scanning finds
+        // networks and sends are attempted/delivered at the radio level, but
+        // never actually inspected what's inside the message being sent.
+        Serial.printf("[MESH] TX: %s\n", line.c_str());
         jcmkSendText(line);
         jcmkSentCount++;
       }
@@ -2772,6 +2929,7 @@ static void enterNodeMode() {
   jcmkSentCount         = 0;
   jcmkSendFailCount     = 0;
   jcmkHbCounter         = 0;
+  jcmkTextCounter       = 0;
   jcmkLastHbMs          = 0;
   jcmkLastReqMs         = 0;
   jcmkReqInterval       = JCMK_REQ_INIT_MS;
@@ -2781,6 +2939,7 @@ static void enterNodeMode() {
   nodeScanActive        = false;
   nodeScanChOffset      = 0;
   nodeScanAdminWin      = false;
+  biscuitChannelCount   = 0;
 
   // Mesh mode owns the WiFi stack — prevent stopAPIfAllowed() from firing
   // WiFi.disconnect(true,true) after esp_now_init() would kill the ESP-Now driver.
@@ -2859,6 +3018,14 @@ static void nodeModeTick() {
     jcmkCycleEpochMs   = now;
     jcmkReqInterval    = JCMK_REQ_INIT_MS;
     jcmkAddPeer(jcmkCoreMac);
+    if (biscuitPlainReplyPending) {
+      // Identify ourselves to the Biscuit Core ("Piglet:<version>") and give
+      // it a short ch-6 admin window to send its role/channel-config handshake.
+      jcmkSetChannel(JCMK_ESPNOW_CH);
+      biscuitSendControl(7, 0, "Piglet:" FIRMWARE_VERSION);
+      nodeScanAdminWin = true;
+      nodeScanAdminMs = now;
+    }
     Serial.printf("[MESH] Core: %02X:%02X:%02X:%02X:%02X:%02X%s\n",
       jcmkCoreMac[0], jcmkCoreMac[1], jcmkCoreMac[2],
       jcmkCoreMac[3], jcmkCoreMac[4], jcmkCoreMac[5],
@@ -2880,6 +3047,7 @@ static void nodeModeTick() {
     jcmkPendingHead  = jcmkPendingTail = 0;  // drop any buffered-but-unsent results
     nodeScanActive   = false;
     nodeScanAdminWin = false;
+    biscuitChannelCount = 0;
     jcmkReqInterval  = JCMK_REQ_INIT_MS;
   }
 
@@ -3103,7 +3271,7 @@ static bool initSD_SharedSPI() {
 static void handleRoot() { server.sendHeader("Cache-Control", "no-store"); server.send_P(200, "text/html", INDEX_HTML); }
 
 static void handleStatus() {
-  DynamicJsonDocument doc(2048);  // heap, not stack — avoids task stack overflow
+  DynamicJsonDocument doc(3072);  // heap, not stack — avoids task stack overflow; bumped for ssidWhitelist1..10
   bool allowScan = scanningEnabled && sdOk && (userScanOverride || !autoPaused);
   doc["scanningEnabled"] = scanningEnabled;
   doc["allowScan"] = allowScan;
@@ -3154,6 +3322,9 @@ static void handleStatus() {
   c["deviceName"]     = cfg.deviceName;
   c["meshModeOnBoot"] = cfg.meshModeOnBoot;
   c["rotateScreen180"] = cfg.rotateScreen180;
+  for (int i = 0; i < 10; i++) {
+    c[String("ssidWhitelist") + String(i + 1)] = cfg.ssidWhitelist[i];
+  }
 
   String out; serializeJson(doc, out);
   server.send(200, "application/json", out);
@@ -3626,6 +3797,57 @@ static bool shouldPauseScanning() {
   return false;
 }
 
+// ---- Home network auto-return: connect + upload mid-drive ----
+
+// Minimum time between connection attempts triggered by seeing the home
+// SSID in scan results -- avoids hammering connectSTA() every scan cycle
+// (every ~1.5 s in aggressive mode) while lingering near the edge of range.
+static const uint32_t HOME_RETURN_RETRY_MS = 30000UL;
+
+static void checkHomeNetworkReturn() {
+  if (!homeNetworkSeen) return;
+  homeNetworkSeen = false;  // consume -- re-armed next time it's seen in a scan
+
+  // Already connected, or AP actively serving the config UI -- nothing to do.
+  if (WiFi.status() == WL_CONNECTED) return;
+  if (apWindowActive) return;
+
+  static uint32_t lastAttemptMs = 0;
+  if (lastAttemptMs != 0 && (millis() - lastAttemptMs) < HOME_RETURN_RETRY_MS) return;
+  lastAttemptMs = millis();
+
+  Serial.println("[WIFI] Home network seen while wardriving -- connecting to upload");
+
+  bool staOk = connectSTA(12000);
+  lastStaStatus = WiFi.status();
+
+  if (!staOk) {
+    Serial.println("[WIFI] Home network connect failed -- resuming wardriving");
+    WiFi.setAutoReconnect(false);
+    WiFi.persistent(false);
+    WiFi.disconnect(true, false);  // eraseap=false keeps NVS credentials
+    delay(50);
+    WiFi.mode(WIFI_STA);           // idle STA ready for scanning
+    return;
+  }
+
+  // Connected -- shouldPauseScanning() now returns true so wardriving pauses
+  // automatically; handleStaTransitions() resumes it once STA disconnects
+  // (e.g. driving back out of home WiFi range).
+  bool hasWigle = cfg.wigleBasicToken.length() > 0;
+  bool hasWdg   = cfg.wdgwarsApiKey.length()   > 0;
+
+  if (sdOk && (hasWigle || hasWdg) && cfg.maxBootUploads != 0) {
+    Serial.print("[UPLOAD] Home network connected. Services: ");
+    if (hasWdg)   Serial.print("WDGoWars ");
+    if (hasWigle) Serial.print("WiGLE ");
+    Serial.println();
+    uploadAllCsvsToWigle(cfg.maxBootUploads);
+  } else {
+    Serial.println("[UPLOAD] Skipped (SD not ready, no tokens set, or maxBootUploads=0)");
+  }
+}
+
 // Last-known GPS position — used when fix is temporarily lost so networks
 // aren't logged at 0,0 (null island).
 // Updated every loop() iteration (not just on scan) so position stays current
@@ -3674,11 +3896,17 @@ static void processScanResults(int n) {
     int rssi = WiFi.RSSI(i);
     String authStr = authModeToString(WiFi.encryptionType(i));
 
+    // Exact, case-sensitive match against the configured home network --
+    // lets the device notice it has returned home mid-drive instead of
+    // only checking at boot.
+    if (!homeNetworkSeen && cfg.homeSsid.length() > 0 && ssid == cfg.homeSsid) {
+      homeNetworkSeen = true;
+    }
+
     if (is2g) networksFound2G++;
     else      networksFound5G++;
 
-    appendWigleRow(mac, ssid, authStr, firstSeen, ch, rssi, lat, lon, altM, accM);
-    wrote++;
+    if (appendWigleRow(mac, ssid, authStr, firstSeen, ch, rssi, lat, lon, altM, accM)) wrote++;
   }
 
   WiFi.scanDelete();
@@ -4186,7 +4414,10 @@ void loop() {
 
   // Skip STA transition handler in mesh mode — it calls WiFi.disconnect(wifioff=true)
   // which stops the WiFi driver and deinits ESP-Now.
-  if (!meshNodeActive && !meshCoreActive) handleStaTransitions();
+  if (!meshNodeActive && !meshCoreActive) {
+    handleStaTransitions();
+    checkHomeNetworkReturn();
+  }
 
   // Check on any WDGoWars jobs queued during the last upload batch. This is
   // rate-limited internally to at most one short network round-trip per

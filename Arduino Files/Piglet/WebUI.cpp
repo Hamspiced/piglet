@@ -92,7 +92,7 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
   }
 
   /* ---- Inputs ---- */
-  input,select{
+  input,select,textarea{
     padding:9px 12px;
     border-radius:8px;
     border:1px solid var(--inputBorder);
@@ -100,14 +100,16 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
     background:var(--input);
     color:var(--text);
     font-size:14px;
+    font-family:inherit;
     transition:border-color .15s,box-shadow .15s;
     outline:none;
   }
-  input:focus,select:focus{
+  input:focus,select:focus,textarea:focus{
     border-color:var(--accent);
     box-shadow:0 0 0 3px var(--accentDim);
   }
-  input::placeholder{color:var(--muted);opacity:.6}
+  input::placeholder,textarea::placeholder{color:var(--muted);opacity:.6}
+  textarea{resize:vertical;line-height:1.4}
 
   label{
     display:block;
@@ -394,6 +396,11 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
         </select>
       </div>
     </div>
+    <div class="mt-md">
+      <label>Network Whitelist &mdash; SSIDs to Scan but Never Log (up to 10, one per line)</label>
+      <textarea id="ssidWhitelist" rows="4" placeholder="e.g.&#10;MyHomeNetwork&#10;MyOfficeWifi"></textarea>
+      <p style="margin:6px 0 0;font-size:12px;color:var(--muted)">Exact, case-sensitive match. These networks still count toward Found totals but are never written to the CSV log.</p>
+    </div>
     <div class="row mt-md">
       <button class="btn-primary" onclick="saveCfg()">Save Config</button>
       <button onclick="saveAndReboot()" title="Save config then restart the device">Save &amp; Reboot</button>
@@ -515,6 +522,18 @@ async function loadStatus(){
         if(el)el.value=v;
       }
     }
+
+    // Network whitelist: join the 10 flat ssidWhitelistN keys into one
+    // newline-separated textarea value (skipping empty/unused slots).
+    if(j.config){
+      const lines=[];
+      for(let i=1;i<=10;i++){
+        const v=j.config['ssidWhitelist'+i];
+        if(v)lines.push(v);
+      }
+      const wlEl=$('ssidWhitelist');
+      if(wlEl)wlEl.value=lines.join('\n');
+    }
   }catch(e){console.error('loadStatus',e)}
 }
 
@@ -596,6 +615,17 @@ async function doSave(){
     if(maskedKeys.has(k)&&v==='')continue;
     body+=k+'='+String(v).replace(/\r?\n/g,' ')+'\n';
   }
+
+  // Network whitelist: split the textarea into non-empty, trimmed lines
+  // (capped at 10), then always emit all 10 ssidWhitelistN keys -- including
+  // blank ones -- so removing an entry actually clears that slot on save
+  // instead of leaving a stale value behind.
+  const wlEl=$('ssidWhitelist');
+  const wlLines=(wlEl?wlEl.value:'').split(/\r?\n/).map(s=>s.trim()).filter(s=>s.length>0).slice(0,10);
+  for(let i=0;i<10;i++){
+    body+='ssidWhitelist'+(i+1)+'='+(wlLines[i]||'')+'\n';
+  }
+
   const r=await fetch('/saveConfig',{method:'POST',headers:{'Content-Type':'text/plain'},body});
   await loadStatus();
   return r;
@@ -791,7 +821,9 @@ static void handleStatus() {
   // Heap allocation: StaticJsonDocument<N> puts N bytes on the Arduino loop
   // task stack (8192 bytes). Even 1024 bytes plus WebServer call chain overhead
   // risks a stack overflow.  DynamicJsonDocument allocates from the heap instead.
-  DynamicJsonDocument doc(2048);
+  // Bumped from 2048 -> 3072 to leave headroom for the 10 ssidWhitelistN
+  // string fields (each up to a full 32-byte SSID) added to "config".
+  DynamicJsonDocument doc(3072);
 
   bool allowScan = scanningEnabled && sdOk && (userScanOverride || !autoPaused);
   doc["scanningEnabled"] = scanningEnabled;
@@ -850,6 +882,9 @@ static void handleStatus() {
   c["meshModeOnBoot"] = cfg.meshModeOnBoot;
   c["rotateScreen180"] = cfg.rotateScreen180;
   c["autoStartAfterUpload"] = cfg.autoStartAfterUpload;
+  for (uint8_t i = 0; i < 10; i++) {
+    c[String("ssidWhitelist") + String(i + 1)] = cfg.ssidWhitelist[i];
+  }
 
   String output;
   serializeJson(doc, output);

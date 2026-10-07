@@ -137,6 +137,13 @@ void cfgAssignKV(const String& k, const String& v) {
     long hz = v.toInt();
     if (hz >= 400000 && hz <= 40000000) cfg.sdMaxSpiHz = (uint32_t)hz;  // sanity-clamp to a plausible SPI range
   }
+  else if (k.startsWith("ssidWhitelist")) {
+    // Keys are ssidWhitelist1..ssidWhitelist10 (1-indexed in the file/UI,
+    // 0-indexed in the array). Assign unconditionally -- including empty
+    // strings -- so a slot can be cleared by saving it blank from the Web UI.
+    int idx = k.substring(13).toInt();  // strlen("ssidWhitelist") == 13
+    if (idx >= 1 && idx <= 10) cfg.ssidWhitelist[idx - 1] = v;
+  }
 }
 
 // ---------------- Load / Save ----------------
@@ -309,6 +316,13 @@ bool saveConfigToSD() {
   f.println("# this that mounts successfully. Lower if you see SD write errors/corruption");
   f.println("# on marginal wiring (default 20000000 = 20 MHz).");
   f.print("sdMaxSpiHz="); f.println(cfg.sdMaxSpiHz);
+
+  f.println("");
+  f.println("# Network whitelist: up to 10 SSIDs that are scanned but never logged to CSV.");
+  f.println("# Exact, case-sensitive match. Leave blank to disable a slot.");
+  for (uint8_t i = 0; i < 10; i++) {
+    f.print("ssidWhitelist"); f.print(i + 1); f.print("="); f.println(cfg.ssidWhitelist[i]);
+  }
 
   f.flush();
   f.close();

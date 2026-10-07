@@ -55,6 +55,13 @@ struct Config {
   // marginal wiring (e.g. long breadboard jumpers); default is a commonly-
   // safe ceiling for SD-over-SPI. Requires reboot.
   uint32_t sdMaxSpiHz = 20000000;
+
+  // Network whitelist: up to 10 SSIDs that are scanned normally (still count
+  // toward Found totals) but are never written to the CSV log -- e.g. your
+  // own home/work network you don't want captured. Exact, case-sensitive
+  // match. Empty slots are ignored. Applies to both local scanning and
+  // mesh-forwarded records written by this device.
+  String ssidWhitelist[10];
 };
 
 const PinMap& detectPinsByChip();

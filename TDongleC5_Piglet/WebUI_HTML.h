@@ -18,8 +18,10 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
   .header .logo{font-size:28px} .header h1{font-size:20px;font-weight:700;margin:0} .header .sub{font-size:12px;color:var(--muted);margin:0}
   .card{border:1px solid var(--border);border-radius:12px;padding:14px;margin:12px 0;background:var(--card)}
   .card h3{margin:0 0 10px 0;font-size:13px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;color:var(--muted)}
-  input,select{padding:8px 10px;border-radius:7px;border:1px solid var(--inputBorder);width:100%;background:var(--input);color:var(--text);font-size:13px;outline:none}
-  input:focus,select:focus{border-color:var(--accent);box-shadow:0 0 0 2px var(--accentDim)}
+  input,select,textarea{padding:8px 10px;border-radius:7px;border:1px solid var(--inputBorder);width:100%;box-sizing:border-box;background:var(--input);color:var(--text);font-size:13px;font-family:inherit;outline:none}
+  input:focus,select:focus,textarea:focus{border-color:var(--accent);box-shadow:0 0 0 2px var(--accentDim)}
+  input::placeholder,textarea::placeholder{color:var(--muted);opacity:.6}
+  textarea{resize:vertical;line-height:1.4}
   label{display:block;font-size:11px;font-weight:500;color:var(--muted);margin-bottom:3px;text-transform:uppercase;letter-spacing:.3px}
   button{cursor:pointer;padding:8px 14px;border-radius:7px;border:1px solid var(--inputBorder);background:var(--btn);color:var(--text);font-size:13px;width:100%;transition:background .1s}
   button:hover{background:var(--btnHover)} button:active{transform:translateY(1px)} button:disabled{opacity:.4;cursor:not-allowed}
@@ -110,6 +112,11 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
       <div><label>Mesh Mode On Boot</label><select id="meshModeOnBoot"><option value="none">None</option><option value="core">Core</option><option value="node">Node</option></select></div>
       <div><label>Rotate Screen 180&deg; (requires reboot)</label><select id="rotateScreen180"><option value="false">Normal</option><option value="true">Rotated 180&deg;</option></select></div>
     </div>
+    <div class="mt-md">
+      <label>Network Whitelist &mdash; SSIDs to Scan but Never Log (up to 10, one per line)</label>
+      <textarea id="ssidWhitelist" rows="4" placeholder="e.g.&#10;MyHomeNetwork&#10;MyOfficeWifi"></textarea>
+      <p style="margin:6px 0 0;font-size:11px;color:var(--muted)">Exact, case-sensitive match. Still counted in Found totals but never written to the CSV log.</p>
+    </div>
     <div class="row mt-md">
       <button class="btn-primary" onclick="saveCfg()">Save Config</button>
       <button onclick="saveAndReboot()" title="Save and restart device">Save &amp; Reboot</button>
@@ -173,6 +180,12 @@ async function loadStatus(){try{
   setText('vLastUpload',lu);
   for(const k of ['wigleBasicToken','wdgwarsApiKey','deviceName','gpsBaud','homeSsid','wardriverSsid','wardriverPsk','scanMode','speedUnits','maxBootUploads','meshModeOnBoot','rotateScreen180']){
     if(j.config&&(k in j.config)){const v=String(j.config[k]);if(maskedKeys.has(k)&&(v===''||v==='(set)'))continue;const el=$(k);if(el)el.value=v}}
+  if(j.config){
+    const lines=[];
+    for(let i=1;i<=10;i++){const v=j.config['ssidWhitelist'+i];if(v)lines.push(v);}
+    const wlEl=$('ssidWhitelist');
+    if(wlEl)wlEl.value=lines.join('\n');
+  }
 }catch(e){console.error(e)}}
 
 async function loadFiles(){try{
@@ -222,6 +235,9 @@ async function doSave(){
   const keys=['wigleBasicToken','wdgwarsApiKey','deviceName','gpsBaud','homeSsid','homePsk','wardriverSsid','wardriverPsk','scanMode','speedUnits','maxBootUploads','meshModeOnBoot','rotateScreen180'];
   let body='# Saved from Web UI\n';
   for(const k of keys){const el=$(k);const v=el?(el.value??''):'';if(maskedKeys.has(k)&&v==='')continue;body+=k+'='+String(v).replace(/\r?\n/g,' ')+'\n'}
+  const wlEl=$('ssidWhitelist');
+  const wlLines=(wlEl?wlEl.value:'').split(/\r?\n/).map(s=>s.trim()).filter(s=>s.length>0).slice(0,10);
+  for(let i=0;i<10;i++){body+='ssidWhitelist'+(i+1)+'='+(wlLines[i]||'')+'\n'}
   await fetch('/saveConfig',{method:'POST',headers:{'Content-Type':'text/plain'},body});
   await loadStatus();
 }

@@ -26,6 +26,7 @@ Designed for **[Seeed XIAO ESP32-S3](https://wiki.seeedstudio.com/xiao_esp32s3_g
 - OLED live status display  
 - Optional battery monitoring (board dependent)  
 - Automatic STA connect with AP fallback  
+- **Home network auto-return** — detects your home SSID while wardriving, automatically connects and uploads pending CSVs, then resumes wardriving once you drive out of range again
 - Optimized for mobile wardriving or warWalking!
 - **ESP-Now Mesh Node mode** — pair with a coordinator device for multi-node wardriving
 - **Mesh auto-start on boot** — configure `meshModeOnBoot` to automatically enter Core or Node mode after uploads complete, bypassing the AP window
@@ -308,6 +309,13 @@ deviceName=
 # If connection fails, falls back to SoftAP for 60 seconds
 # (can be extended via the "Stay in WebUI?" prompt that appears
 # ~30 s before the timer expires).
+#
+# Auto-return while wardriving: if this SSID is seen in a scan result
+# while driving, the device stops scanning, connects to it, and uploads
+# pending CSVs automatically (same upload flow as boot) -- no need to
+# reboot or stop by the web UI when you get home. Normal wardriving
+# resumes automatically once the connection is lost (e.g. driving back
+# out of range).
 
 homeSsid=EnterWifiHere
 homePsk=EnterWifiPasswordHere
@@ -399,6 +407,28 @@ autoStartAfterUpload=false
 # Reboot required after changing.
 
 sdMaxSpiHz=20000000
+
+# ------------------------------------------------------------
+# Network Whitelist
+# ------------------------------------------------------------
+# Up to 10 SSIDs that will never be written to the WiGLE CSV log.
+# Matching is exact and case-sensitive; empty slots never match, so
+# blank/hidden SSIDs are never accidentally filtered. Whitelisted
+# networks are still scanned and still count toward the Found totals —
+# they are simply skipped when writing log rows. Editable from the
+# web UI's Configuration card ("Network Whitelist" textarea, one SSID
+# per line) or directly in this file.
+
+ssidWhitelist1=
+ssidWhitelist2=
+ssidWhitelist3=
+ssidWhitelist4=
+ssidWhitelist5=
+ssidWhitelist6=
+ssidWhitelist7=
+ssidWhitelist8=
+ssidWhitelist9=
+ssidWhitelist10=
 ```
 
 ### Auto-Start Wardriving After Uploads — How to Disable

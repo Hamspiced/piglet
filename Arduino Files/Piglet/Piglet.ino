@@ -693,7 +693,10 @@ void loop() {
 
   // Skip STA transition handler in mesh mode — it calls WiFi.disconnect(wifioff=true)
   // which stops the WiFi driver and deinits ESP-Now.
-  if (!meshNodeActive && !meshCoreActive) handleStaTransitions();
+  if (!meshNodeActive && !meshCoreActive) {
+    handleStaTransitions();
+    checkHomeNetworkReturn();
+  }
 
   // Check on any WDGoWars jobs queued during the last upload batch. This is
   // rate-limited internally to at most one short network round-trip per

@@ -1,5 +1,7 @@
 #include "WiFiManager.h"
 #include "Globals.h"
+#include "Scanner.h"
+#include "WigleUpload.h"
 #include "esp_netif.h"
 
 // ---- STA disconnect helper ----
@@ -248,4 +250,56 @@ bool shouldPauseScanning() {
     return true; // pause anytime AP is up
   }
   return false;
+}
+
+// ---- Home network auto-return: connect + upload mid-drive ----
+
+// Minimum time between connection attempts triggered by seeing the home
+// SSID in scan results -- avoids hammering connectSTA() every scan cycle
+// (every ~1.5 s in aggressive mode) while lingering near the edge of range.
+static const uint32_t HOME_RETURN_RETRY_MS = 30000UL;
+
+void checkHomeNetworkReturn() {
+  if (!homeNetworkSeen) return;
+  homeNetworkSeen = false;  // consume -- re-armed next time it's seen in a scan
+
+  // Already connected, or AP actively serving the config UI -- nothing to do.
+  if (WiFi.status() == WL_CONNECTED) return;
+  if (apWindowActive) return;
+
+  static uint32_t lastAttemptMs = 0;
+  if (lastAttemptMs != 0 && (millis() - lastAttemptMs) < HOME_RETURN_RETRY_MS) return;
+  lastAttemptMs = millis();
+
+  Serial.println("[WIFI] Home network seen while wardriving -- connecting to upload");
+
+  bool staOk = connectSTA(12000);
+  lastStaStatus = WiFi.status();
+
+  if (!staOk) {
+    Serial.println("[WIFI] Home network connect failed -- resuming wardriving");
+    WiFi.setAutoReconnect(false);
+    WiFi.persistent(false);
+    WiFi.disconnect(true, false);  // eraseap=false keeps NVS credentials
+    delay(50);
+    WiFi.mode(WIFI_STA);           // idle STA ready for scanning
+    return;
+  }
+
+  // Connected -- shouldPauseScanning() now returns true so wardriving pauses
+  // automatically; handleStaTransitions() resumes it once STA disconnects
+  // (e.g. driving back out of home WiFi range).
+  bool hasWigle = cfg.wigleBasicToken.length() > 0;
+  bool hasWdg   = cfg.wdgwarsApiKey.length()   > 0;
+
+  if (sdOk && (hasWigle || hasWdg) && cfg.maxBootUploads != 0) {
+    Serial.print("[UPLOAD] Home network connected. Services: ");
+    if (hasWdg)   Serial.print("WDGoWars ");
+    if (hasWigle) Serial.print("WiGLE ");
+    Serial.println();
+    uint32_t uploaded = uploadAllCsvsToWigle(cfg.maxBootUploads);
+    Serial.printf("[UPLOAD] Done: %d files moved\n", uploaded);
+  } else {
+    Serial.println("[UPLOAD] Skipped (SD not ready, no tokens set, or maxBootUploads=0)");
+  }
 }

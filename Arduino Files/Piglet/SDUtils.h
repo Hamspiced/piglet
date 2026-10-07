@@ -3,7 +3,9 @@
 
 bool   openLogFile();
 void   closeLogFile();
-void   appendWigleRow(const String& mac, const String& ssid, const String& auth,
+// Returns true if the row was actually written to the CSV, false if skipped
+// (SD/log file unavailable, or the SSID matches a configured whitelist entry).
+bool   appendWigleRow(const String& mac, const String& ssid, const String& auth,
                       const String& firstSeen, int channel, int rssi,
                       double lat, double lon, double altM, double accM);
 

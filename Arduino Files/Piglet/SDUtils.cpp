@@ -310,16 +310,28 @@ static void csvEscapeQuotes(const String& in, char* out, size_t outSize) {
   out[o] = '\0';
 }
 
-void appendWigleRow(const String& mac, const String& ssid, const String& auth,
+bool appendWigleRow(const String& mac, const String& ssid, const String& auth,
                     const String& firstSeen, int channel, int rssi,
                     double lat, double lon, double altM, double accM) {
-  if (!sdOk || !logFile) return;
+  if (!sdOk || !logFile) return false;
+
+  // Network whitelist: skip logging any SSID the user has explicitly listed
+  // (e.g. their own home/work network). Exact, case-sensitive match against
+  // up to 10 configured entries; empty slots are never matched, so a blank
+  // SSID (hidden network) is never accidentally filtered by an unused slot.
+  if (ssid.length() > 0) {
+    for (uint8_t i = 0; i < 10; i++) {
+      if (cfg.ssidWhitelist[i].length() > 0 && cfg.ssidWhitelist[i] == ssid) {
+        return false;
+      }
+    }
+  }
 
   // Rotate CSV before it exceeds the WDGoWars 15 MB upload limit
   if (csvRowCount >= CSV_MAX_ROWS) {
     Serial.println("[SD] CSV row limit reached, rotating log file");
     closeLogFile();
-    if (!openLogFile()) return;
+    if (!openLogFile()) return false;
   }
 
   // Frequency in MHz derived from channel number (WiGLE 1.6 requirement)
@@ -342,7 +354,7 @@ void appendWigleRow(const String& mac, const String& ssid, const String& auth,
                       channel, (unsigned)freq, rssi, lat, lon, altM, accM);
   if (len < 0) {
     Serial.println("[SD] appendWigleRow: encoding error, row skipped");
-    return;
+    return false;
   }
   if ((size_t)len >= sizeof(line)) {
     Serial.printf("[SD] appendWigleRow: row truncated (needed %d bytes, buffer %u) — check SSID\n",
@@ -371,7 +383,7 @@ void appendWigleRow(const String& mac, const String& ssid, const String& auth,
         sdOk = false;
       }
     }
-    return;
+    return false;
   }
 
   // Flush less often to avoid stalls (SD writes can block hard). Threshold
@@ -390,4 +402,6 @@ void appendWigleRow(const String& mac, const String& ssid, const String& auth,
     lastFlushMs = nowMs;
     linesSinceFlush = 0;
   }
+
+  return true;
 }
