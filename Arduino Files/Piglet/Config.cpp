@@ -133,6 +133,10 @@ void cfgAssignKV(const String& k, const String& v) {
     String vv = v; vv.toLowerCase();
     cfg.autoStartAfterUpload = (vv == "true" || vv == "1");
   }
+  else if (k == "uploadOnNetworkSeen") {
+    String vv = v; vv.toLowerCase();
+    cfg.uploadOnNetworkSeen = (vv == "true" || vv == "1");
+  }
   else if (k == "sdMaxSpiHz") {
     long hz = v.toInt();
     if (hz >= 400000 && hz <= 40000000) cfg.sdMaxSpiHz = (uint32_t)hz;  // sanity-clamp to a plausible SPI range
@@ -141,8 +145,15 @@ void cfgAssignKV(const String& k, const String& v) {
     // Keys are ssidWhitelist1..ssidWhitelist10 (1-indexed in the file/UI,
     // 0-indexed in the array). Assign unconditionally -- including empty
     // strings -- so a slot can be cleared by saving it blank from the Web UI.
-    int idx = k.substring(13).toInt();  // strlen("ssidWhitelist") == 13
+      int idx = k.substring(13).toInt();  // strlen("ssidWhitelist") == 13
     if (idx >= 1 && idx <= 10) cfg.ssidWhitelist[idx - 1] = v;
+  }
+}
+
+void cfgEnforceMutualExclusion() {
+  if (cfg.autoStartAfterUpload && cfg.uploadOnNetworkSeen) {
+    Serial.println("[CFG] autoStartAfterUpload + uploadOnNetworkSeen both on -- forcing uploadOnNetworkSeen off");
+    cfg.uploadOnNetworkSeen = false;
   }
 }
 
@@ -171,6 +182,7 @@ bool loadConfigFromSD() {
       }
     }
     f.close();
+    cfgEnforceMutualExclusion();
 
     Serial.println("[CFG] Loaded config from /wardriver.cfg:");
     Serial.print("      wardriverSsid: "); Serial.println(cfg.wardriverSsid);
@@ -310,6 +322,12 @@ bool saveConfigToSD() {
   f.println("# true = wardrive right after uploads complete (headless mode).");
   f.println("# false = stay on home WiFi, keep web UI accessible (default).");
   f.print("autoStartAfterUpload="); f.println(cfg.autoStartAfterUpload ? "true" : "false");
+
+  f.println("");
+  f.println("# Connect + upload automatically when the home SSID is seen while wardriving.");
+  f.println("# Mutually exclusive with autoStartAfterUpload -- enabling that always forces");
+  f.println("# this off. Default: true.");
+  f.print("uploadOnNetworkSeen="); f.println(cfg.uploadOnNetworkSeen ? "true" : "false");
 
   f.println("");
   f.println("# SD-over-SPI clock ceiling in Hz. Boot negotiates the fastest speed up to");

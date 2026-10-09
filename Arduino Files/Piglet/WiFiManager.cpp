@@ -263,6 +263,13 @@ void checkHomeNetworkReturn() {
   if (!homeNetworkSeen) return;
   homeNetworkSeen = false;  // consume -- re-armed next time it's seen in a scan
 
+  // Feature disabled, or mutually exclusive with autoStartAfterUpload (the
+  // latter is authoritative -- cfgEnforceMutualExclusion() keeps
+  // uploadOnNetworkSeen false whenever autoStartAfterUpload is on, but this
+  // check is kept as a defense-in-depth guard against the two ever running
+  // together).
+  if (!cfg.uploadOnNetworkSeen || cfg.autoStartAfterUpload) return;
+
   // Already connected, or AP actively serving the config UI -- nothing to do.
   if (WiFi.status() == WL_CONNECTED) return;
   if (apWindowActive) return;

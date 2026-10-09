@@ -49,6 +49,14 @@ struct Config {
   // but the device will not hold the STA link open. Requires reboot.
   bool autoStartAfterUpload = false;
 
+  // When true (default): if the configured home SSID is seen in a scan
+  // result while wardriving, the device stops scanning, connects to it, and
+  // uploads pending CSVs automatically. Mutually exclusive with
+  // autoStartAfterUpload -- enforced in cfgEnforceMutualExclusion() so the
+  // two features can never both be active (one wants to leave home Wi-Fi
+  // for good after boot, the other wants to return to it mid-drive).
+  bool uploadOnNetworkSeen = true;
+
   // Ceiling for SD-over-SPI clock negotiation (Hz). Boot tries a descending
   // ladder of speeds up to this cap and uses the fastest one that mounts
   // successfully. Lower this if you see SD write errors/corruption on
@@ -73,3 +81,9 @@ bool parseKeyValueLine(const String& lineIn, String& keyOut, String& valOut);
 void cfgAssignKV(const String& k, const String& v);
 bool loadConfigFromSD();
 bool saveConfigToSD();
+
+// Forces uploadOnNetworkSeen off whenever autoStartAfterUpload is on, so the
+// two mutually-exclusive STA-connection behaviors never both run. Call after
+// any bulk config change (file load, Web UI save) -- not from cfgAssignKV()
+// itself, since key order within a save is not guaranteed.
+void cfgEnforceMutualExclusion();

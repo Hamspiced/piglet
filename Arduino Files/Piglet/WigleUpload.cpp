@@ -202,7 +202,8 @@ bool uploadFileToWigle(const String& path) {
 
   uint32_t fileSize = f.size();
   uint32_t contentLen = (uint32_t)pre.length() + fileSize + (uint32_t)post.length();
-  
+  Serial.printf("[WiGLE] File size: %.2f MB (%u bytes)\n", fileSize / (1024.0 * 1024.0), (unsigned)fileSize);
+
   WiFiClientSecure client;
   client.setInsecure();
   client.setTimeout(25000);
@@ -457,6 +458,7 @@ bool uploadFileToWdgwars(const String& path) {
 
   uint32_t fileSize   = f.size();
   uint32_t contentLen = (uint32_t)pre.length() + fileSize + (uint32_t)post.length();
+  Serial.printf("[WDGWars] File size: %.2f MB (%u bytes)\n", fileSize / (1024.0 * 1024.0), (unsigned)fileSize);
 
   WiFiClientSecure client;
   client.setInsecure();

@@ -43,7 +43,7 @@
 #include "esp32-hal-matrix.h"
 
 // Firmware version
-#define FIRMWARE_VERSION "v2.63"
+#define FIRMWARE_VERSION "v2.635"
 
 // ---------------- Pins (T-DONGLE C5) ----------------
 struct PinMap {
@@ -150,6 +150,10 @@ struct Config {
   // Up to 10 SSIDs that will never be logged (exact, case-sensitive match).
   // Empty slots never match, so blank/hidden SSIDs are not accidentally filtered.
   String ssidWhitelist[10];
+  // When true (default): if the configured home SSID is seen in a scan
+  // result while wardriving, the device stops scanning, connects to it, and
+  // uploads pending CSVs automatically.
+  bool uploadOnNetworkSeen = true;
 };
 
 Config cfg;
@@ -420,6 +424,10 @@ static void cfgAssignKV(const String& k, const String& v) {
     int idx = k.substring(13).toInt();
     if (idx >= 1 && idx <= 10) cfg.ssidWhitelist[idx - 1] = v;  // assign even if empty, to allow clearing
   }
+  else if (k == "uploadOnNetworkSeen") {
+    String vv = v; vv.toLowerCase();
+    cfg.uploadOnNetworkSeen = (vv == "true" || vv == "1");
+  }
 }
 
 static bool saveConfigToSD() {
@@ -455,6 +463,8 @@ static bool saveConfigToSD() {
   for (int i = 0; i < 10; i++) {
     f.print("ssidWhitelist"); f.print(i + 1); f.print("="); f.println(cfg.ssidWhitelist[i]);
   }
+  f.println("# Connect + upload automatically when the home SSID is seen while wardriving.");
+  f.print("uploadOnNetworkSeen="); f.println(cfg.uploadOnNetworkSeen ? "true" : "false");
 
   f.flush(); f.close();
   Serial.println("[CFG] Saved OK");
@@ -764,7 +774,9 @@ static bool uploadFileToWdgwars(const String& path) {
   String filename = pathBasename(path);
   String pre = "--"+boundary+"\r\nContent-Disposition: form-data; name=\"file\"; filename=\""+filename+"\"\r\nContent-Type: text/csv\r\n\r\n";
   String post = "\r\n--"+boundary+"--\r\n";
-  uint32_t contentLen = (uint32_t)pre.length()+(uint32_t)f.size()+(uint32_t)post.length();
+  uint32_t fileSize = f.size();
+  uint32_t contentLen = (uint32_t)pre.length()+fileSize+(uint32_t)post.length();
+  Serial.printf("[WDGWars] File size: %.2f MB (%u bytes)\n", fileSize / (1024.0 * 1024.0), (unsigned)fileSize);
 
   WiFiClientSecure client;
   client.setInsecure(); client.setTimeout(25000);
@@ -1143,7 +1155,9 @@ static bool uploadFileToWigle(const String& path) {
   String filename = pathBasename(path);
   String pre = "--" + boundary + "\r\nContent-Disposition: form-data; name=\"file\"; filename=\"" + filename + "\"\r\nContent-Type: text/csv\r\n\r\n";
   String post = "\r\n--" + boundary + "--\r\n";
-  uint32_t contentLen = (uint32_t)pre.length() + (uint32_t)f.size() + (uint32_t)post.length();
+  uint32_t fileSize = f.size();
+  uint32_t contentLen = (uint32_t)pre.length() + fileSize + (uint32_t)post.length();
+  Serial.printf("[WiGLE] File size: %.2f MB (%u bytes)\n", fileSize / (1024.0 * 1024.0), (unsigned)fileSize);
 
   WiFiClientSecure client;
   client.setInsecure();
@@ -1172,7 +1186,6 @@ static bool uploadFileToWigle(const String& path) {
   }
   f.close();
 
-  uint32_t fileSize = contentLen - (uint32_t)pre.length() - (uint32_t)post.length();
   if (fileSent != fileSize) {
     client.stop();
     uploadLastResult = "Read/write error (body short)";
@@ -3322,6 +3335,7 @@ static void handleStatus() {
   c["deviceName"]     = cfg.deviceName;
   c["meshModeOnBoot"] = cfg.meshModeOnBoot;
   c["rotateScreen180"] = cfg.rotateScreen180;
+  c["uploadOnNetworkSeen"] = cfg.uploadOnNetworkSeen;
   for (int i = 0; i < 10; i++) {
     c[String("ssidWhitelist") + String(i + 1)] = cfg.ssidWhitelist[i];
   }
@@ -3532,18 +3546,53 @@ static void handleWigleUploadOne() {
   digitalWrite(PINS.tft_cs, HIGH);
   if (!SD.exists(path)) { server.send(404, "text/plain", "Not found"); return; }
 
+  bool hasWigle = cfg.wigleBasicToken.length() >= 8;
+  bool hasWdg   = cfg.wdgwarsApiKey.length()   >= 8;
+  if (!hasWigle && !hasWdg) {
+    server.send(400, "text/plain", "No WiGLE token or WDGoWars API key configured");
+    return;
+  }
+
   uploading = true; uploadPausedScanWasEnabled = scanningEnabled; scanningEnabled = false;
   uploadTotalFiles = 1; uploadDoneFiles = 0; uploadCurrentFile = path;
   ledBlue();
 
-  bool ok = uploadFileToWigle(path);
+  // Mirrors the batch upload flow (uploadAllCsvsToWigle): try WDGoWars first
+  // (if configured), then WiGLE, and move the file to /uploaded if EITHER
+  // succeeds. Previously this only ever attempted WiGLE, so a file uploaded
+  // via this per-file button never moved out of /logs when only a WDGoWars
+  // API key was configured (no WiGLE token).
+  wigleLastHttpCode = 0;  // avoid reporting a stale code if WiGLE isn't attempted below
+  bool wdgOk = false;
+  if (hasWdg) {
+    uploadTargetName = "WDGW UL";
+    tftWigleUploadScreen(uploadDoneFiles, uploadTotalFiles, pathBasename(path));
+    wdgOk = uploadFileToWdgwars(path);
+    if (hasWigle) delay(1500);  // brief settle between TLS sessions
+  }
+  String wdgResult = uploadLastResult;  // preserve before uploadFileToWigle overwrites it
+
+  bool wigleOk = false;
+  if (hasWigle) {
+    uploadTargetName = "WiGLE UL";
+    tftWigleUploadScreen(uploadDoneFiles, uploadTotalFiles, pathBasename(path));
+    wigleOk = uploadFileToWigle(path);
+  }
+
   uploadDoneFiles = 1; uploading = false;
-  scanningEnabled = uploadPausedScanWasEnabled; uploadCurrentFile = "";
+  scanningEnabled = uploadPausedScanWasEnabled; uploadCurrentFile = ""; uploadTargetName = "";
   ledOff(); forceStatusFullRedraw();
+
+  bool ok = wigleOk || wdgOk;
   if (ok) moveToUploaded(path);
 
+  String message = uploadLastResult;
+  if (hasWdg && hasWigle) {
+    message = "WDGW: " + wdgResult + " | WiGLE: " + uploadLastResult;
+  }
+
   DynamicJsonDocument doc(384);
-  doc["ok"] = ok; doc["httpCode"] = wigleLastHttpCode; doc["message"] = uploadLastResult;
+  doc["ok"] = ok; doc["httpCode"] = wigleLastHttpCode; doc["message"] = message;
   String out; serializeJson(doc, out);
   server.send(ok ? 200 : 500, "application/json", out);
 }
@@ -3807,6 +3856,9 @@ static const uint32_t HOME_RETURN_RETRY_MS = 30000UL;
 static void checkHomeNetworkReturn() {
   if (!homeNetworkSeen) return;
   homeNetworkSeen = false;  // consume -- re-armed next time it's seen in a scan
+
+  // Feature disabled via config -- toggleable, default on.
+  if (!cfg.uploadOnNetworkSeen) return;
 
   // Already connected, or AP actively serving the config UI -- nothing to do.
   if (WiFi.status() == WL_CONNECTED) return;

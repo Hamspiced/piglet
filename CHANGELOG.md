@@ -1,5 +1,21 @@
 # Changelog
 
+## v2.635 (2026-10-09)
+
+### Bug Fixes
+- **Per-file "Upload" button never moved the file when only WDGoWars was configured** — the single-file upload button in the SD Card Files list only ever attempted a WiGLE upload and moved the file to `/uploaded` solely on WiGLE success. If a WDGoWars API key was set but no WiGLE token was configured, that WiGLE attempt always failed immediately ("No token set"), so the file was uploaded to WDGoWars successfully but never moved out of `/logs`. This endpoint now mirrors the batch upload flow: it tries WDGoWars first (if configured), then WiGLE, and moves the file if either succeeds. Applied to both the main Piglet firmware and the T-Dongle C5 standalone firmware.
+
+### New Features
+- **Upload When Home Network Seen toggle** — the home-network auto-return/upload behavior is now a configurable option (`uploadOnNetworkSeen`, default enabled) instead of always-on, via a new Web UI dropdown. On the main Piglet firmware it is also mutually exclusive with **Auto-Start Wardriving After Uploads**: enabling that option always forces this one off (both client-side in the Web UI and server-side on save/load), since the two behaviors conflict — one disconnects from home Wi-Fi for good after boot, the other wants to reconnect to it mid-drive. Applied to both the main Piglet firmware and the T-Dongle C5 standalone firmware (T-Dongle C5 does not have Auto-Start Wardriving After Uploads, so only the toggle applies there).
+
+### Diagnostics
+- **File size logged for every upload** — `uploadFileToWigle()` and `uploadFileToWdgwars()` now print the CSV's size in MB (and raw bytes) to Serial right before sending it, for both single-file and batch uploads on the main Piglet firmware and the T-Dongle C5 standalone firmware.
+
+### Configuration
+- New config option: `uploadOnNetworkSeen` — connect + upload automatically when the home SSID is seen while wardriving (default: true).
+
+---
+
 ## v2.63 (2026-10-07)
 
 ### New Features

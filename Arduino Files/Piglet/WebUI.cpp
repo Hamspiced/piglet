@@ -389,13 +389,22 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
           <option value="true">Rotated 180&deg;</option>
         </select>
       </div>
+      <div><label>Upload When Home Network Seen (while wardriving)</label>
+        <select id="uploadOnNetworkSeen" onchange="syncUploadOnNetworkSeen()">
+          <option value="true">Enabled &mdash; Connect &amp; Upload Automatically (default)</option>
+          <option value="false">Disabled</option>
+        </select>
+      </div>
       <div><label>Auto-Start Wardriving After Uploads (requires reboot)</label>
-        <select id="autoStartAfterUpload">
+        <select id="autoStartAfterUpload" onchange="syncUploadOnNetworkSeen()">
           <option value="false">Disabled &mdash; Stay on Home Wi-Fi (default)</option>
           <option value="true">Enabled &mdash; Disconnect and Wardrive Immediately</option>
         </select>
       </div>
     </div>
+    <p style="margin-top:8px;font-size:12px;color:var(--muted)">
+      <strong>Upload When Home Network Seen</strong> and <strong>Auto-Start Wardriving After Uploads</strong> are mutually exclusive &mdash; enabling Auto-Start always disables Upload When Home Network Seen.
+    </p>
     <div class="mt-md">
       <label>Network Whitelist &mdash; SSIDs to Scan but Never Log (up to 10, one per line)</label>
       <textarea id="ssidWhitelist" rows="4" placeholder="e.g.&#10;MyHomeNetwork&#10;MyOfficeWifi"></textarea>
@@ -514,7 +523,7 @@ async function loadStatus(){
     setText('vApSsid',j?.config?.wardriverSsid||'\u2014');
 
     // Fill config form — skip masked/secret values
-    for(const k of ['wigleBasicToken','wdgwarsApiKey','deviceName','board','gpsBaud','homeSsid','wardriverSsid','wardriverPsk','scanMode','speedUnits','battPin','batteryTest','maxBootUploads','meshModeOnBoot','rotateScreen180','autoStartAfterUpload']){
+    for(const k of ['wigleBasicToken','wdgwarsApiKey','deviceName','board','gpsBaud','homeSsid','wardriverSsid','wardriverPsk','scanMode','speedUnits','battPin','batteryTest','maxBootUploads','meshModeOnBoot','rotateScreen180','autoStartAfterUpload','uploadOnNetworkSeen']){
       if(j.config&&(k in j.config)){
         const v=String(j.config[k]);
         if(maskedKeys.has(k)&&(v===''||v==='(set)'))continue;
@@ -534,7 +543,23 @@ async function loadStatus(){
       const wlEl=$('ssidWhitelist');
       if(wlEl)wlEl.value=lines.join('\n');
     }
+
+    syncUploadOnNetworkSeen();
   }catch(e){console.error('loadStatus',e)}
+}
+
+/* ---- Mutual exclusion: Upload On Network Seen vs Auto-Start After Upload ----
+   The two features can never both be active. Auto-Start wins: enabling it
+   forces Upload On Network Seen off and greys it out client-side; the
+   firmware enforces the same rule server-side on load/save regardless of
+   what the client sends. */
+function syncUploadOnNetworkSeen(){
+  const auto=$('autoStartAfterUpload');
+  const uns=$('uploadOnNetworkSeen');
+  if(!auto||!uns)return;
+  const autoOn=auto.value==='true';
+  uns.disabled=autoOn;
+  if(autoOn)uns.value='false';
 }
 
 /* ---- Files ---- */
@@ -607,7 +632,7 @@ async function deleteAllLogs(){
 
 /* ---- Shared save logic used by both Save and Save+Reboot ---- */
 async function doSave(){
-  const keys=['board','wigleBasicToken','wdgwarsApiKey','deviceName','gpsBaud','homeSsid','homePsk','wardriverSsid','wardriverPsk','scanMode','speedUnits','battPin','batteryTest','maxBootUploads','meshModeOnBoot','rotateScreen180','autoStartAfterUpload'];
+  const keys=['board','wigleBasicToken','wdgwarsApiKey','deviceName','gpsBaud','homeSsid','homePsk','wardriverSsid','wardriverPsk','scanMode','speedUnits','battPin','batteryTest','maxBootUploads','meshModeOnBoot','rotateScreen180','autoStartAfterUpload','uploadOnNetworkSeen'];
   let body='# Saved from Web UI\n# key=value\n';
   for(const k of keys){
     const el=$(k);
@@ -882,6 +907,7 @@ static void handleStatus() {
   c["meshModeOnBoot"] = cfg.meshModeOnBoot;
   c["rotateScreen180"] = cfg.rotateScreen180;
   c["autoStartAfterUpload"] = cfg.autoStartAfterUpload;
+  c["uploadOnNetworkSeen"] = cfg.uploadOnNetworkSeen;
   for (uint8_t i = 0; i < 10; i++) {
     c[String("ssidWhitelist") + String(i + 1)] = cfg.ssidWhitelist[i];
   }
@@ -1069,6 +1095,8 @@ static void handleSaveConfig() {
     return;
   }
 
+  cfgEnforceMutualExclusion();
+
   Serial.println("[CFG] Updated config from Web UI (in-RAM). Saving to SD...");
   bool ok = saveConfigToSD();
   server.send(ok ? 200 : 500, "text/plain", ok ? "OK" : "FAIL");
@@ -1173,6 +1201,13 @@ static void handleWigleUploadOne() {
   String path = server.arg("name");
   if (!SD.exists(path)) { server.send(404, "text/plain", "Not found"); return; }
 
+  bool hasWigle = cfg.wigleBasicToken.length() >= 8;
+  bool hasWdg   = cfg.wdgwarsApiKey.length()   >= 8;
+  if (!hasWigle && !hasWdg) {
+    server.send(400, "text/plain", "No WiGLE token or WDGoWars API key configured");
+    return;
+  }
+
   uploading = true;
   uploadPausedScanWasEnabled = scanningEnabled;
   scanningEnabled = false;
@@ -1182,7 +1217,27 @@ static void handleWigleUploadOne() {
   uploadCurrentFile = path;
   updateOLED(0);
 
-  bool ok = uploadFileToWigle(path);
+  // Mirrors the batch upload flow (uploadAllCsvsToWigle): try WDGoWars first
+  // (if configured), then WiGLE, and move the file to /uploaded if EITHER
+  // succeeds. Previously this only ever attempted WiGLE, so a file uploaded
+  // via this per-file button never moved out of /logs when only a WDGoWars
+  // API key was configured (no WiGLE token).
+  wigleLastHttpCode = 0;  // avoid reporting a stale code if WiGLE isn't attempted below
+  bool wdgOk = false;
+  if (hasWdg) {
+    uploadTargetName = "WDGW UL";
+    updateOLED(0);
+    wdgOk = uploadFileToWdgwars(path);
+    if (hasWigle) delay(1500);  // brief settle between TLS sessions
+  }
+  String wdgResult = uploadLastResult;  // preserve before uploadFileToWigle overwrites it
+
+  bool wigleOk = false;
+  if (hasWigle) {
+    uploadTargetName = "WiGLE UL";
+    updateOLED(0);
+    wigleOk = uploadFileToWigle(path);
+  }
 
   uploadDoneFiles = 1;
   updateOLED(0);
@@ -1190,17 +1245,25 @@ static void handleWigleUploadOne() {
   uploading = false;
   scanningEnabled = uploadPausedScanWasEnabled;
   uploadCurrentFile = "";
+  uploadTargetName = "";
   updateOLED(0);
 
+  bool ok = wigleOk || wdgOk;
   if (ok) {
     moveToUploaded(path);
     // History will auto-refresh when user next accesses /files.json
   }
 
+  // Combine both results into the message when both services were attempted
+  String message = uploadLastResult;
+  if (hasWdg && hasWigle) {
+    message = "WDGW: " + wdgResult + " | WiGLE: " + uploadLastResult;
+  }
+
   DynamicJsonDocument doc(384);
   doc["ok"] = ok;
   doc["httpCode"] = wigleLastHttpCode;
-  doc["message"] = uploadLastResult;
+  doc["message"] = message;
 
   String out;
   serializeJson(doc, out);
