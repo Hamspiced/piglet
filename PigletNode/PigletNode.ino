@@ -20,7 +20,7 @@
 #include <esp_now.h>
 #include "esp_wifi.h"
 
-#define FIRMWARE_VERSION "v2.585"
+#define FIRMWARE_VERSION "v2.65"
 
 // ================================================================
 //  Board — XIAO ESP32-C5
@@ -483,10 +483,20 @@ static void statusTick() {
 // ================================================================
 //  Button: hold >2 s to force a re-search
 // ================================================================
+// BTN_PIN is GPIO0, which doubles as the ESP32 BOOT/flash-mode strapping
+// pin. The 2 s continuous-hold requirement already makes this fairly
+// immune to brief post-flash reset noise, but a short settle window is
+// still applied for defense-in-depth consistency with the other Piglet
+// firmware variants; set once near the end of setup().
+static const uint32_t BTN_BOOT_SETTLE_MS = 1500;
+static uint32_t btnBootSettleUntilMs = 0;
+
 static void buttonTick() {
   static bool     pressing      = false;
   static bool     triggered     = false;
   static uint32_t pressStartMs  = 0;
+
+  if (millis() < btnBootSettleUntilMs) return;
 
   bool low = (digitalRead(BTN_PIN) == LOW);
 
@@ -563,6 +573,11 @@ void setup() {
   delay(stagger);
 
   nodeActive = true;
+
+  // Arm the button boot-settle guard now, right as loop() is about to start —
+  // see buttonTick() for the rationale.
+  btnBootSettleUntilMs = millis() + BTN_BOOT_SETTLE_MS;
+
   Serial.println("[NODE] Ready — searching for Core on ch 6...");
 }
 

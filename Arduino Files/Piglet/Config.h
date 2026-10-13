@@ -27,6 +27,14 @@ struct Config {
   // Leave empty to disable WDGoWars uploads.
   String wdgwarsApiKey;
 
+  // Wardrift API key (wdk_...) from wardrift.net, sent as "X-API-Key".
+  // The CSV file is uploaded as-is (raw body, Content-Type: text/csv,
+  // X-File-Name header) to POST /v1/ingest/signals -- no multipart wrapper
+  // and no parsing needed. If set, CSVs are uploaded to Wardrift AFTER
+  // WDGoWars but BEFORE WiGLE at every boot (2nd in the chain). Leave empty
+  // to disable Wardrift uploads.
+  String wardriftApiKey;
+
   // Optional device name — appended to WiGLE CSV header and filename so
   // multiple Piglets uploading to the same account can be distinguished.
   // E.g. deviceName=rover1  →  device=Piglet-rover1  /  rover1_Piglet_WiGLE_....csv

@@ -20,3 +20,11 @@ uint32_t uploadAllCsvsToWdgwars(int maxFiles = -1); // WDGoWars-only batch uploa
 // to give pending jobs a last chance to resolve.
 void     wdgwarsServicePendingJobs();
 void     wdgwarsDrainPendingJobs(uint32_t budgetMs);
+
+// Wardrift upload (wardrift.net) — uses X-API-Key header, POST /v1/ingest/signals.
+// The CSV file is uploaded as-is (raw body, Content-Type: text/csv, plus an
+// X-File-Name header) -- no multipart wrapper, no per-row parsing. Runs 2nd
+// in the upload chain: after WDGoWars, before WiGLE.
+bool     wardriftTestKey();                           // posts a header-only test CSV — 200 = valid
+bool     uploadFileToWardrift(const String& path);
+uint32_t uploadAllCsvsToWardrift(int maxFiles = -1);  // Wardrift-only batch upload

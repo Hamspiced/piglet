@@ -19,7 +19,7 @@ Designed for **[Seeed XIAO ESP32-S3](https://wiki.seeedstudio.com/xiao_esp32s3_g
 - SD card logging in WiGLE CSV format  
 - Web UI for:
   - Start / stop scanning  
-  - Upload logs to WiGLE  
+  - Upload logs to WiGLE, WDGoWars, and Wardrift  
   - View device status  
   - Manage SD files  
   - Edit configuration  
@@ -282,6 +282,14 @@ wigleBasicToken=EnterWigleTokenHere
 # Leave empty to disable WDGoWars uploads.
 
 wdgwarsApiKey=EnterWDGoWarsAPIKeyHere
+
+# ------------------------------------------------------------
+# Wardrift
+# ------------------------------------------------------------
+# Get your API key at: https://wardrift.net
+# Leave empty to disable Wardrift uploads.
+
+wardriftApiKey=EnterWardriftAPIKeyHere
 
 # ------------------------------------------------------------
 # Max Automatic Uploads at Boot

@@ -120,6 +120,7 @@ void cfgAssignKV(const String& k, const String& v) {
     if (n >= -1) cfg.maxBootUploads = n;  // -1=all, 0=disabled, 1+=limited
   }
   else if (k == "wdgwarsApiKey")    cfg.wdgwarsApiKey = v;
+  else if (k == "wardriftApiKey")   cfg.wardriftApiKey = v;
   else if (k == "deviceName")       cfg.deviceName = v;
   else if (k == "meshModeOnBoot") {
     String vv = v; vv.toLowerCase();
@@ -301,6 +302,11 @@ bool saveConfigToSD() {
   f.println("");
   f.println("# WDGoWars API key from https://wdgwars.pl/profile (leave empty to disable)");
   f.print("wdgwarsApiKey="); f.println(cfg.wdgwarsApiKey);
+
+  f.println("");
+  f.println("# Wardrift API key (wdk_...) from wardrift.net, sent as X-API-Key.");
+  f.println("# Leave empty to disable Wardrift uploads.");
+  f.print("wardriftApiKey="); f.println(cfg.wardriftApiKey);
 
   f.println("# Device name — identifies this Piglet in WiGLE headers and filenames.");
   f.println("# Alphanumeric + _ - only.  E.g.: rover1  backpack  car");

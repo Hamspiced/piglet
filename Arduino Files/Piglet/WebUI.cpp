@@ -321,6 +321,16 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
         <button class="btn-primary" onclick="wdgwarsUploadAll()">Upload All CSVs</button>
       </div>
     </div>
+
+    <!-- Wardrift section -->
+    <div class="inner-card">
+      <h4>Wardrift</h4>
+      <div id="wardriftMsg" class="muted" style="font-size:14px">—</div>
+      <div class="row mt-sm">
+        <button onclick="wardriftTest()">Test API Key</button>
+        <button class="btn-primary" onclick="wardriftUploadAll()">Upload All CSVs</button>
+      </div>
+    </div>
   </div>
 
   <!-- ============ CONFIG ============ -->
@@ -329,23 +339,28 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
     <div class="cfg-grid">
       <div>
         <label>WiGLE Basic Token</label>
-        <input id="wigleBasicToken" placeholder="Enter 'Encoded for use' token from wigle.net/account">
+        <input id="wigleBasicToken" placeholder="Enter 'Encoded for use' token from wigle.net/account" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false">
         <a href="https://wigle.net/account" target="_blank" rel="noopener" style="font-size:12px;margin-top:5px;display:inline-block">&rarr; Get your API Key here</a>
       </div>
       <div>
         <label>WDGoWars API Key</label>
-        <input id="wdgwarsApiKey" placeholder="API key from wdgwars.pl/profile (leave empty to disable)">
+        <input id="wdgwarsApiKey" placeholder="API key from wdgwars.pl/profile (leave empty to disable)" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false">
         <a href="https://wdgwars.pl/profile/" target="_blank" rel="noopener" style="font-size:12px;margin-top:5px;display:inline-block">&rarr; Get your API Key here</a>
       </div>
       <div>
+        <label>Wardrift API Key</label>
+        <input id="wardriftApiKey" placeholder="API key (wdk_...) from wardrift.net (leave empty to disable)" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false">
+        <a href="https://wardrift.net" target="_blank" rel="noopener" style="font-size:12px;margin-top:5px;display:inline-block">&rarr; Get your API Key at wardrift.net</a>
+      </div>
+      <div>
         <label>Device Name</label>
-        <input id="deviceName" placeholder="e.g. rover1 &mdash; identifies this device in WiGLE uploads (optional)">
+        <input id="deviceName" placeholder="e.g. rover1 &mdash; identifies this device in WiGLE uploads (optional)" autocomplete="off">
       </div>
       <div><label>GPS Baud Rate</label><input id="gpsBaud" type="number" value="9600"></div>
-      <div><label>Home SSID</label><input id="homeSsid" placeholder="Your home Wi-Fi"></div>
-      <div><label>Home PSK</label><input id="homePsk" type="password" placeholder="Password"></div>
-      <div><label>Wardriver SSID</label><input id="wardriverSsid"></div>
-      <div><label>Wardriver PSK</label><input id="wardriverPsk" type="password"></div>
+      <div><label>Home SSID</label><input id="homeSsid" placeholder="Your home Wi-Fi" autocomplete="off"></div>
+      <div><label>Home PSK</label><input id="homePsk" type="password" placeholder="Password" autocomplete="new-password"></div>
+      <div><label>Wardriver SSID</label><input id="wardriverSsid" autocomplete="off"></div>
+      <div><label>Wardriver PSK</label><input id="wardriverPsk" type="password" autocomplete="new-password"></div>
       <div><label>Scan Mode</label>
         <select id="scanMode">
           <option value="aggressive">Aggressive</option>
@@ -523,7 +538,7 @@ async function loadStatus(){
     setText('vApSsid',j?.config?.wardriverSsid||'\u2014');
 
     // Fill config form — skip masked/secret values
-    for(const k of ['wigleBasicToken','wdgwarsApiKey','deviceName','board','gpsBaud','homeSsid','wardriverSsid','wardriverPsk','scanMode','speedUnits','battPin','batteryTest','maxBootUploads','meshModeOnBoot','rotateScreen180','autoStartAfterUpload','uploadOnNetworkSeen']){
+    for(const k of ['wigleBasicToken','wdgwarsApiKey','wardriftApiKey','deviceName','board','gpsBaud','homeSsid','wardriverSsid','wardriverPsk','scanMode','speedUnits','battPin','batteryTest','maxBootUploads','meshModeOnBoot','rotateScreen180','autoStartAfterUpload','uploadOnNetworkSeen']){
       if(j.config&&(k in j.config)){
         const v=String(j.config[k]);
         if(maskedKeys.has(k)&&(v===''||v==='(set)'))continue;
@@ -632,7 +647,7 @@ async function deleteAllLogs(){
 
 /* ---- Shared save logic used by both Save and Save+Reboot ---- */
 async function doSave(){
-  const keys=['board','wigleBasicToken','wdgwarsApiKey','deviceName','gpsBaud','homeSsid','homePsk','wardriverSsid','wardriverPsk','scanMode','speedUnits','battPin','batteryTest','maxBootUploads','meshModeOnBoot','rotateScreen180','autoStartAfterUpload','uploadOnNetworkSeen'];
+  const keys=['board','wigleBasicToken','wdgwarsApiKey','wardriftApiKey','deviceName','gpsBaud','homeSsid','homePsk','wardriverSsid','wardriverPsk','scanMode','speedUnits','battPin','batteryTest','maxBootUploads','meshModeOnBoot','rotateScreen180','autoStartAfterUpload','uploadOnNetworkSeen'];
   let body='# Saved from Web UI\n# key=value\n';
   for(const k of keys){
     const el=$(k);
@@ -713,6 +728,34 @@ async function wdgwarsUploadAll(){
       setWdgwarsMsg(msg,j.ok?'ok-text':'bad-text');
     }
   }catch(e){setWdgwarsMsg('Upload request failed','bad-text')}
+  await loadFiles();
+}
+
+function setWardriftMsg(t,cls){
+  const el=$('wardriftMsg');
+  el.textContent=t;
+  el.className=cls||'muted';
+}
+
+async function wardriftTest(){
+  setWardriftMsg('Testing key\u2026');
+  try{
+    const r=await fetch('/wardrift/test',{method:'POST'});
+    const j=await r.json().catch(()=>({ok:false,message:'Bad response'}));
+    setWardriftMsg(j.message||(j.ok?'Key valid':'Key invalid'),j.ok?'ok-text':'bad-text');
+  }catch(e){setWardriftMsg('Request failed','bad-text')}
+}
+
+async function wardriftUploadAll(){
+  setWardriftMsg('Uploading all CSVs to Wardrift\u2026');
+  try{
+    const r=await fetch('/wardrift/uploadAll',{method:'POST'});
+    const j=await r.json().catch(()=>null);
+    if(j){
+      const msg=j.message||(j.ok?j.uploaded+' file(s) uploaded':'Upload failed');
+      setWardriftMsg(msg,j.ok?'ok-text':'bad-text');
+    }
+  }catch(e){setWardriftMsg('Upload request failed','bad-text')}
   await loadFiles();
 }
 
@@ -892,6 +935,7 @@ static void handleStatus() {
   JsonObject c = doc.createNestedObject("config");
   c["wigleBasicToken"] = cfg.wigleBasicToken;
   c["wdgwarsApiKey"]   = cfg.wdgwarsApiKey;
+  c["wardriftApiKey"]  = cfg.wardriftApiKey;
   c["homeSsid"] = cfg.homeSsid;
   c["homePsk"] = cfg.homePsk.length() ? "(set)" : "";
   c["wardriverSsid"] = cfg.wardriverSsid;
@@ -1172,6 +1216,47 @@ static void handleWdgwarsUploadAll() {
   server.send(200, "application/json", out);
 }
 
+static void handleWardriftTest() {
+  if (WiFi.status() != WL_CONNECTED) {
+    server.send(400, "application/json",
+                "{\"ok\":false,\"message\":\"STA WiFi not connected\"}");
+    return;
+  }
+  if (cfg.wardriftApiKey.length() < 8) {
+    server.send(400, "application/json",
+                "{\"ok\":false,\"message\":\"No API key configured\"}");
+    return;
+  }
+
+  bool ok = wardriftTestKey();
+
+  DynamicJsonDocument doc(256);
+  doc["ok"]      = ok;
+  doc["message"] = uploadLastResult;
+
+  String out;
+  serializeJson(doc, out);
+  server.send(ok ? 200 : 400, "application/json", out);
+}
+
+static void handleWardriftUploadAll() {
+  if (!sdOk) { server.send(500, "text/plain", "SD not available"); return; }
+  if (WiFi.status() != WL_CONNECTED) { server.send(400, "text/plain", "STA WiFi not connected"); return; }
+  if (cfg.wardriftApiKey.length() < 8) { server.send(400, "text/plain", "No API key configured"); return; }
+
+  uint32_t okCount = uploadAllCsvsToWardrift(-1);
+
+  DynamicJsonDocument doc(256);
+  doc["ok"]       = (okCount > 0);
+  doc["uploaded"] = okCount;
+  doc["total"]    = uploadTotalFiles;
+  doc["message"]  = uploadLastResult;
+
+  String out;
+  serializeJson(doc, out);
+  server.send(200, "application/json", out);
+}
+
 static void handleWigleUploadAll() {
   if (!sdOk) { server.send(500, "text/plain", "SD not available"); return; }
   if (WiFi.status() != WL_CONNECTED) { server.send(400, "text/plain", "STA WiFi not connected"); return; }
@@ -1201,10 +1286,11 @@ static void handleWigleUploadOne() {
   String path = server.arg("name");
   if (!SD.exists(path)) { server.send(404, "text/plain", "Not found"); return; }
 
-  bool hasWigle = cfg.wigleBasicToken.length() >= 8;
-  bool hasWdg   = cfg.wdgwarsApiKey.length()   >= 8;
-  if (!hasWigle && !hasWdg) {
-    server.send(400, "text/plain", "No WiGLE token or WDGoWars API key configured");
+  bool hasWigle    = cfg.wigleBasicToken.length() >= 8;
+  bool hasWdg      = cfg.wdgwarsApiKey.length()   >= 8;
+  bool hasWardrift = cfg.wardriftApiKey.length()  >= 8;
+  if (!hasWigle && !hasWdg && !hasWardrift) {
+    server.send(400, "text/plain", "No WiGLE token, WDGoWars API key, or Wardrift token configured");
     return;
   }
 
@@ -1217,20 +1303,29 @@ static void handleWigleUploadOne() {
   uploadCurrentFile = path;
   updateOLED(0);
 
-  // Mirrors the batch upload flow (uploadAllCsvsToWigle): try WDGoWars first
-  // (if configured), then WiGLE, and move the file to /uploaded if EITHER
-  // succeeds. Previously this only ever attempted WiGLE, so a file uploaded
-  // via this per-file button never moved out of /logs when only a WDGoWars
-  // API key was configured (no WiGLE token).
+  // Mirrors the batch upload flow (uploadAllCsvsToWigle): try WDGoWars, then
+  // Wardrift, then WiGLE (whichever are configured), and move the file to
+  // /uploaded if ANY succeed. Previously this only ever attempted WiGLE, so
+  // a file uploaded via this per-file button never moved out of /logs when
+  // only a WDGoWars API key was configured (no WiGLE token).
   wigleLastHttpCode = 0;  // avoid reporting a stale code if WiGLE isn't attempted below
   bool wdgOk = false;
   if (hasWdg) {
     uploadTargetName = "WDGW UL";
     updateOLED(0);
     wdgOk = uploadFileToWdgwars(path);
+    if (hasWardrift || hasWigle) delay(1500);  // brief settle between TLS sessions
+  }
+  String wdgResult = uploadLastResult;  // preserve before the next call overwrites it
+
+  bool wardriftOk = false;
+  if (hasWardrift) {
+    uploadTargetName = "Wardrift UL";
+    updateOLED(0);
+    wardriftOk = uploadFileToWardrift(path);
     if (hasWigle) delay(1500);  // brief settle between TLS sessions
   }
-  String wdgResult = uploadLastResult;  // preserve before uploadFileToWigle overwrites it
+  String wardriftResult = uploadLastResult;  // preserve before uploadFileToWigle overwrites it
 
   bool wigleOk = false;
   if (hasWigle) {
@@ -1248,16 +1343,25 @@ static void handleWigleUploadOne() {
   uploadTargetName = "";
   updateOLED(0);
 
-  bool ok = wigleOk || wdgOk;
+  bool ok = wigleOk || wdgOk || wardriftOk;
   if (ok) {
     moveToUploaded(path);
     // History will auto-refresh when user next accesses /files.json
   }
 
-  // Combine both results into the message when both services were attempted
+  // Combine all attempted services' results into the message
+  int attempted = (hasWdg ? 1 : 0) + (hasWardrift ? 1 : 0) + (hasWigle ? 1 : 0);
   String message = uploadLastResult;
-  if (hasWdg && hasWigle) {
-    message = "WDGW: " + wdgResult + " | WiGLE: " + uploadLastResult;
+  if (attempted > 1) {
+    std::vector<String> parts;
+    if (hasWdg)      parts.push_back("WDGW: " + wdgResult);
+    if (hasWardrift) parts.push_back("Wardrift: " + wardriftResult);
+    if (hasWigle)    parts.push_back("WiGLE: " + uploadLastResult);
+    message = "";
+    for (size_t i = 0; i < parts.size(); i++) {
+      if (i) message += " | ";
+      message += parts[i];
+    }
   }
 
   DynamicJsonDocument doc(384);
@@ -1408,6 +1512,8 @@ void startWebServer() {
   server.on("/wigle/upload",    HTTP_POST, handleWigleUploadOne);
   server.on("/wdgwars/test",      HTTP_POST, handleWdgwarsTest);
   server.on("/wdgwars/uploadAll", HTTP_POST, handleWdgwarsUploadAll);
+  server.on("/wardrift/test",      HTTP_POST, handleWardriftTest);
+  server.on("/wardrift/uploadAll", HTTP_POST, handleWardriftUploadAll);
 
   server.begin();
   Serial.println("[WEB] Server started");

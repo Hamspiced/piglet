@@ -1,5 +1,5 @@
 #pragma once
-#define FIRMWARE_VERSION "v2.635"
+#define FIRMWARE_VERSION "v2.7"
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
@@ -76,6 +76,10 @@ extern int      wigleLastHttpCode;
 // ---- WiGLE constants ----
 extern const char* WIGLE_HOST;
 extern const uint16_t WIGLE_PORT;
+
+// ---- Wardrift constants ----
+extern const char* WARDRIFT_HOST;
+extern const uint16_t WARDRIFT_PORT;
 
 // ---- Optional TLS buffer sizing (no-op for broad core compatibility) ----
 inline void tlsMaybeSetBufferSizes(WiFiClientSecure&, int, int) {}

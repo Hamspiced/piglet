@@ -1,5 +1,18 @@
 # Changelog
 
+## v2.7 (2026-10-13)
+
+### New Features
+- **Wardrift upload support** — a third upload service alongside WiGLE and WDGoWars. Add a Wardrift API key (`wdk_...`, from wardrift.net) in the Web UI's Configuration card to enable it; a new "Wardrift" section provides a Test API Key button and an Upload All CSVs button. The CSV file is uploaded as-is -- raw body, no multipart wrapper or per-row parsing -- to `POST /v1/ingest/signals` with an `X-API-Key` header, `Content-Type: text/csv`, and an `X-File-Name` header. The Test button posts a header-only (0-data-row) CSV to the same endpoint as a safe live key check. Runs 2nd in the upload chain (after WDGoWars, before WiGLE) for both the boot auto-upload and the per-file "Upload" button in the SD Card Files list; a file is moved to `/uploaded` if Wardrift accepts it, or if the server reports it as an already-uploaded duplicate. Applied to both the main Piglet firmware and the T-Dongle C5 standalone firmware.
+
+### Configuration
+- New config option: `wardriftApiKey` — Wardrift API key, sent as `X-API-Key` (empty by default, disables Wardrift uploads).
+
+### Bug Fixes
+- **Device could boot straight into Mesh Node mode on its own** — on the XIAO ESP32-C5, the user button shares GPIO0 with the chip's BOOT/flash-mode strapping pin. Right after flashing, auto-reset noise from the host tool's DTR/RTS sequence (or a serial monitor re-opening the port) could produce a burst of transient low pulses on GPIO0 as soon as the firmware started running. With no guard against this, each pulse was read as a real button press, and enough of them in a row could silently advance the page all the way to the Mesh Node page and activate it without any user input. Button input is now ignored for a short settle window right after boot to absorb this noise. Applied to the main Piglet firmware, the T-Dongle C5 standalone firmware, and PigletNode.
+
+---
+
 ## v2.635 (2026-10-09)
 
 ### Bug Fixes
