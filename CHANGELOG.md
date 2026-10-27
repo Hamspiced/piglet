@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+### Bug Fixes
+- **Wardrift uploads could incorrectly mark a failed upload as successful** — per an updated revision of the Wardrift API docs, an HTTP `409` response from `POST /v1/ingest/signals` no longer means "duplicate file" (that code is now reserved for the separate multipart upload endpoint); a genuine duplicate instead comes back as HTTP `200` with `"duplicate":true` in the body. The firmware previously treated any `409` as a successful duplicate and moved the file to `/uploaded` — which could silently discard a file that actually failed to upload (e.g. a real conflict) instead of leaving it for retry. Uploads now only treat `200` as success, and specifically detect `"duplicate":true` for a clearer "Already uploaded" status message. Applied to both the main Piglet firmware and the T-Dongle C5 standalone firmware.
+- **Wardrift success message showed no signal count** — the upload-success message looked for an `accepted_signals` field, but that field only appears in the separate async queued-upload response; the synchronous endpoint used here reports the count as `item_count`. The success message now reads the correct field. Applied to both firmware variants.
+- **Wardrift "Test API Key" could misreport a valid key as invalid** — the test payload is an empty (header-only) CSV, which the Wardrift API now explicitly rejects for having no observations (expected to return HTTP `400`) — but only after authentication succeeds. The test previously treated any non-200/401/403 response as inconclusive; it now also recognizes `400` as a valid-key signal, since the server only gets far enough to reject empty content once the key has been accepted. Applied to both firmware variants.
+
+### Improvements
+- **Wardrift uploads fail fast on oversized files** — the Wardrift API caps `POST /v1/ingest/signals` uploads at 10 MiB (10,485,760 bytes). CSVs larger than that are now skipped for Wardrift immediately, with a clear "File too large for Wardrift" status, instead of streaming the whole file only to receive a guaranteed `413` from the server. The file is still attempted on WDGoWars and WiGLE, which have higher limits. Applied to both firmware variants.
+- **CSV log rotation now guarantees files actually fit Wardrift's 10 MiB cap** — the only previous rotation trigger was a 100,000-row count, estimated at ~12 MB per file and tuned for WDGoWars' 15 MB limit; a long drive with no connectivity could still produce a single CSV larger than Wardrift's 10 MiB cap, which the fast-fail check above would then always skip for that service. Log rotation now also tracks the actual bytes written to the active CSV and rotates at 9 MiB -- comfortably under all three services' limits -- so every rotated file is reliably uploadable to Wardrift. The row-count cap remains as a secondary safeguard. Applied to both firmware variants.
+
+---
+
 ## v2.7 (2026-10-13)
 
 ### New Features

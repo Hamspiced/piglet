@@ -609,8 +609,11 @@ bool uploadFileToWdgwars(const String& path) {
 // POSTs a minimal, 0-data-row WiGLE CSV (just the 2 header lines) to
 // POST /v1/ingest/signals with X-API-Key -- the same endpoint/auth used for
 // real uploads. There's no dedicated key-check endpoint, so this doubles as
-// a safe live test: a valid key gets a normal 200 response with nothing
-// recorded (0 rows), while an invalid key 401s/403s before parsing anything.
+// a safe live test. Per the Wardrift API docs, "a CSV file with no supported
+// observations fails" -- so a valid key with this empty payload is expected
+// to come back as either 200 (accepted, 0 rows) or 400 (rejected for having
+// no observations, which only happens *after* auth succeeds). An invalid key
+// 401s/403s before the body is ever parsed.
 bool wardriftTestKey() {
   uploadLastResult = "";
 
@@ -688,6 +691,13 @@ bool wardriftTestKey() {
     return true;
   }
 
+  // A 400 here means the server parsed far enough to reject the payload for
+  // having no supported observations -- which only happens once auth passes.
+  if (code == 400) {
+    uploadLastResult = "API key valid (400 -- empty test payload rejected, as expected)";
+    return true;
+  }
+
   if (code == 401 || code == 403) {
     uploadLastResult = "API key invalid (" + String(code) + ")";
   } else if (code == 0) {
@@ -702,9 +712,10 @@ bool wardriftTestKey() {
 // Auth: X-API-Key header  |  Endpoint: POST /v1/ingest/signals
 // The CSV file is uploaded as-is -- raw body, Content-Type: text/csv, plus
 // an X-File-Name header -- no multipart wrapper and no per-row parsing
-// needed. A 409 response means the server already has this exact file --
-// treated as success so the file still gets moved out of /logs instead of
-// being retried forever.
+// needed. This endpoint caps uploaded/decompressed files at 10 MiB
+// (10,485,760 bytes); a duplicate file comes back as HTTP 200 with
+// "duplicate":true in the body, not a 409 -- a 409 here means a real
+// idempotency/sequence conflict and must NOT be treated as success.
 
 bool uploadFileToWardrift(const String& path) {
   Serial.print("[Wardrift] uploadFileToWardrift: ");
@@ -744,6 +755,18 @@ bool uploadFileToWardrift(const String& path) {
   String filename = pathBasename(path);
   uint32_t fileSize = f.size();
   Serial.printf("[Wardrift] File size: %.2f MB (%u bytes)\n", fileSize / (1024.0 * 1024.0), (unsigned)fileSize);
+
+  // Wardrift caps this endpoint's uploaded/decompressed file size at 10 MiB
+  // (10,485,760 bytes). Fail fast with a clear reason instead of wasting a
+  // TLS round-trip on a guaranteed 413 -- other services (WiGLE/WDGoWars)
+  // have higher limits and can still take this file.
+  static const uint32_t WARDRIFT_MAX_FILE_BYTES = 10485760UL;
+  if (fileSize > WARDRIFT_MAX_FILE_BYTES) {
+    f.close();
+    uploadLastResult = "File too large for Wardrift (>10 MiB)";
+    Serial.printf("[Wardrift] File exceeds 10 MiB limit (%u bytes) -- skipping\n", (unsigned)fileSize);
+    return false;
+  }
 
   WiFiClientSecure client;
   client.setInsecure();
@@ -855,21 +878,22 @@ bool uploadFileToWardrift(const String& path) {
   Serial.printf("[Wardrift] HTTP %d  body: %s\n", code, body.substring(0, 160).c_str());
 
   if (code == 200) {
-    int asIdx = body.indexOf("\"accepted_signals\":");
+    // Synchronous responses use "item_count" (not "accepted_signals", which
+    // only appears in the async queued-upload /v1/wardrive/logs response).
+    bool isDuplicate = body.indexOf("\"duplicate\":true") >= 0;
+    int icIdx = body.indexOf("\"item_count\":");
     String countStr = "";
-    if (asIdx >= 0) {
-      int start = asIdx + 20;
+    if (icIdx >= 0) {
+      int start = icIdx + 13;
       int end = start;
       while (end < (int)body.length() && isDigit(body[end])) end++;
       countStr = body.substring(start, end);
     }
-    uploadLastResult = countStr.length() ? "Uploaded OK (" + countStr + " signals)" : "Uploaded OK (200)";
-    return true;
-  }
-
-  if (code == 409) {
-    uploadLastResult = "Already uploaded (duplicate)";
-    Serial.println("[Wardrift] 409 -- treating as already-uploaded success");
+    if (isDuplicate) {
+      uploadLastResult = "Already uploaded (duplicate)";
+    } else {
+      uploadLastResult = countStr.length() ? "Uploaded OK (" + countStr + " signals)" : "Uploaded OK (200)";
+    }
     return true;
   }
 

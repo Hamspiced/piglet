@@ -184,11 +184,19 @@ bool moveToUploaded(const String& srcPath) {
 
 // ---- Log file ----
 
-// Row limit per CSV file: ~120 bytes/row × 100k = ~12 MB, safely under the
-// WDGoWars 15 MB upload cap. When the limit is reached, the active CSV is
-// closed and a fresh one is opened with proper WiGLE headers.
+// Row limit per CSV file -- a loose secondary safeguard; CSV_MAX_BYTES below
+// is the real, byte-accurate cap that rotation actually relies on.
 static const uint32_t CSV_MAX_ROWS = 100000;
 static uint32_t       csvRowCount  = 0;
+
+// Byte limit per CSV file: rotates well before the Wardrift API's hard
+// 10 MiB (10,485,760-byte) cap on POST /v1/ingest/signals, with roughly 1 MiB
+// of margin to absorb header overhead and the one extra row that can land
+// before rotation is detected on the next call. Also comfortably under the
+// WDGoWars 15 MB cap. Tracked from the actual bytes logFile.println() reports
+// writing, not estimated from row count, so this is an exact guarantee.
+static const uint32_t CSV_MAX_BYTES = 9UL * 1024UL * 1024UL;  // 9 MiB
+static uint32_t       csvByteCount  = 0;
 
 // Sanitise a user-provided device name for safe use in filenames.
 // Keeps alphanumerics, hyphens, underscores; replaces spaces with _;
@@ -276,6 +284,7 @@ bool openLogFile() {
   logFile.println("MAC,SSID,AuthMode,FirstSeen,Channel,Frequency,RSSI,CurrentLatitude,CurrentLongitude,AltitudeMeters,AccuracyMeters,RCOIs,MfgrId,Type");
   logFile.flush();
   csvRowCount = 0;
+  csvByteCount = 0;  // header bytes are negligible against the multi-MB cap
 
   Serial.println("[SD] Log file initialized with WiGLE headers");
   return true;
@@ -327,9 +336,12 @@ bool appendWigleRow(const String& mac, const String& ssid, const String& auth,
     }
   }
 
-  // Rotate CSV before it exceeds the WDGoWars 15 MB upload limit
-  if (csvRowCount >= CSV_MAX_ROWS) {
-    Serial.println("[SD] CSV row limit reached, rotating log file");
+  // Rotate before the file grows past the byte cap (the real Wardrift-size
+  // guarantee) or the loose row-count safeguard, whichever comes first.
+  if (csvByteCount >= CSV_MAX_BYTES || csvRowCount >= CSV_MAX_ROWS) {
+    Serial.printf("[SD] CSV %s limit reached (%u bytes, %u rows), rotating log file\n",
+                  (csvByteCount >= CSV_MAX_BYTES) ? "byte" : "row",
+                  (unsigned)csvByteCount, (unsigned)csvRowCount);
     closeLogFile();
     if (!openLogFile()) return false;
   }
@@ -363,6 +375,7 @@ bool appendWigleRow(const String& mac, const String& ssid, const String& auth,
 
   size_t written = logFile.println(line);
   csvRowCount++;
+  csvByteCount += (uint32_t)written;  // 0 on a failed write, so no false accumulation
 
   // Detect silent write failure — if println() returns 0 for a non-empty line,
   // the SD card or file handle is broken. Attempt to reopen the log file once;

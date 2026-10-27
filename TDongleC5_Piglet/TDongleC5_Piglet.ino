@@ -136,8 +136,10 @@ struct Config {
   String wdgwarsApiKey;
   // Wardrift API key (wdk_...) from wardrift.net, sent as X-API-Key. The CSV
   // file is uploaded as-is (raw body, Content-Type: text/csv, X-File-Name
-  // header) to POST /v1/ingest/signals. Runs 2nd in the upload chain: after
-  // WDGoWars, before WiGLE.
+  // header) to POST /v1/ingest/signals. This endpoint caps files at 10 MiB;
+  // larger CSVs are skipped for Wardrift but still attempted on
+  // WDGoWars/WiGLE, which have higher limits. Runs 2nd in the upload chain:
+  // after WDGoWars, before WiGLE.
   String wardriftApiKey;
   // Boot auto-upload limit: -1=all, 0=disabled, 1+=capped
   int maxBootUploads   = 25;
@@ -520,9 +522,19 @@ static String normalizeSdPath(const char* dir, const char* nameIn) {
   return d + "/" + n;
 }
 
-// Row limit per CSV: ~120 bytes/row x 100k = ~12 MB, under WDGoWars 15 MB cap.
+// Row limit per CSV -- a loose secondary safeguard; CSV_MAX_BYTES below is
+// the real, byte-accurate cap that rotation actually relies on.
 static const uint32_t CSV_MAX_ROWS = 100000;
 static uint32_t       csvRowCount  = 0;
+
+// Byte limit per CSV file: rotates well before the Wardrift API's hard
+// 10 MiB (10,485,760-byte) cap on POST /v1/ingest/signals, with roughly 1 MiB
+// of margin to absorb header overhead and the one extra row that can land
+// before rotation is detected on the next call. Also comfortably under the
+// WDGoWars 15 MB cap. Tracked from the actual bytes logFile.println() reports
+// writing, not estimated from row count, so this is an exact guarantee.
+static const uint32_t CSV_MAX_BYTES = 9UL * 1024UL * 1024UL;  // 9 MiB
+static uint32_t       csvByteCount  = 0;
 
 // Sanitise device name for filename/header use
 static String tdongleSanitiseName(const String& raw) {
@@ -588,6 +600,7 @@ static bool openLogFile() {
   logFile.println("MAC,SSID,AuthMode,FirstSeen,Channel,Frequency,RSSI,CurrentLatitude,CurrentLongitude,AltitudeMeters,AccuracyMeters,RCOIs,MfgrId,Type");
   logFile.flush();
   csvRowCount = 0;
+  csvByteCount = 0;  // header bytes are negligible against the multi-MB cap
   return true;
 }
 
@@ -624,9 +637,12 @@ static bool appendWigleRow(const String& mac, const String& ssid, const String& 
     if (cfg.ssidWhitelist[i].length() > 0 && cfg.ssidWhitelist[i] == ssid) return false;
   }
 
-  // Rotate CSV before it exceeds the WDGoWars 15 MB upload limit
-  if (csvRowCount >= CSV_MAX_ROWS) {
-    Serial.println("[SD] CSV row limit reached, rotating log file");
+  // Rotate before the file grows past the byte cap (the real Wardrift-size
+  // guarantee) or the loose row-count safeguard, whichever comes first.
+  if (csvByteCount >= CSV_MAX_BYTES || csvRowCount >= CSV_MAX_ROWS) {
+    Serial.printf("[SD] CSV %s limit reached (%u bytes, %u rows), rotating log file\n",
+                  (csvByteCount >= CSV_MAX_BYTES) ? "byte" : "row",
+                  (unsigned)csvByteCount, (unsigned)csvRowCount);
     closeLogFile();
     if (!openLogFile()) return false;
   }
@@ -661,6 +677,7 @@ static bool appendWigleRow(const String& mac, const String& ssid, const String& 
   digitalWrite(PINS.tft_cs, HIGH);
   size_t written = logFile.println(line);
   csvRowCount++;
+  csvByteCount += (uint32_t)written;  // 0 on a failed write, so no false accumulation
 
   // Detect silent write failure — if println() returns 0 for a non-empty line,
   // the SD card or file handle is broken. Attempt to reopen the log file once;
@@ -871,8 +888,11 @@ static bool uploadFileToWdgwars(const String& path) {
 
 // ---- Wardrift API key test — POSTs a minimal, 0-data-row CSV ----
 // No dedicated key-check endpoint exists, so this doubles as a safe live
-// test: posts a header-only WiGLE CSV to the real upload endpoint. A valid
-// key gets a normal 200 (0 rows recorded); an invalid key 401s/403s first.
+// test. Per the Wardrift API docs, "a CSV file with no supported
+// observations fails" -- so a valid key with this empty payload is expected
+// to come back as either 200 (accepted, 0 rows) or 400 (rejected for having
+// no observations, which only happens after auth succeeds). An invalid key
+// 401s/403s before the body is ever parsed.
 static bool wardriftTestKey() {
   uploadLastResult = "";
   if (WiFi.status() != WL_CONNECTED) { uploadLastResult = "No STA WiFi"; return false; }
@@ -920,6 +940,9 @@ static bool wardriftTestKey() {
   Serial.printf("[Wardrift] /v1/ingest/signals (test) HTTP %d  body: %s\n", code, respBody.substring(0,160).c_str());
 
   if (code == 200) { uploadLastResult = "API key valid (200)"; return true; }
+  // A 400 here means the server parsed far enough to reject the payload for
+  // having no supported observations -- which only happens once auth passes.
+  if (code == 400) { uploadLastResult = "API key valid (400 -- empty test payload rejected, as expected)"; return true; }
   if (code==401||code==403) { uploadLastResult="API key invalid ("+String(code)+")"; }
   else if (code==0) { uploadLastResult="No response from server"; }
   else { uploadLastResult="Test inconclusive ("+String(code)+")"; }
@@ -929,9 +952,11 @@ static bool wardriftTestKey() {
 // ---- Wardrift single-file upload — POST /v1/ingest/signals ----
 // Auth: X-API-Key header. The CSV file is uploaded as-is (raw body,
 // Content-Type: text/csv, plus an X-File-Name header) -- no multipart
-// wrapper and no per-row parsing needed. A 409 response means the server
-// already has this exact file -- treated as success so the file still gets
-// moved out of /logs instead of being retried forever.
+// wrapper and no per-row parsing needed. This endpoint caps
+// uploaded/decompressed files at 10 MiB (10,485,760 bytes); a duplicate
+// file comes back as HTTP 200 with "duplicate":true in the body, not a
+// 409 -- a 409 here means a real idempotency/sequence conflict and must
+// NOT be treated as success.
 static bool uploadFileToWardrift(const String& path) {
   if (WiFi.status() != WL_CONNECTED) { uploadLastResult = "No STA WiFi"; return false; }
   if (cfg.wardriftApiKey.length() < 8) { uploadLastResult = "No API key set"; return false; }
@@ -956,6 +981,18 @@ static bool uploadFileToWardrift(const String& path) {
   String filename = pathBasename(path);
   uint32_t fileSize = f.size();
   Serial.printf("[Wardrift] File size: %.2f MB (%u bytes)\n", fileSize / (1024.0 * 1024.0), (unsigned)fileSize);
+
+  // Wardrift caps this endpoint's uploaded/decompressed file size at 10 MiB
+  // (10,485,760 bytes). Fail fast with a clear reason instead of wasting a
+  // TLS round-trip on a guaranteed 413 -- other services (WiGLE/WDGoWars)
+  // have higher limits and can still take this file.
+  static const uint32_t WARDRIFT_MAX_FILE_BYTES = 10485760UL;
+  if (fileSize > WARDRIFT_MAX_FILE_BYTES) {
+    f.close();
+    uploadLastResult = "File too large for Wardrift (>10 MiB)";
+    Serial.printf("[Wardrift] File exceeds 10 MiB limit (%u bytes) -- skipping\n", (unsigned)fileSize);
+    return false;
+  }
 
   WiFiClientSecure client;
   client.setInsecure(); client.setTimeout(25000);
@@ -1019,19 +1056,21 @@ static bool uploadFileToWardrift(const String& path) {
   Serial.printf("[Wardrift] HTTP %d  body: %s\n", code, body.substring(0,160).c_str());
 
   if (code == 200) {
-    int asIdx = body.indexOf("\"accepted_signals\":");
+    // Synchronous responses use "item_count" (not "accepted_signals", which
+    // only appears in the async queued-upload /v1/wardrive/logs response).
+    bool isDuplicate = body.indexOf("\"duplicate\":true") >= 0;
+    int icIdx = body.indexOf("\"item_count\":");
     String countStr = "";
-    if (asIdx >= 0) {
-      int start = asIdx + 20, end = start;
+    if (icIdx >= 0) {
+      int start = icIdx + 13, end = start;
       while (end < (int)body.length() && isDigit(body[end])) end++;
       countStr = body.substring(start, end);
     }
-    uploadLastResult = countStr.length() ? "Uploaded OK (" + countStr + " signals)" : "Uploaded OK (200)";
-    return true;
-  }
-  if (code == 409) {
-    uploadLastResult = "Already uploaded (duplicate)";
-    Serial.println("[Wardrift] 409 -- treating as already-uploaded success");
+    if (isDuplicate) {
+      uploadLastResult = "Already uploaded (duplicate)";
+    } else {
+      uploadLastResult = countStr.length() ? "Uploaded OK (" + countStr + " signals)" : "Uploaded OK (200)";
+    }
     return true;
   }
 
@@ -3000,6 +3039,7 @@ static void exitCoreMode() {
   Serial.println("[CORE] Exiting Core mode");
   if (meshCoreActive) esp_now_deinit();
   meshCoreActive=false; coreNodeCount=0;
+
   WiFi.mode(WIFI_OFF); delay(150);
   WiFi.setAutoReconnect(true);  // restore auto-reconnect for normal wardriving
   WiFi.mode(WIFI_STA); delay(100);
@@ -3011,6 +3051,7 @@ static void exitCoreMode() {
 static void coreModeTick() {
   if (!meshCoreActive) return;
   uint32_t now=millis();
+
   while (coreReqHead!=coreReqTail) {
     uint8_t i=coreReqHead; coreReqHead=(coreReqHead+1)%CORE_REQ_QUEUE;
     coreFindOrAddNode(coreReqBuf[i].mac, coreReqBuf[i].isBiscuit, coreReqBuf[i].isPiglet);
@@ -3095,6 +3136,9 @@ static void nodeDoScanTick() {
         String bssid = WiFi.BSSIDstr(i);
         String ssid  = WiFi.SSID(i);
         String auth  = authModeToString(WiFi.encryptionType(i));
+        int    ch    = WiFi.channel(i);
+        int    rssi  = WiFi.RSSI(i);
+
         if (biscuitPlainReplyPending) {
           if (auth == "OPEN") auth = "[OPEN]";
           else if (auth == "WEP") auth = "[WEP]";
@@ -3106,8 +3150,6 @@ static void nodeDoScanTick() {
           else if (auth == "WPA2WPA3") auth = "[WPA2_WPA3_PSK]";
           else auth = "[UNDEFINED]";
         }
-        int    ch    = WiFi.channel(i);
-        int    rssi  = WiFi.RSSI(i);
         String line  = bssid + "," + ssid + "," + auth + ","
                      + String(ch) + "," + String(rssi) + ",W";
         // Log the exact payload content -- we've verified scanning finds
@@ -3461,7 +3503,7 @@ static void drawPageMeshNode() {
     tft.fillRect(0, 103, W, 10, BLACK); tft.setCursor(2, 104);
     tft.print("ENOW ch: "); tft.print(JCMK_ESPNOW_CH);
 
-    // Hold hint
+    // Hold hint (y=117)
     tft.fillRect(0, 117, W, 10, BLACK); tft.setCursor(2, 118);
     tft.setTextColor(0x4208, BLACK); tft.print("Hold btn = Core mode");
     tft.setTextColor(WHITE, BLACK);
