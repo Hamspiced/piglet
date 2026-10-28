@@ -35,6 +35,7 @@
 #include "WigleUpload.h"
 #include "WebUI.h"
 #include "MeshNode.h"
+#include "WardriveGoBLE.h"
 
 // -------- Battery Test (uncomment to enable) --------
 #include "battery_test.h"
@@ -197,6 +198,17 @@ static void pollButton() {
       statusPagePaused = !statusPagePaused;
       Serial.print("[BTN] Double press -> status page scan ");
       Serial.println(statusPagePaused ? "PAUSED" : "RESUMED");
+    } else if (clickCount >= 2 && currentPage == 5) {
+      // Double press on Mesh Node/Core page -> toggle the Wardrive Go BLE
+      // bridge immediately (mesh mode is already active on this page) and
+      // persist the setting, so it also auto-starts on this page after a
+      // reboot -- same effect as flipping the Web UI toggle and saving.
+      cfg.wardriveGoBridge = !cfg.wardriveGoBridge;
+      saveConfigToSD();
+      if (cfg.wardriveGoBridge) wardriveGoBleBegin();
+      else                      wardriveGoBleStop();
+      Serial.print("[BTN] Double press -> Wardrive Go bridge ");
+      Serial.println(cfg.wardriveGoBridge ? "ENABLED" : "DISABLED");
     } else {
       // Single press -> cycle page (once, regardless of extra clicks)
       uint8_t oldPage = currentPage;

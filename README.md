@@ -33,6 +33,7 @@ Designed for **[Seeed XIAO ESP32-S3](https://wiki.seeedstudio.com/xiao_esp32s3_g
 - **Screen rotation** — mount the display upside-down and set `rotateScreen180=true` to flip 180°
 - **Auto-start wardriving after uploads** — set `autoStartAfterUpload=true` to disconnect from home Wi-Fi immediately after boot uploads complete and begin scanning without delay
 - **PigletNode** — standalone minimal firmware for XIAO ESP32-C5 that boots directly as a mesh node (no display, GPS, or SD required)
+- **Wardrive Go BLE bridge** — while on the Mesh Node/Core page, advertise a RocketGod "iosESP" BLE bridge so the Wardrive Go / WarBLE Go phone app can pair and plot APs live on its map
 
 
 ## ESP-Now Mesh Network Node Mode
@@ -75,6 +76,15 @@ Set `meshModeOnBoot` in `/wardriver.cfg` to automatically enter mesh mode after 
 
 When `core` or `node` is set the SoftAP window is **skipped entirely** (ESP-Now owns the WiFi stack and the AP would be non-functional). The device goes straight from boot uploads to the mesh page. Set via the web UI **Mesh Mode On Boot** dropdown or directly in `/wardriver.cfg`.
 
+### Wardrive Go BLE Bridge
+
+While on the Mesh Node or Core page, Piglet can advertise a RocketGod "iosESP" BLE bridge (service UUID `47686F73-7445-5350-4272-696467655376`, advertised as `iosESP-XXXX`) so the **Wardrive Go / WarBLE Go** phone app can pair and plot APs live on its map:
+
+- **Node** pushes its own scan finds plus its own GPS fix.
+- **Core** pushes every node-forwarded AP plus its own GPS fix.
+
+Enable it with the **Wardrive Go BLE Bridge** toggle in the Web UI's Configuration card (`wardriveGoBridge` in `/wardriver.cfg`, default off). The bridge is only ever active while on the Mesh Node/Core page — it is torn down immediately when you leave it. While enabled, the Mesh page's hold-button hint is replaced with a `WG: off / advertising / connected` status line. Requires the **NimBLE-Arduino** library (see Building Firmware below).
+
 
 ## PigletNode — Standalone Mesh Node
 
@@ -112,6 +122,7 @@ Install via Arduino Library Manager (`Sketch → Include Library → Manage Libr
 | Adafruit BusIO | Adafruit |
 | TinyGPSPlus | Mikal Hart |
 | ArduinoJson | Benoit Blanchon |
+| NimBLE-Arduino | h2zero |
 
 All networking, SPI, SD, ESP-Now, and ESP-IDF headers are included in the ESP32 Arduino core — no separate install needed.
 
@@ -437,6 +448,16 @@ ssidWhitelist7=
 ssidWhitelist8=
 ssidWhitelist9=
 ssidWhitelist10=
+
+# ------------------------------------------------------------
+# Wardrive Go BLE Bridge
+# ------------------------------------------------------------
+# When true, the Mesh Node/Core page advertises a RocketGod "iosESP" BLE
+# bridge (as iosESP-XXXX) so the Wardrive Go / WarBLE Go phone app can pair
+# and plot APs live. Only active while on the Mesh Node/Core page.
+# Values: true or false
+
+wardriveGoBridge=false
 ```
 
 ### Auto-Start Wardriving After Uploads — How to Disable
@@ -470,8 +491,8 @@ When Piglet is away from the saved home network (or the home network is unavaila
 | Press | Timing | Action |
 |-------|--------|--------|
 | **Single press** | Quick tap | Advance to next page |
-| **Double press** | Two taps within 350 ms | Toggle scan pause *(Status page only)* |
-| **Long press** | Hold ≥ 2 seconds | Enter deep sleep |
+| **Double press** | Two taps within 350 ms | Toggle scan pause *(Status page)* / toggle Wardrive Go BLE bridge *(Mesh Node page)* |
+| **Long press** | Hold ≥ 2 seconds | Enter deep sleep *(or toggle Core/Node on the Mesh Node page)* |
 | **Single press** *(while sleeping)* | Any | Wake from deep sleep / reboot |
 
 ### Pages (Single Press cycles through these)
@@ -504,6 +525,8 @@ Hold the button for **2 seconds** from any page:
 
 Entering **page 5** automatically starts ESP-Now node mode. Leaving it (single press to advance) automatically restores normal wardriving. See the [ESP-Now Mesh Network Node Mode](#esp-now-mesh-network-node-mode) section above for details.
 
+While on this page, **double-pressing** toggles the Wardrive Go BLE bridge on/off immediately (no reboot or page re-entry needed) and saves the new state to `/wardriver.cfg`, so it stays on for this page on future boots too — the same effect as flipping the Web UI's **Wardrive Go BLE Bridge** toggle and saving. See [Wardrive Go BLE Bridge](#wardrive-go-ble-bridge) above.
+
 ## Building Firmware
 
 ### Requirements
@@ -522,6 +545,7 @@ Install via Arduino Library Manager (`Sketch → Include Library → Manage Libr
 | Adafruit SSD1306 | Adafruit | OLED display driver |
 | Adafruit BusIO | Adafruit | Required by SSD1306 |
 | ArduinoJson | Benoit Blanchon | v6.x or v7.x |
+| NimBLE-Arduino | h2zero | Wardrive Go BLE bridge on the Mesh page |
 
 All other headers (`WiFi`, `WebServer`, `WiFiClientSecure`, `HTTPClient`, `SD`, `SPI`, `Wire`, `esp_now.h`, `esp_wifi.h`) are included in the ESP32 Arduino core — no separate install needed.
 
@@ -536,6 +560,7 @@ Install via Arduino Library Manager:
 | Adafruit BusIO | Adafruit | Required by ST7735 |
 | TinyGPSPlus | Mikal Hart | GPS NMEA parsing |
 | ArduinoJson | Benoit Blanchon | v6.x or v7.x |
+| NimBLE-Arduino | h2zero | Wardrive Go BLE bridge on the Mesh page |
 
 All networking, SPI, SD, ESP-Now, and ESP-IDF headers are built into the ESP32 core.
 

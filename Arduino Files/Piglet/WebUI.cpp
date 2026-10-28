@@ -416,6 +416,12 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
           <option value="true">Enabled &mdash; Disconnect and Wardrive Immediately</option>
         </select>
       </div>
+      <div><label>Wardrive Go BLE Bridge (Mesh Node/Core page only)</label>
+        <select id="wardriveGoBridge">
+          <option value="false">Disabled (default)</option>
+          <option value="true">Enabled &mdash; Advertise to Wardrive Go / WarBLE Go</option>
+        </select>
+      </div>
     </div>
     <p style="margin-top:8px;font-size:12px;color:var(--muted)">
       <strong>Upload When Home Network Seen</strong> and <strong>Auto-Start Wardriving After Uploads</strong> are mutually exclusive &mdash; enabling Auto-Start always disables Upload When Home Network Seen.
@@ -538,7 +544,7 @@ async function loadStatus(){
     setText('vApSsid',j?.config?.wardriverSsid||'\u2014');
 
     // Fill config form — skip masked/secret values
-    for(const k of ['wigleBasicToken','wdgwarsApiKey','wardriftApiKey','deviceName','board','gpsBaud','homeSsid','wardriverSsid','wardriverPsk','scanMode','speedUnits','battPin','batteryTest','maxBootUploads','meshModeOnBoot','rotateScreen180','autoStartAfterUpload','uploadOnNetworkSeen']){
+    for(const k of ['wigleBasicToken','wdgwarsApiKey','wardriftApiKey','deviceName','board','gpsBaud','homeSsid','wardriverSsid','wardriverPsk','scanMode','speedUnits','battPin','batteryTest','maxBootUploads','meshModeOnBoot','rotateScreen180','autoStartAfterUpload','uploadOnNetworkSeen','wardriveGoBridge']){
       if(j.config&&(k in j.config)){
         const v=String(j.config[k]);
         if(maskedKeys.has(k)&&(v===''||v==='(set)'))continue;
@@ -647,7 +653,7 @@ async function deleteAllLogs(){
 
 /* ---- Shared save logic used by both Save and Save+Reboot ---- */
 async function doSave(){
-  const keys=['board','wigleBasicToken','wdgwarsApiKey','wardriftApiKey','deviceName','gpsBaud','homeSsid','homePsk','wardriverSsid','wardriverPsk','scanMode','speedUnits','battPin','batteryTest','maxBootUploads','meshModeOnBoot','rotateScreen180','autoStartAfterUpload','uploadOnNetworkSeen'];
+  const keys=['board','wigleBasicToken','wdgwarsApiKey','wardriftApiKey','deviceName','gpsBaud','homeSsid','homePsk','wardriverSsid','wardriverPsk','scanMode','speedUnits','battPin','batteryTest','maxBootUploads','meshModeOnBoot','rotateScreen180','autoStartAfterUpload','uploadOnNetworkSeen','wardriveGoBridge'];
   let body='# Saved from Web UI\n# key=value\n';
   for(const k of keys){
     const el=$(k);
@@ -952,6 +958,7 @@ static void handleStatus() {
   c["rotateScreen180"] = cfg.rotateScreen180;
   c["autoStartAfterUpload"] = cfg.autoStartAfterUpload;
   c["uploadOnNetworkSeen"] = cfg.uploadOnNetworkSeen;
+  c["wardriveGoBridge"] = cfg.wardriveGoBridge;
   for (uint8_t i = 0; i < 10; i++) {
     c[String("ssidWhitelist") + String(i + 1)] = cfg.ssidWhitelist[i];
   }

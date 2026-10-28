@@ -121,6 +121,7 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
       <div><label>Mesh Mode On Boot</label><select id="meshModeOnBoot"><option value="none">None</option><option value="core">Core</option><option value="node">Node</option></select></div>
       <div><label>Rotate Screen 180&deg; (requires reboot)</label><select id="rotateScreen180"><option value="false">Normal</option><option value="true">Rotated 180&deg;</option></select></div>
       <div><label>Upload When Home Network Seen</label><select id="uploadOnNetworkSeen"><option value="true">Enabled (default)</option><option value="false">Disabled</option></select></div>
+      <div><label>Wardrive Go BLE Bridge (Mesh Node/Core page only)</label><select id="wardriveGoBridge"><option value="false">Disabled (default)</option><option value="true">Enabled</option></select></div>
     </div>
     <div class="mt-md">
       <label>Network Whitelist &mdash; SSIDs to Scan but Never Log (up to 10, one per line)</label>
@@ -189,7 +190,7 @@ async function loadStatus(){try{
   setText('vApSeen',j.apClientsSeen?'Yes':'No');
   const lu=j.uploadLastResult?j.uploadLastResult+' (HTTP '+(j.wigleLastHttpCode||'\u2014')+')':'\u2014';
   setText('vLastUpload',lu);
-  for(const k of ['wigleBasicToken','wdgwarsApiKey','wardriftApiKey','deviceName','gpsBaud','homeSsid','wardriverSsid','wardriverPsk','scanMode','speedUnits','maxBootUploads','meshModeOnBoot','rotateScreen180','uploadOnNetworkSeen']){
+  for(const k of ['wigleBasicToken','wdgwarsApiKey','wardriftApiKey','deviceName','gpsBaud','homeSsid','wardriverSsid','wardriverPsk','scanMode','speedUnits','maxBootUploads','meshModeOnBoot','rotateScreen180','uploadOnNetworkSeen','wardriveGoBridge']){
     if(j.config&&(k in j.config)){const v=String(j.config[k]);if(maskedKeys.has(k)&&(v===''||v==='(set)'))continue;const el=$(k);if(el)el.value=v}}
   if(j.config){
     const lines=[];
@@ -243,7 +244,7 @@ async function deleteAllLogs(){
 }
 
 async function doSave(){
-  const keys=['wigleBasicToken','wdgwarsApiKey','wardriftApiKey','deviceName','gpsBaud','homeSsid','homePsk','wardriverSsid','wardriverPsk','scanMode','speedUnits','maxBootUploads','meshModeOnBoot','rotateScreen180','uploadOnNetworkSeen'];
+  const keys=['wigleBasicToken','wdgwarsApiKey','wardriftApiKey','deviceName','gpsBaud','homeSsid','homePsk','wardriverSsid','wardriverPsk','scanMode','speedUnits','maxBootUploads','meshModeOnBoot','rotateScreen180','uploadOnNetworkSeen','wardriveGoBridge'];
   let body='# Saved from Web UI\n';
   for(const k of keys){const el=$(k);const v=el?(el.value??''):'';if(maskedKeys.has(k)&&v==='')continue;body+=k+'='+String(v).replace(/\r?\n/g,' ')+'\n'}
   const wlEl=$('ssidWhitelist');

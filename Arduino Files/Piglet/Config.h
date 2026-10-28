@@ -80,6 +80,14 @@ struct Config {
   // match. Empty slots are ignored. Applies to both local scanning and
   // mesh-forwarded records written by this device.
   String ssidWhitelist[10];
+
+  // Wardrive Go / WarBLE Go BLE bridge. When true, the Mesh Node/Core page
+  // (and only that page) advertises a RocketGod "iosESP" BLE bridge so the
+  // Wardrive Go / WarBLE Go phone app can pair and plot APs live: Node pushes
+  // its own scan finds + GPS, Core pushes every node-forwarded AP + its own
+  // GPS. Started/stopped from enterNodeMode()/exitNodeMode()/enterCoreMode()/
+  // exitCoreMode() in MeshNode.cpp. Default off.
+  bool wardriveGoBridge = false;
 };
 
 const PinMap& detectPinsByChip();

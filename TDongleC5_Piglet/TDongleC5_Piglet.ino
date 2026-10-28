@@ -43,7 +43,7 @@
 #include "esp32-hal-matrix.h"
 
 // Firmware version
-#define FIRMWARE_VERSION "v2.7"
+#define FIRMWARE_VERSION "v2.8"
 
 // ---------------- Pins (T-DONGLE C5) ----------------
 struct PinMap {
@@ -161,6 +161,12 @@ struct Config {
   // result while wardriving, the device stops scanning, connects to it, and
   // uploads pending CSVs automatically.
   bool uploadOnNetworkSeen = true;
+  // Wardrive Go / WarBLE Go BLE bridge. When true, the Mesh Node/Core page
+  // (and only that page) advertises a RocketGod "iosESP" BLE bridge so the
+  // Wardrive Go / WarBLE Go phone app can pair and plot APs live: Node pushes
+  // its own scan finds + GPS, Core pushes every node-forwarded AP + its own
+  // GPS. Default off.
+  bool wardriveGoBridge = false;
 };
 
 Config cfg;
@@ -439,6 +445,10 @@ static void cfgAssignKV(const String& k, const String& v) {
     String vv = v; vv.toLowerCase();
     cfg.uploadOnNetworkSeen = (vv == "true" || vv == "1");
   }
+  else if (k == "wardriveGoBridge") {
+    String vv = v; vv.toLowerCase();
+    cfg.wardriveGoBridge = (vv == "true" || vv == "1");
+  }
 }
 
 static bool saveConfigToSD() {
@@ -478,6 +488,9 @@ static bool saveConfigToSD() {
   }
   f.println("# Connect + upload automatically when the home SSID is seen while wardriving.");
   f.print("uploadOnNetworkSeen="); f.println(cfg.uploadOnNetworkSeen ? "true" : "false");
+
+  f.println("# Wardrive Go / WarBLE Go BLE bridge -- active only on the Mesh Node/Core page.");
+  f.print("wardriveGoBridge="); f.println(cfg.wardriveGoBridge ? "true" : "false");
 
   f.flush(); f.close();
   Serial.println("[CFG] Saved OK");
@@ -2984,6 +2997,9 @@ static void coreSendHeartbeatToAll() {
   esp_now_send(JCMK_BCAST, (uint8_t*)&msg, sizeof(msg));
 }
 
+// ---------------- Wardrive Go BLE bridge (in separate header to avoid Arduino ctags bug) ----------------
+#include "WardriveGoBLE.h"
+
 static void coreParseAndLogText(const char* line) {
   String s(line);
   int p0=s.indexOf(','); if(p0<0)return;
@@ -2996,6 +3012,7 @@ static void coreParseAndLogText(const char* line) {
   double lat=0, lon=0, altM=0, accM=0;
   if (gpsHasFix) { lat=gps.location.lat(); lon=gps.location.lng();
                    altM=gps.altitude.meters(); accM=gps.hdop.hdop(); }
+  wardriveGoPushAp(bssid, ssid, auth, ch, rssi);
   digitalWrite(PINS.tft_cs, HIGH);
   if (appendWigleRow(bssid, ssid, auth, iso8601NowUTC(), ch, rssi, lat, lon, altM, accM)) {
     coreRecordsRx++;
@@ -3033,12 +3050,19 @@ static void enterCoreMode() {
   meshCoreActive=true;
   pageNeedsInit[4]=true;  // force TFT header redraw for Core mode
   Serial.println("[CORE] Ready — listening for nodes on ch 6");
+
+  // Wardrive Go BLE bridge -- only ever active while on this page, gated on
+  // the config toggle. Relays every node-forwarded AP (coreParseAndLogText())
+  // plus this Core's own GPS.
+  if (cfg.wardriveGoBridge) wardriveGoBleBegin();
 }
 
 static void exitCoreMode() {
   Serial.println("[CORE] Exiting Core mode");
   if (meshCoreActive) esp_now_deinit();
   meshCoreActive=false; coreNodeCount=0;
+
+  wardriveGoBleStop();  // no-op if it was never begun
 
   WiFi.mode(WIFI_OFF); delay(150);
   WiFi.setAutoReconnect(true);  // restore auto-reconnect for normal wardriving
@@ -3051,6 +3075,19 @@ static void exitCoreMode() {
 static void coreModeTick() {
   if (!meshCoreActive) return;
   uint32_t now=millis();
+
+  wardriveGoBleTick();  // no-op unless the bridge was begun (cfg.wardriveGoBridge)
+
+  // Relay this Core's own GPS fix ~1 Hz, independent of node traffic.
+  {
+    static uint32_t wgGpsMs = 0;
+    if (gpsHasFix && now - wgGpsMs >= 1000) {
+      wgGpsMs = now;
+      int sats = gps.satellites.isValid() ? (int)gps.satellites.value() : 0;
+      wardriveGoPushGps(gps.location.lat(), gps.location.lng(),
+                         gps.altitude.isValid() ? gps.altitude.meters() : 0.0, sats);
+    }
+  }
 
   while (coreReqHead!=coreReqTail) {
     uint8_t i=coreReqHead; coreReqHead=(coreReqHead+1)%CORE_REQ_QUEUE;
@@ -3139,6 +3176,10 @@ static void nodeDoScanTick() {
         int    ch    = WiFi.channel(i);
         int    rssi  = WiFi.RSSI(i);
 
+        // Pushed before the Biscuit bracket-notation rewrite below so the
+        // phone always gets the plain WiGLE-style auth token (OPEN/WPA2/...).
+        wardriveGoPushAp(bssid, ssid, auth, ch, rssi);
+
         if (biscuitPlainReplyPending) {
           if (auth == "OPEN") auth = "[OPEN]";
           else if (auth == "WEP") auth = "[WEP]";
@@ -3171,6 +3212,7 @@ static void nodeDoScanTick() {
         String auth  = authModeToString(WiFi.encryptionType(i));
         int    ch    = WiFi.channel(i);
         int    rssi  = WiFi.RSSI(i);
+        wardriveGoPushAp(bssid, ssid, auth, ch, rssi);
         String line  = bssid + "," + ssid + "," + auth + ","
                      + String(ch) + "," + String(rssi) + ",W";
         jcmkPendingPush(line);
@@ -3281,6 +3323,10 @@ static void enterNodeMode() {
 
   meshNodeActive = true;
   Serial.println("[MESH] ESP-Now ready — searching for Core on ch 6...");
+
+  // Wardrive Go BLE bridge -- only ever active while on this page, gated on
+  // the config toggle. Relays this node's own finds (see nodeDoScanTick()).
+  if (cfg.wardriveGoBridge) wardriveGoBleBegin();
 }
 
 // Exit mesh node mode — call when leaving page 4
@@ -3289,6 +3335,8 @@ static void exitNodeMode() {
   if (meshNodeActive) esp_now_deinit();
   meshNodeActive = false;
   jcmkHaveCore   = false;
+
+  wardriveGoBleStop();  // no-op if it was never begun
 
   // Full WiFi stack reset: OFF then STA gives a clean state after esp_now_deinit
   WiFi.mode(WIFI_OFF);
@@ -3308,6 +3356,20 @@ static void exitNodeMode() {
 static void nodeModeTick() {
   if (!meshNodeActive) return;
   uint32_t now = millis();
+
+  wardriveGoBleTick();  // no-op unless the bridge was begun (cfg.wardriveGoBridge)
+  wardriveGoSetGpsPresent(gps.charsProcessed() > 0);
+
+  // Relay this node's own GPS fix ~1 Hz, independent of ESP-NOW pairing state.
+  {
+    static uint32_t wgGpsMs = 0;
+    if (gpsHasFix && now - wgGpsMs >= 1000) {
+      wgGpsMs = now;
+      int sats = gps.satellites.isValid() ? (int)gps.satellites.value() : 0;
+      wardriveGoPushGps(gps.location.lat(), gps.location.lng(),
+                         gps.altitude.isValid() ? gps.altitude.meters() : 0.0, sats);
+    }
+  }
 
   // Consume pending core-found event from the ESP-Now callback
   if (jcmkCoreFoundPending) {
@@ -3368,13 +3430,27 @@ static void nodeModeTick() {
     jcmkSendHeartbeat();
   }
 
-  // Per-channel async scan — runs continuously while connected to Core.
+  // Per-channel async scan — runs continuously while connected to Core, OR
+  // while the Wardrive Go bridge is enabled even with no Core at all, so a
+  // solo Node (no mesh coordinator in range) still scans and feeds the phone
+  // app instead of sitting idle on "Searching..." forever. The CORE_REQUEST
+  // backoff above keeps announcing in the background either way, so a real
+  // coordinator can still be picked up later without needing a restart.
   // jcmkPigletSlotTick() only ever acts for confirmed-Piglet pairings, and
   // only in the gap between scans, so it never affects scan timing itself.
-  if (jcmkHaveCore) {
+  if (jcmkHaveCore || cfg.wardriveGoBridge) {
     jcmkPigletSlotTick();
     nodeDoScanTick();
   }
+}
+
+// Short label for the "WG: ..." indicator that replaces the Hold hint when
+// cfg.wardriveGoBridge is on. Only three states are shown: NimBLE doesn't
+// expose a separate "streaming" state since subscribe implies streaming.
+static const char* wgStatusLabel() {
+  if (!wardriveGoBridgeRunning())   return "WG: off";
+  if (wardriveGoBridgeConnected())  return "WG: connected";
+  return "WG: advertising";
 }
 
 // ================================================================
@@ -3447,9 +3523,14 @@ static void drawPageMeshNode() {
     tft.print(gpsHasFix ? "GPS: FIX" : "GPS: ---");
     tft.setTextColor(WHITE, BLACK);
 
-    // Hint (y=110)
+    // Hint (y=110), or Wardrive Go status if the bridge is enabled
     tft.fillRect(0, 110, W, 10, BLACK); tft.setCursor(2, 111);
-    tft.setTextColor(0x4208, BLACK); tft.print("Hold btn = Node mode");
+    if (cfg.wardriveGoBridge) {
+      tft.setTextColor(wardriveGoBridgeConnected() ? COLOR_GREEN : COLOR_YELLOW, BLACK);
+      tft.print(wgStatusLabel());
+    } else {
+      tft.setTextColor(0x4208, BLACK); tft.print("Hold btn = Node mode");
+    }
     tft.setTextColor(WHITE, BLACK);
 
   } else {
@@ -3503,9 +3584,14 @@ static void drawPageMeshNode() {
     tft.fillRect(0, 103, W, 10, BLACK); tft.setCursor(2, 104);
     tft.print("ENOW ch: "); tft.print(JCMK_ESPNOW_CH);
 
-    // Hold hint (y=117)
+    // Hold hint (y=117), or Wardrive Go status if the bridge is enabled
     tft.fillRect(0, 117, W, 10, BLACK); tft.setCursor(2, 118);
-    tft.setTextColor(0x4208, BLACK); tft.print("Hold btn = Core mode");
+    if (cfg.wardriveGoBridge) {
+      tft.setTextColor(wardriveGoBridgeConnected() ? COLOR_GREEN : COLOR_YELLOW, BLACK);
+      tft.print(wgStatusLabel());
+    } else {
+      tft.setTextColor(0x4208, BLACK); tft.print("Hold btn = Core mode");
+    }
     tft.setTextColor(WHITE, BLACK);
   }
 }
@@ -3625,6 +3711,7 @@ static void handleStatus() {
   c["meshModeOnBoot"] = cfg.meshModeOnBoot;
   c["rotateScreen180"] = cfg.rotateScreen180;
   c["uploadOnNetworkSeen"] = cfg.uploadOnNetworkSeen;
+  c["wardriveGoBridge"] = cfg.wardriveGoBridge;
   for (int i = 0; i < 10; i++) {
     c[String("ssidWhitelist") + String(i + 1)] = cfg.ssidWhitelist[i];
   }
@@ -4390,7 +4477,8 @@ static const uint32_t BTN_BOOT_SETTLE_MS = 1500;
 static uint32_t btnBootSettleUntilMs = 0;
 
 // Button: triple-tap on pig page (3) = twerk; single press = advance page;
-//         2 s hold on mesh page (4) = toggle Core / Node.
+//         2 s hold on mesh page (4) = toggle Core / Node; double press on
+//         mesh page (4) = toggle the Wardrive Go BLE bridge.
 static void pollButton() {
   static uint32_t pressStartMs  = 0;
   static bool     pressing      = false;
@@ -4433,6 +4521,17 @@ static void pollButton() {
       sasquatchStartTFT();
     } else if (clickCount == 2 && currentPage == 3) {
       pigTwerkStartTFT();
+    } else if (clickCount >= 2 && currentPage == 4) {
+      // Double press on Mesh Node/Core page -> toggle the Wardrive Go BLE
+      // bridge immediately (mesh mode is already active on this page) and
+      // persist the setting, so it also auto-starts on this page after a
+      // reboot -- same effect as flipping the Web UI toggle and saving.
+      cfg.wardriveGoBridge = !cfg.wardriveGoBridge;
+      saveConfigToSD();
+      if (cfg.wardriveGoBridge) wardriveGoBleBegin();
+      else                      wardriveGoBleStop();
+      Serial.print("[BTN] Double press -> Wardrive Go bridge ");
+      Serial.println(cfg.wardriveGoBridge ? "ENABLED" : "DISABLED");
     } else {
       // Single (or unrecognised multi) press -> advance page
       advancePage();

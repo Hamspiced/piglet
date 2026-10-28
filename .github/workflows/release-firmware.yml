@@ -1,0 +1,163 @@
+name: Build and Release Firmware
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing git tag to build and (re)publish a release for (e.g. v2.8)'
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  ESP32_CORE_VERSION: "3.3.10"
+  # Board config matches the one used for the official releases (see each
+  # sketch's build/esp32.esp32.XIAO_ESP32C5/build.options.json).
+  FQBN: "esp32:esp32:XIAO_ESP32C5:CDCOnBoot=cdc,CPUFreq=80,FlashFreq=80,FlashMode=qio,FlashSize=8M,PartitionScheme=huge_app,DebugLevel=none,PSRAM=disabled,EraseFlash=none,JTAGAdapter=default,ZigbeeMode=default"
+  BUILD_DIR_NAME: "esp32.esp32.XIAO_ESP32C5"
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Piglet
+            sketch_dir: "Arduino Files/Piglet"
+            display_lib: ssd1306
+            needs_ble: true
+          - name: TDongleC5_Piglet
+            sketch_dir: "TDongleC5_Piglet"
+            display_lib: st7735
+            needs_ble: true
+          - name: PigletNode
+            sketch_dir: "PigletNode"
+            display_lib: none
+            needs_ble: false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
+
+      - name: Install arduino-cli
+        uses: arduino/setup-arduino-cli@v2
+
+      - name: Install ESP32 core
+        run: |
+          arduino-cli config init --overwrite
+          arduino-cli config set board_manager.additional_urls https://espressif.github.io/arduino-esp32/package_esp32_dev_index.json
+          arduino-cli core update-index
+          arduino-cli core install "esp32:esp32@${{ env.ESP32_CORE_VERSION }}"
+
+      - name: Install shared libraries
+        run: |
+          arduino-cli lib install "TinyGPSPlus@1.0.3"
+          arduino-cli lib install "Adafruit GFX Library@1.12.6"
+          arduino-cli lib install "Adafruit BusIO@1.17.4"
+          arduino-cli lib install "ArduinoJson@7.4.3"
+
+      - name: Install NimBLE-Arduino (Wardrive Go bridge)
+        if: matrix.needs_ble
+        run: arduino-cli lib install "NimBLE-Arduino@2.5.1"
+
+      - name: Install Adafruit SSD1306 (OLED)
+        if: matrix.display_lib == 'ssd1306'
+        run: arduino-cli lib install "Adafruit SSD1306@2.5.17"
+
+      - name: Install Adafruit ST7735/ST7789 (TFT)
+        if: matrix.display_lib == 'st7735'
+        run: arduino-cli lib install "Adafruit ST7735 and ST7789 Library@1.11.0"
+
+      - name: Compile ${{ matrix.name }}
+        run: |
+          arduino-cli compile \
+            --fqbn "${{ env.FQBN }}" \
+            --export-binaries \
+            "${{ matrix.sketch_dir }}"
+
+      - name: Collect binaries
+        run: |
+          set -eu
+          OUT="dist/${{ matrix.name }}"
+          mkdir -p "$OUT"
+          BUILD_DIR="${{ matrix.sketch_dir }}/build/${{ env.BUILD_DIR_NAME }}"
+          cp "$BUILD_DIR"/*.bin "$OUT"/
+          ( cd dist && zip -j "${{ matrix.name }}.zip" "${{ matrix.name }}"/*.bin )
+          ls -la "$OUT" dist/*.zip
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: |
+            dist/${{ matrix.name }}/*.bin
+            dist/${{ matrix.name }}.zip
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
+          fetch-depth: 0
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Flatten release assets
+        run: |
+          mkdir -p release_assets
+          find artifacts -type f \( -name "*.bin" -o -name "*.zip" \) -exec cp {} release_assets/ \;
+          ls -la release_assets
+
+      - name: Build release notes
+        run: |
+          set -eu
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          VERSION="${TAG#v}"
+          ESCAPED=$(printf '%s' "$VERSION" | sed 's/[.[\*^$]/\\&/g')
+
+          # Pull the matching "## vX.Y (...)" section out of CHANGELOG.md.
+          sed -n "/^## v${ESCAPED} /,/^## v/p" CHANGELOG.md | sed '$ d' | sed '/^---$/d' > release_notes.md
+          if [ ! -s release_notes.md ]; then
+            echo "Release ${TAG}" > release_notes.md
+          fi
+
+          {
+            echo ""
+            echo "### Firmware Versions"
+            echo "- Main Piglet (XIAO S3/C5/C6/C3): \`$(grep -oE '#define FIRMWARE_VERSION "[^"]+"' "Arduino Files/Piglet/Globals.h" | sed -E 's/.*"(.*)"/\1/')\`"
+            echo "- T-Dongle C5: \`$(grep -oE '#define FIRMWARE_VERSION "[^"]+"' "TDongleC5_Piglet/TDongleC5_Piglet.ino" | sed -E 's/.*"(.*)"/\1/')\`"
+            echo "- PigletNode: \`$(grep -oE '#define FIRMWARE_VERSION "[^"]+"' "PigletNode/PigletNode.ino" | sed -E 's/.*"(.*)"/\1/')\`"
+          } >> release_notes.md
+
+          PREV_TAG=$(git describe --tags --abbrev=0 "${TAG}^" 2>/dev/null || true)
+          if [ -n "$PREV_TAG" ]; then
+            echo "" >> release_notes.md
+            echo "**Full Changelog**: https://github.com/${GITHUB_REPOSITORY}/compare/${PREV_TAG}...${TAG}" >> release_notes.md
+          fi
+
+          echo "----- release notes -----"
+          cat release_notes.md
+
+      - name: Create or update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          name: ${{ github.event.inputs.tag || github.ref_name }}
+          body_path: release_notes.md
+          draft: true
+          files: release_assets/*

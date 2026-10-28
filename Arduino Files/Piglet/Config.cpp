@@ -149,6 +149,10 @@ void cfgAssignKV(const String& k, const String& v) {
       int idx = k.substring(13).toInt();  // strlen("ssidWhitelist") == 13
     if (idx >= 1 && idx <= 10) cfg.ssidWhitelist[idx - 1] = v;
   }
+  else if (k == "wardriveGoBridge") {
+    String vv = v; vv.toLowerCase();
+    cfg.wardriveGoBridge = (vv == "true" || vv == "1");
+  }
 }
 
 void cfgEnforceMutualExclusion() {
@@ -347,6 +351,10 @@ bool saveConfigToSD() {
   for (uint8_t i = 0; i < 10; i++) {
     f.print("ssidWhitelist"); f.print(i + 1); f.print("="); f.println(cfg.ssidWhitelist[i]);
   }
+
+  f.println("");
+  f.println("# Wardrive Go / WarBLE Go BLE bridge -- active only on the Mesh Node/Core page.");
+  f.print("wardriveGoBridge="); f.println(cfg.wardriveGoBridge ? "true" : "false");
 
   f.flush();
   f.close();

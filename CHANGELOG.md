@@ -1,6 +1,12 @@
 # Changelog
 
-## Unreleased
+## v2.8 (2026-10-28)
+
+### New Features
+- **Wardrive Go BLE bridge** — while on the Mesh Node or Core page, the device can advertise a RocketGod "iosESP" BLE bridge (service UUID `47686F73-7445-5350-4272-696467655376`, advertised as `iosESP-XXXX`) so the Wardrive Go / WarBLE Go phone app can pair and plot APs live on its map. A Node pushes its own scan finds plus its own GPS fix; a Core pushes every node-forwarded AP plus its own GPS fix. Enable with the new **Wardrive Go BLE Bridge** toggle in the Web UI's Configuration card (`wardriveGoBridge`, default off) — the bridge is only ever active on the Mesh Node/Core page and is fully torn down when leaving it. The Mesh page's hold-button hint is replaced with a `WG: off / advertising / connected` status line while the toggle is on. While on the Mesh page, double-pressing the button also toggles the bridge immediately and persists the new state to `/wardriver.cfg`, without needing the Web UI. A solo Node (no mesh coordinator in range) now scans and feeds the bridge even without ever pairing with a Core, instead of sitting idle on "Searching..." and sending nothing — background Core-search broadcasts are unaffected, so a real coordinator can still be picked up later. Applied to both the main Piglet firmware and the T-Dongle C5 standalone firmware.
+
+### Configuration
+- New config option: `wardriveGoBridge` — advertise the Wardrive Go / WarBLE Go BLE bridge while on the Mesh Node/Core page (default: false).
 
 ### Bug Fixes
 - **Wardrift uploads could incorrectly mark a failed upload as successful** — per an updated revision of the Wardrift API docs, an HTTP `409` response from `POST /v1/ingest/signals` no longer means "duplicate file" (that code is now reserved for the separate multipart upload endpoint); a genuine duplicate instead comes back as HTTP `200` with `"duplicate":true` in the body. The firmware previously treated any `409` as a successful duplicate and moved the file to `/uploaded` — which could silently discard a file that actually failed to upload (e.g. a real conflict) instead of leaving it for retry. Uploads now only treat `200` as success, and specifically detect `"duplicate":true` for a clearer "Already uploaded" status message. Applied to both the main Piglet firmware and the T-Dongle C5 standalone firmware.

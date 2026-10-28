@@ -3,6 +3,7 @@
 #include "Config.h"
 #include "GPS.h"
 #include "SDUtils.h"
+#include "WardriveGoBLE.h"
 #include <esp_now.h>
 #include "esp_wifi.h"
 
@@ -743,6 +744,7 @@ static void coreParseAndLogText(const char* line) {
     altM = gps.altitude.meters();
     accM = gps.hdop.hdop();
   }
+  wardriveGoPushAp(bssid, ssid, auth, ch, rssi);
   if (appendWigleRow(bssid, ssid, auth, iso8601NowUTC(), ch, rssi, lat, lon, altM, accM)) {
     coreRecordsRx++;
   }
@@ -818,6 +820,11 @@ static void nodeDoScanTick() {
         String bssid = WiFi.BSSIDstr(i);
         String ssid  = WiFi.SSID(i);
         String auth  = meshAuthModeToString(WiFi.encryptionType(i));
+        int    ch    = WiFi.channel(i);
+        int    rssi  = WiFi.RSSI(i);
+        // Pushed before the Biscuit bracket-notation rewrite below so the
+        // phone always gets the plain WiGLE-style auth token (OPEN/WPA2/...).
+        wardriveGoPushAp(bssid, ssid, auth, ch, rssi);
         if (biscuitPlainReplyPending) {
           if (auth == "OPEN") auth = "[OPEN]";
           else if (auth == "WEP") auth = "[WEP]";
@@ -829,8 +836,6 @@ static void nodeDoScanTick() {
           else if (auth == "WPA2WPA3") auth = "[WPA2_WPA3_PSK]";
           else auth = "[UNDEFINED]";
         }
-        int    ch    = WiFi.channel(i);
-        int    rssi  = WiFi.RSSI(i);
         String line  = bssid + "," + ssid + "," + auth + ","
                      + String(ch) + "," + String(rssi) + ",W";
         // Log the exact payload content -- we've verified scanning finds
@@ -851,6 +856,7 @@ static void nodeDoScanTick() {
         String auth  = meshAuthModeToString(WiFi.encryptionType(i));
         int    ch    = WiFi.channel(i);
         int    rssi  = WiFi.RSSI(i);
+        wardriveGoPushAp(bssid, ssid, auth, ch, rssi);
         String line  = bssid + "," + ssid + "," + auth + ","
                      + String(ch) + "," + String(rssi) + ",W";
         jcmkPendingPush(line);
@@ -970,6 +976,10 @@ void enterNodeMode() {
 
   meshNodeActive = true;
   Serial.println("[MESH] ESP-Now ready — searching for Core on ch 6...");
+
+  // Wardrive Go BLE bridge -- only ever active while on this page, gated on
+  // the config toggle. Relays this node's own finds (see nodeDoScanTick()).
+  if (cfg.wardriveGoBridge) wardriveGoBleBegin();
 }
 
 void exitNodeMode() {
@@ -977,6 +987,8 @@ void exitNodeMode() {
   if (meshNodeActive) esp_now_deinit();
   meshNodeActive = false;
   jcmkHaveCore   = false;
+
+  wardriveGoBleStop();  // no-op if it was never begun
 
   // Full WiFi stack reset: OFF then STA gives a clean state after esp_now_deinit
   WiFi.mode(WIFI_OFF);
@@ -1042,6 +1054,11 @@ void enterCoreMode() {
 
   meshCoreActive = true;
   Serial.println("[CORE] Ready — listening for nodes on ch 6");
+
+  // Wardrive Go BLE bridge -- only ever active while on this page, gated on
+  // the config toggle. Relays every node-forwarded AP (coreParseAndLogText())
+  // plus this Core's own GPS.
+  if (cfg.wardriveGoBridge) wardriveGoBleBegin();
 }
 
 void exitCoreMode() {
@@ -1049,6 +1066,8 @@ void exitCoreMode() {
   if (meshCoreActive) esp_now_deinit();
   meshCoreActive = false;
   coreNodeCount  = 0;
+
+  wardriveGoBleStop();  // no-op if it was never begun
 
   WiFi.mode(WIFI_OFF);
   delay(150);
@@ -1063,6 +1082,19 @@ void exitCoreMode() {
 void coreModeTick() {
   if (!meshCoreActive) return;
   uint32_t now = millis();
+
+  wardriveGoBleTick();  // no-op unless the bridge was begun (cfg.wardriveGoBridge)
+
+  // Relay this Core's own GPS fix ~1 Hz, independent of node traffic.
+  {
+    static uint32_t wgGpsMs = 0;
+    if (gpsHasFix && now - wgGpsMs >= 1000) {
+      wgGpsMs = now;
+      int sats = gps.satellites.isValid() ? (int)gps.satellites.value() : 0;
+      wardriveGoPushGps(gps.location.lat(), gps.location.lng(),
+                         gps.altitude.isValid() ? gps.altitude.meters() : 0.0, sats);
+    }
+  }
 
   // 1. Process pending CORE_REQUEST queue (new node registrations)
   while (coreReqHead != coreReqTail) {
@@ -1107,6 +1139,20 @@ void coreModeTick() {
 void nodeModeTick() {
   if (!meshNodeActive) return;
   uint32_t now = millis();
+
+  wardriveGoBleTick();  // no-op unless the bridge was begun (cfg.wardriveGoBridge)
+  wardriveGoSetGpsPresent(gps.charsProcessed() > 0);
+
+  // Relay this node's own GPS fix ~1 Hz, independent of ESP-NOW pairing state.
+  {
+    static uint32_t wgGpsMs = 0;
+    if (gpsHasFix && now - wgGpsMs >= 1000) {
+      wgGpsMs = now;
+      int sats = gps.satellites.isValid() ? (int)gps.satellites.value() : 0;
+      wardriveGoPushGps(gps.location.lat(), gps.location.lng(),
+                         gps.altitude.isValid() ? gps.altitude.meters() : 0.0, sats);
+    }
+  }
 
   // Consume pending core-found event from the ESP-Now callback
   if (jcmkCoreFoundPending) {
@@ -1167,13 +1213,27 @@ void nodeModeTick() {
     jcmkSendHeartbeat();
   }
 
-  // Per-channel async scan — runs continuously while connected to Core.
+  // Per-channel async scan — runs continuously while connected to Core, OR
+  // while the Wardrive Go bridge is enabled even with no Core at all, so a
+  // solo Node (no mesh coordinator in range) still scans and feeds the phone
+  // app instead of sitting idle on "Searching..." forever. The CORE_REQUEST
+  // backoff above keeps announcing in the background either way, so a real
+  // coordinator can still be picked up later without needing a restart.
   // jcmkPigletSlotTick() only ever acts for confirmed-Piglet pairings, and
   // only in the gap between scans, so it never affects scan timing itself.
-  if (jcmkHaveCore) {
+  if (jcmkHaveCore || cfg.wardriveGoBridge) {
     jcmkPigletSlotTick();
     nodeDoScanTick();
   }
+}
+
+// Short label for the "WG: ..." indicator that replaces the Hold hint when
+// cfg.wardriveGoBridge is on. Only three states are shown: NimBLE doesn't
+// expose a separate "streaming" state since subscribe implies streaming.
+static const char* wgStatusLabel() {
+  if (!wardriveGoBridgeRunning())   return "WG:off";
+  if (wardriveGoBridgeConnected())  return "WG:on";
+  return "WG:adv";
 }
 
 // ================================================================
@@ -1238,11 +1298,11 @@ void drawPageMeshNode() {
     snprintf(rbuf, sizeof(rbuf), "Rcvd: %lu", (unsigned long)coreRecordsRx);
     display.print(rbuf);
 
-    // Row 5 (y=53): GPS + hint
+    // Row 5 (y=53): GPS + hint (or WG status if the bridge is enabled)
     display.setCursor(0, 53);
     display.print(gpsHasFix ? "GPS:FIX" : "GPS:---");
     display.setCursor(62, 53);
-    display.print("Hold=Node");
+    display.print(cfg.wardriveGoBridge ? wgStatusLabel() : "Hold=Node");
 
   } else {
     // ---- Node mode (original layout) ----
@@ -1287,12 +1347,12 @@ void drawPageMeshNode() {
     display.print("ENOW:");
     display.print(JCMK_ESPNOW_CH);
 
-    // Row 4 (y=44): networks found + Core hint
+    // Row 4 (y=44): networks found + Core hint (or WG status if enabled)
     display.setCursor(0, 44);
     display.print("Found:");
     display.print(jcmkNetworksFound);
     display.setCursor(70, 44);
-    display.print("Hold=Core");
+    display.print(cfg.wardriveGoBridge ? wgStatusLabel() : "Hold=Core");
 
     // Row 5 (y=53): records sent + radio-level send failures.
     // "Sent" only means esp_now_send() was called; "Fail" reflects the
