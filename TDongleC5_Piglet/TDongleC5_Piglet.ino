@@ -43,7 +43,7 @@
 #include "esp32-hal-matrix.h"
 
 // Firmware version
-#define FIRMWARE_VERSION "v2.8"
+#define FIRMWARE_VERSION "v2.81"
 
 // ---------------- Pins (T-DONGLE C5) ----------------
 struct PinMap {
@@ -2460,6 +2460,12 @@ static uint8_t  nodeScanChOffset = 0;
 static bool     nodeScanAdminWin = false;
 static uint32_t nodeScanAdminMs  = 0;
 
+// Channel list the Wardrive Go phone app has explicitly narrowed scanning to (via
+// `-ch`/`ch`), refreshed each nodeDoScanTick() call. Empty unless the bridge is active
+// AND the app asked for fewer than every supported channel -- see wardriveGoChannelOverride().
+static uint8_t  wgOverrideChannels[48];
+static uint8_t  wgOverrideCount = 0;
+
 // Pending core-found event — set from ESP-Now callback, consumed in loop
 static volatile bool  jcmkCoreFoundPending    = false;
 static uint8_t        jcmkCoreMacPending[6]   = {0};
@@ -3054,7 +3060,7 @@ static void enterCoreMode() {
   // Wardrive Go BLE bridge -- only ever active while on this page, gated on
   // the config toggle. Relays every node-forwarded AP (coreParseAndLogText())
   // plus this Core's own GPS.
-  if (cfg.wardriveGoBridge) wardriveGoBleBegin();
+  if (cfg.wardriveGoBridge) wardriveGoBleBegin(true);
 }
 
 static void exitCoreMode() {
@@ -3119,7 +3125,14 @@ static void coreModeTick() {
 //  window (heartbeat + NODE_ADMIN_WIN_MS) before the next cycle.
 // ================================================================
 static void nodeDoScanTick() {
+  // The Wardrive Go app's channel selection takes effect here, not just as a filter
+  // on what gets reported to it -- but a real Biscuit Core's channel assignment still
+  // wins if both happen to be active at once (biscuitChannelCount checked first below).
+  bool useWgChannels = !biscuitChannelCount &&
+                       wardriveGoChannelOverride(wgOverrideChannels, &wgOverrideCount);
+
   uint8_t numCh = biscuitChannelCount ? biscuitChannelCount :
+                  useWgChannels ? wgOverrideCount :
                   ((jcmkEndIdx >= jcmkStartIdx) ? (jcmkEndIdx - jcmkStartIdx + 1) : 0);
   if (numCh == 0) return;
 
@@ -3144,8 +3157,10 @@ static void nodeDoScanTick() {
     }
 
     uint8_t chIdx = jcmkStartIdx + nodeScanChOffset;
-    if (!biscuitChannelCount && chIdx >= JCMK_NUM_CHANNELS) { nodeScanChOffset++; return; }
-    uint8_t channel = biscuitChannelCount ? biscuitChannels[nodeScanChOffset] : JCMK_CHANNELS[chIdx];
+    if (!biscuitChannelCount && !useWgChannels && chIdx >= JCMK_NUM_CHANNELS) { nodeScanChOffset++; return; }
+    uint8_t channel = biscuitChannelCount ? biscuitChannels[nodeScanChOffset]
+                     : useWgChannels      ? wgOverrideChannels[nodeScanChOffset]
+                                          : JCMK_CHANNELS[chIdx];
 
     // Async scan of this single channel only (no blocking)
     int16_t rc = WiFi.scanNetworks(/*async*/true, /*hidden*/true,
@@ -3326,7 +3341,7 @@ static void enterNodeMode() {
 
   // Wardrive Go BLE bridge -- only ever active while on this page, gated on
   // the config toggle. Relays this node's own finds (see nodeDoScanTick()).
-  if (cfg.wardriveGoBridge) wardriveGoBleBegin();
+  if (cfg.wardriveGoBridge) wardriveGoBleBegin(false);
 }
 
 // Exit mesh node mode — call when leaving page 4
@@ -3453,6 +3468,27 @@ static const char* wgStatusLabel() {
   return "WG: advertising";
 }
 
+// Scrolling window into a longer string, for display space too small to show it all
+// at once (e.g. a multi-channel Wardrive Go `-ch` selection). Advances by one
+// character roughly every redraw (the Mesh page redraws at a ~500ms cadence), with a
+// gap before it repeats so it reads as a continuous loop rather than jumping.
+static const char* scrollText(const char* full, uint8_t windowChars) {
+  static char out[24];
+  size_t flen = strlen(full);
+  if (windowChars >= sizeof(out)) windowChars = sizeof(out) - 1;
+  if (flen <= windowChars) {
+    strncpy(out, full, sizeof(out) - 1); out[sizeof(out) - 1] = '\0';
+    return out;
+  }
+  char padded[160];
+  snprintf(padded, sizeof(padded), "%s   ", full);
+  size_t plen = strlen(padded);
+  uint32_t pos = (millis() / 500) % plen;
+  for (uint8_t i = 0; i < windowChars; i++) out[i] = padded[(pos + i) % plen];
+  out[windowChars] = '\0';
+  return out;
+}
+
 // ================================================================
 //  Page 4: handles both Mesh Node and Core mode
 // ================================================================
@@ -3565,9 +3601,17 @@ static void drawPageMeshNode() {
 
     tft.fillRect(0, 51, W, 10, BLACK); tft.setCursor(2, 52);
     tft.print("Ch: ");
-    if (jcmkAssignVer>0 && jcmkStartIdx<JCMK_NUM_CHANNELS && jcmkEndIdx<JCMK_NUM_CHANNELS) {
-      tft.print(JCMK_CHANNELS[jcmkStartIdx]); tft.print("-"); tft.print(JCMK_CHANNELS[jcmkEndIdx]);
-    } else { tft.print("all"); }
+    {
+      uint8_t wgCh[48]; uint8_t wgN = 0;
+      if (wardriveGoChannelOverride(wgCh, &wgN)) {
+        char list[160]; int len = 0;
+        for (uint8_t i = 0; i < wgN && len < (int)sizeof(list) - 5; i++)
+          len += snprintf(list + len, sizeof(list) - len, i ? ",%u" : "%u", (unsigned)wgCh[i]);
+        tft.print(scrollText(list, 20));
+      } else if (jcmkAssignVer>0 && jcmkStartIdx<JCMK_NUM_CHANNELS && jcmkEndIdx<JCMK_NUM_CHANNELS) {
+        tft.print(JCMK_CHANNELS[jcmkStartIdx]); tft.print("-"); tft.print(JCMK_CHANNELS[jcmkEndIdx]);
+      } else { tft.print("all"); }
+    }
 
     tft.fillRect(0, 64, W, 10, BLACK); tft.setCursor(2, 65);
     tft.print("Found: "); tft.print(jcmkNetworksFound);
@@ -4528,7 +4572,7 @@ static void pollButton() {
       // reboot -- same effect as flipping the Web UI toggle and saving.
       cfg.wardriveGoBridge = !cfg.wardriveGoBridge;
       saveConfigToSD();
-      if (cfg.wardriveGoBridge) wardriveGoBleBegin();
+      if (cfg.wardriveGoBridge) wardriveGoBleBegin(meshCoreActive);
       else                      wardriveGoBleStop();
       Serial.print("[BTN] Double press -> Wardrive Go bridge ");
       Serial.println(cfg.wardriveGoBridge ? "ENABLED" : "DISABLED");

@@ -121,6 +121,12 @@ static uint8_t  nodeScanChOffset = 0;
 static bool     nodeScanAdminWin = false;
 static uint32_t nodeScanAdminMs  = 0;
 
+// Channel list the Wardrive Go phone app has explicitly narrowed scanning to (via
+// `-ch`/`ch`), refreshed each nodeDoScanTick() call. Empty unless the bridge is active
+// AND the app asked for fewer than every supported channel -- see wardriveGoChannelOverride().
+static uint8_t  wgOverrideChannels[48];
+static uint8_t  wgOverrideCount = 0;
+
 // Pending core-found event — written in ESP-Now callback, consumed in loop
 static volatile bool  jcmkCoreFoundPending    = false;
 static uint8_t        jcmkCoreMacPending[6]   = {0};
@@ -757,7 +763,14 @@ static void coreParseAndLogText(const char* line) {
 //  window (heartbeat + NODE_ADMIN_WIN_MS) before the next cycle.
 // ================================================================
 static void nodeDoScanTick() {
+  // The Wardrive Go app's channel selection takes effect here, not just as a filter
+  // on what gets reported to it -- but a real Biscuit Core's channel assignment still
+  // wins if both happen to be active at once (biscuitChannelCount checked first below).
+  bool useWgChannels = !biscuitChannelCount &&
+                       wardriveGoChannelOverride(wgOverrideChannels, &wgOverrideCount);
+
   uint8_t numCh = biscuitChannelCount ? biscuitChannelCount :
+                  useWgChannels ? wgOverrideCount :
                   ((jcmkEndIdx >= jcmkStartIdx) ? (jcmkEndIdx - jcmkStartIdx + 1) : 0);
   if (numCh == 0) return;
 
@@ -784,8 +797,10 @@ static void nodeDoScanTick() {
     }
 
     uint8_t chIdx = jcmkStartIdx + nodeScanChOffset;
-    if (!biscuitChannelCount && chIdx >= JCMK_NUM_CHANNELS) { nodeScanChOffset++; return; }
-    uint8_t channel = biscuitChannelCount ? biscuitChannels[nodeScanChOffset] : JCMK_CHANNELS[chIdx];
+    if (!biscuitChannelCount && !useWgChannels && chIdx >= JCMK_NUM_CHANNELS) { nodeScanChOffset++; return; }
+    uint8_t channel = biscuitChannelCount ? biscuitChannels[nodeScanChOffset]
+                     : useWgChannels      ? wgOverrideChannels[nodeScanChOffset]
+                                          : JCMK_CHANNELS[chIdx];
 
     // Skip 5 GHz channels on 2.4 GHz-only hardware (S3, C6).
     // wardriverIsC5() returns true only for C5 (dual-band); all others are 2.4 GHz only.
@@ -979,7 +994,7 @@ void enterNodeMode() {
 
   // Wardrive Go BLE bridge -- only ever active while on this page, gated on
   // the config toggle. Relays this node's own finds (see nodeDoScanTick()).
-  if (cfg.wardriveGoBridge) wardriveGoBleBegin();
+  if (cfg.wardriveGoBridge) wardriveGoBleBegin(false);
 }
 
 void exitNodeMode() {
@@ -1058,7 +1073,7 @@ void enterCoreMode() {
   // Wardrive Go BLE bridge -- only ever active while on this page, gated on
   // the config toggle. Relays every node-forwarded AP (coreParseAndLogText())
   // plus this Core's own GPS.
-  if (cfg.wardriveGoBridge) wardriveGoBleBegin();
+  if (cfg.wardriveGoBridge) wardriveGoBleBegin(true);
 }
 
 void exitCoreMode() {
@@ -1236,6 +1251,27 @@ static const char* wgStatusLabel() {
   return "WG:adv";
 }
 
+// Scrolling window into a longer string, for display space too small to show it all
+// at once (e.g. a multi-channel Wardrive Go `-ch` selection). Advances by one
+// character roughly every redraw (the Mesh page redraws at a ~500ms cadence), with a
+// gap before it repeats so it reads as a continuous loop rather than jumping.
+static const char* scrollText(const char* full, uint8_t windowChars) {
+  static char out[24];
+  size_t flen = strlen(full);
+  if (windowChars >= sizeof(out)) windowChars = sizeof(out) - 1;
+  if (flen <= windowChars) {
+    strncpy(out, full, sizeof(out) - 1); out[sizeof(out) - 1] = '\0';
+    return out;
+  }
+  char padded[160];
+  snprintf(padded, sizeof(padded), "%s   ", full);
+  size_t plen = strlen(padded);
+  uint32_t pos = (millis() / 500) % plen;
+  for (uint8_t i = 0; i < windowChars; i++) out[i] = padded[(pos + i) % plen];
+  out[windowChars] = '\0';
+  return out;
+}
+
 // ================================================================
 //  OLED page renderer (page 5) — handles both Node and Core mode
 // ================================================================
@@ -1332,16 +1368,25 @@ void drawPageMeshNode() {
       display.print("--:--:--:--:--:--");
     }
 
-    // Row 3 (y=35): channel assignment + ENOW ch
+    // Row 3 (y=35): channel assignment + ENOW ch (or the Wardrive Go app's own
+    // channel selection, scrolled, if it has narrowed one)
     display.setCursor(0, 35);
     display.print("Ch:");
-    if (jcmkAssignVer > 0 && jcmkStartIdx < JCMK_NUM_CHANNELS
-                          && jcmkEndIdx   < JCMK_NUM_CHANNELS) {
-      display.print(JCMK_CHANNELS[jcmkStartIdx]);
-      display.print("-");
-      display.print(JCMK_CHANNELS[jcmkEndIdx]);
-    } else {
-      display.print("all");
+    {
+      uint8_t wgCh[48]; uint8_t wgN = 0;
+      if (wardriveGoChannelOverride(wgCh, &wgN)) {
+        char list[160]; int len = 0;
+        for (uint8_t i = 0; i < wgN && len < (int)sizeof(list) - 5; i++)
+          len += snprintf(list + len, sizeof(list) - len, i ? ",%u" : "%u", (unsigned)wgCh[i]);
+        display.print(scrollText(list, 9));
+      } else if (jcmkAssignVer > 0 && jcmkStartIdx < JCMK_NUM_CHANNELS
+                                    && jcmkEndIdx   < JCMK_NUM_CHANNELS) {
+        display.print(JCMK_CHANNELS[jcmkStartIdx]);
+        display.print("-");
+        display.print(JCMK_CHANNELS[jcmkEndIdx]);
+      } else {
+        display.print("all");
+      }
     }
     display.setCursor(72, 35);
     display.print("ENOW:");

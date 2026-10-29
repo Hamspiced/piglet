@@ -205,7 +205,7 @@ static void pollButton() {
       // reboot -- same effect as flipping the Web UI toggle and saving.
       cfg.wardriveGoBridge = !cfg.wardriveGoBridge;
       saveConfigToSD();
-      if (cfg.wardriveGoBridge) wardriveGoBleBegin();
+      if (cfg.wardriveGoBridge) wardriveGoBleBegin(meshCoreActive);
       else                      wardriveGoBleStop();
       Serial.print("[BTN] Double press -> Wardrive Go bridge ");
       Serial.println(cfg.wardriveGoBridge ? "ENABLED" : "DISABLED");

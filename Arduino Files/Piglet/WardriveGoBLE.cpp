@@ -1,7 +1,9 @@
 #include "WardriveGoBLE.h"
 #include "Globals.h"      // FIRMWARE_VERSION
+#include "MeshNode.h"     // JCMK_CHANNELS / JCMK_NUM_CHANNELS -- the channel list the mesh already scans
 #include <NimBLEDevice.h>
 #include <stdarg.h>
+#include <stdlib.h>
 #include <string.h>
 
 // ================================================================
@@ -13,7 +15,12 @@ static const char* WG_SERVICE_UUID = "47686F73-7445-5350-4272-696467655376";
 #define WG_CH_CTRL  "0347686F-7374-4553-5042-72694C525443"   // write / write-NR
 #define WG_CH_OTA   "0447686F-7374-4553-5042-72694F544144"   // write-NR (stubbed)
 
-#define WG_FW_VERSION "piglet-" FIRMWARE_VERSION
+// Reported in WD:CAPS/`info` as the protocol-compatible firmware version. Deliberately NOT tied to Piglet's own
+// FIRMWARE_VERSION: the app compares this number-by-number against the latest known WardriveESP release and
+// nags about an "outdated" board if it looks old. Since we don't implement that app's OTA update path anyway
+// (ota=0 below), there's nothing to gain from reporting our real version here -- keep this at or above the
+// latest official release to avoid a false update prompt.
+#define WG_FW_VERSION "1.7.1"
 #ifdef CONFIG_IDF_TARGET
 #define WG_CHIP CONFIG_IDF_TARGET      // "esp32s3", "esp32c5", ...
 #else
@@ -46,9 +53,60 @@ static uint32_t wgSweeps    = 0;
 static uint32_t wgLastStat  = 0;
 static bool     wgRebootReq = false;
 
-// Channels advertised as our scan plan (2.4 GHz; mesh feeds all bands, but
-// the app only needs a plausible plan string for its UI).
-static const char* WG_CHANS = "1,2,3,4,5,6,7,8,9,10,11,12,13";
+// Channel plan: which channels we report in WD:CAPS/WD:PLAN and actually forward AP sightings for.
+// wgSupportedCount is every channel this hardware scans (the JCMK_CHANNELS prefix, 2.4 GHz-only on
+// non-C5 boards, full dual-band list on C5); wgPlan/wgPlanCount is the active subset, which the app can
+// narrow with `-ch` on `wdstream start` or the `ch` command, same as the real WardriveESP protocol.
+static uint8_t  wgSupportedCount = 14;   // JCMK_CHANNELS[0..13] = 2.4 GHz ch 1..14
+static bool     wgDualBand       = false;
+static uint8_t  wgPlan[48];
+static uint8_t  wgPlanCount      = 0;
+
+static int wgFormatChannelList(char* buf, size_t cap, const uint8_t* ch, uint8_t n) {
+  int len = 0;
+  for (uint8_t i = 0; i < n && len < (int)cap - 5; i++)
+    len += snprintf(buf + len, cap - len, i ? ",%u" : "%u", (unsigned)ch[i]);
+  return len;
+}
+
+static bool wgChannelSupported(uint8_t ch) {
+  for (uint8_t i = 0; i < wgSupportedCount; i++) if (JCMK_CHANNELS[i] == ch) return true;
+  return false;
+}
+
+static bool wgChannelInPlan(int ch) {
+  for (uint8_t i = 0; i < wgPlanCount; i++) if (wgPlan[i] == (uint8_t)ch) return true;
+  return false;
+}
+
+// Reset the active plan to every channel this hardware supports.
+static void wgPlanResetToAll() {
+  memcpy(wgPlan, JCMK_CHANNELS, wgSupportedCount);
+  wgPlanCount = wgSupportedCount;
+}
+
+// `-ch 1,6,11,36` / `ch 1,6,11` / `ch all`: narrow (or reset) the channel plan to what the app asked for.
+// Unsupported/invalid channels are dropped; an empty result falls back to every supported channel.
+static void wgSetChannelPlan(const char* s) {
+  while (*s == ' ') s++;
+  if (!*s || !strcmp(s, "all")) { wgPlanResetToAll(); return; }
+  uint8_t tmp[48]; uint8_t n = 0;
+  while (*s && n < sizeof(tmp)) {
+    while (*s == ',' || *s == ' ') s++;
+    if (*s < '0' || *s > '9') break;
+    char* end;
+    long v = strtol(s, &end, 10);
+    s = end;
+    if (v > 0 && v <= 255 && wgChannelSupported((uint8_t)v)) {
+      bool dup = false;
+      for (uint8_t i = 0; i < n; i++) if (tmp[i] == (uint8_t)v) dup = true;
+      if (!dup) tmp[n++] = (uint8_t)v;
+    }
+  }
+  if (n == 0) { wgPlanResetToAll(); return; }
+  memcpy(wgPlan, tmp, n);
+  wgPlanCount = n;
+}
 
 // Inbound command ring (write cb enqueues raw bytes; tick drains/replies).
 #define WG_CMD_SLOT_LEN 256
@@ -107,8 +165,10 @@ static void wgEmit(const char* fmt, ...) {
 //  WD: output helpers
 // ================================================================
 static void wgSendCaps() {
-  wgEmit("WD:CAPS fw=%s chip=%s bands=2g ota=0 bt=0 gps=%d cap=0 chans=%s",
-         WG_FW_VERSION, WG_CHIP, wgGpsPresent ? 1 : 0, WG_CHANS);
+  char chanBuf[200];
+  wgFormatChannelList(chanBuf, sizeof(chanBuf), JCMK_CHANNELS, wgSupportedCount);
+  wgEmit("WD:CAPS fw=%s chip=%s bands=%s ota=0 bt=0 gps=%d cap=0 chans=%s",
+         WG_FW_VERSION, WG_CHIP, wgDualBand ? "2g,5g" : "2g", wgGpsPresent ? 1 : 0, chanBuf);
 }
 
 void wardriveGoSetGpsPresent(bool present) {
@@ -125,7 +185,9 @@ static void wgSendHandshake() {
   wgSendCaps();
   wgEmit("WD:MODE mode=wifi");
   wgEmit("WD:BEGIN type=wifi interval=0 channel=auto");
-  wgEmit("WD:PLAN chans=%s", WG_CHANS);
+  char planBuf[200];
+  wgFormatChannelList(planBuf, sizeof(planBuf), wgPlan, wgPlanCount);
+  wgEmit("WD:PLAN chans=%s", planBuf);
 }
 
 static void wgStartStreaming() {
@@ -198,15 +260,25 @@ static void wgHandleText(const char* text, uint16_t tlen) {
   else if (!strcmp(word, "info"))   wgCmdInfo();
   else if (!strcmp(word, "status")) wgCmdStatus();
   else if (!strcmp(word, "caps"))   wgSendCaps();
-  else if (!strcmp(word, "ch"))     wgEmit("WD:PLAN chans=%s", WG_CHANS);
+  else if (!strcmp(word, "ch")) {
+    if (*rest) wgSetChannelPlan(rest);
+    char planBuf[200];
+    wgFormatChannelList(planBuf, sizeof(planBuf), wgPlan, wgPlanCount);
+    wgEmit("WD:PLAN chans=%s", planBuf);
+  }
   else if (!strcmp(word, "reboot")) { wgEmit("rebooting"); wgRebootReq = true; }
   else if (!strcmp(word, "stop"))   wgStopStreaming();
   else if (!strcmp(word, "start"))  wgStartStreaming();
   else if (!strcmp(word, "bt"))     wgEmit("mode Wi-Fi  \xc2\xb7  bt unsupported");
   else if (!strcmp(word, "cap"))    wgEmit("mode Wi-Fi  \xc2\xb7  cap unsupported");
   else if (!strcmp(word, "wdstream")) {
-    if (strstr(rest, "stop")) wgStopStreaming();
-    else                      wgStartStreaming();   // -ch/-wifi flags: we scan all, always wifi
+    if (strstr(rest, "stop")) {
+      wgStopStreaming();
+    } else {
+      const char* chFlag = strstr(rest, "-ch");
+      if (chFlag) wgSetChannelPlan(chFlag + 3);
+      wgStartStreaming();   // -wifi: we only ever scan Wi-Fi, already the only mode
+    }
   }
   else { wgEmit("unknown command '%s'", word); wgCmdHelp(); }
 }
@@ -272,11 +344,15 @@ class WgServerCB : public NimBLEServerCallbacks {
     // a relink loop every ~15s. Advertising is re-armed in onDisconnect, so
     // the board is findable again the moment the phone really leaves.
     NimBLEDevice::stopAdvertising();
+    // Match the real WardriveESP firmware's connection parameters for better throughput: a 30-50 ms
+    // interval (24-40 x 1.25 ms units) with a 5 s supervision timeout (500 x 10 ms units), no slave latency.
+    s->updateConnParams(i.getConnHandle(), 24, 40, 0, 500);
   }
   void onDisconnect(NimBLEServer* s, NimBLEConnInfo& i, int reason) override {
     if (wgConnected) wgConnected--;
     Serial.printf("[WARDRIVEGO] central disconnected (reason %d)\n", reason);
     wgNotifyOn = false; wgStreaming = false;
+    wgPlanResetToAll();   // the channel list resets to every supported channel on disconnect
     NimBLEDevice::startAdvertising();
   }
 };
@@ -301,8 +377,16 @@ static void wgBuildName() {
 // ================================================================
 //  Lifecycle
 // ================================================================
-void wardriveGoBleBegin() {
+void wardriveGoBleBegin(bool isCore) {
   if (wgActive) return;
+
+  // A Node's "supported" list is limited to what its own radio can scan. A Core never
+  // scans itself -- it only relays whatever channel each node already reported over
+  // ESP-NOW -- so restricting it to this device's own band capability would silently
+  // drop forwarded APs from a dual-band node when the Core itself isn't a C5.
+  wgDualBand = isCore ? true : wardriverIsC5();
+  wgSupportedCount = wgDualBand ? JCMK_NUM_CHANNELS : 14;  // JCMK_CHANNELS[0..13] = 2.4 GHz ch 1..14
+  wgPlanResetToAll();
 
   NimBLEDevice::init("iosESP");
   NimBLEDevice::setMTU(247);
@@ -372,6 +456,13 @@ void wardriveGoBleStop() {
 bool wardriveGoBridgeRunning()   { return wgActive; }
 bool wardriveGoBridgeConnected() { return wgActive && wgConnected > 0; }
 
+bool wardriveGoChannelOverride(uint8_t* out, uint8_t* outCount) {
+  if (!wgActive || wgPlanCount == 0 || wgPlanCount >= wgSupportedCount) return false;
+  memcpy(out, wgPlan, wgPlanCount);
+  *outCount = wgPlanCount;
+  return true;
+}
+
 // ================================================================
 //  Telemetry push
 // ================================================================
@@ -380,6 +471,7 @@ static char wgLowerHex(uint8_t v) { return (char)(v < 10 ? '0' + v : 'a' + (v - 
 void wardriveGoPushAp(const String& bssid, const String& ssid,
                       const String& auth, int channel, int rssi) {
   if (!wgActive || !wgNotifyOn || !wgStreaming) return;
+  if (!wgChannelInPlan(channel)) return;   // respect the app's -ch / `ch` channel selection
   if (rssi < -128) rssi = -128;
 
   // SSID -> lower-case hex; empty => hidden.

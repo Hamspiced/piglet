@@ -24,8 +24,12 @@
 // cfg.wardriveGoBridge -- see enterNodeMode()/exitNodeMode()/enterCoreMode()/
 // exitCoreMode() in MeshNode.cpp.
 
-// Lifecycle -- call from the Mesh Node/Core enter/exit hooks.
-void wardriveGoBleBegin();
+// Lifecycle -- call from the Mesh Node/Core enter/exit hooks. `isCore` controls what
+// channel list we report/accept as "supported": a Node is limited to what its own
+// radio can scan (2.4 GHz only, unless this hardware is a dual-band C5); a Core merely
+// relays whatever channel each node already reported over ESP-NOW, so it is never
+// restricted by its own radio and always reports/accepts the full dual-band list.
+void wardriveGoBleBegin(bool isCore);
 void wardriveGoBleStop();
 
 // Main-loop service: drains inbound commands, streams queued WD: lines,
@@ -55,3 +59,11 @@ void wardriveGoSetGpsPresent(bool present);
 // Status accessors for the Mesh page's "WG: ..." indicator.
 bool wardriveGoBridgeRunning();    // true whenever the BLE stack is up (advertising or linked)
 bool wardriveGoBridgeConnected();  // true while a phone is linked (connected central)
+
+// True when the phone has explicitly narrowed the channel plan below every supported
+// channel (via `-ch` on `wdstream start` or the `ch` command) -- fills `out` (capacity
+// at least 48 bytes) with that channel list and `outCount` with its length. Used by
+// Node-mode scanning to actually scan only those channels, not just filter which
+// sightings get forwarded to the phone. Always false for a Core (it doesn't own a
+// scan loop of its own) and whenever the plan is still the default "every channel".
+bool wardriveGoChannelOverride(uint8_t* out, uint8_t* outCount);
