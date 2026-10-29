@@ -1,0 +1,13 @@
+{
+  "name": "Piglet — PigletNode C5 (mesh node)",
+  "version": "latest",
+  "funding_url": "https://github.com/Hamspiced/piglet",
+  "builds": [
+    {
+      "chipFamily": "ESP32-C5",
+      "parts": [
+        { "path": "https://github.com/Hamspiced/piglet/releases/latest/download/PigletNode.ino.merged.bin", "offset": 0 }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,207 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Piglet Web Flasher</title>
+<meta name="description" content="Flash the official Piglet wardriving firmware to your ESP32-C5 board straight from the browser.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#x1f437;</text></svg>">
+<script type="module" src="https://unpkg.com/esp-web-tools@10.4.0/dist/web/install-button.js?module"></script>
+<style>
+  *,*::before,*::after{box-sizing:border-box}
+  :root{
+    --bg:#0a0e13; --card:#111820; --text:#e2eaf4; --muted:#8899ab;
+    --border:#1e2a3a; --input:#0c1219; --inputBorder:#243044;
+    --accent:#2dd4bf; --accentDim:rgba(45,212,191,.15);
+    --primary:#2dd4bf; --primaryText:#0a0e13;
+    --danger:#fb7185; --warn:#fbbf24; --warnDim:rgba(251,191,36,.12);
+  }
+  html{color-scheme:dark}
+  body{
+    font-family:system-ui,-apple-system,sans-serif;
+    margin:0 auto;padding:16px;max-width:680px;
+    background:var(--bg);color:var(--text);line-height:1.5;
+  }
+
+  .header{display:flex;align-items:center;gap:10px;margin-bottom:16px;padding-bottom:12px;border-bottom:1px solid var(--border)}
+  .header .logo{font-size:28px;line-height:1}
+  .header h1{font-size:20px;font-weight:700;margin:0}
+  .header .sub{font-size:12px;color:var(--muted);margin:0}
+  .header h1 .tag{font-size:11px;font-weight:600;color:var(--accent);background:var(--accentDim);border:1px solid rgba(45,212,191,.35);padding:2px 7px;border-radius:999px;vertical-align:middle;margin-left:7px;letter-spacing:.3px;white-space:nowrap}
+
+  .card{border:1px solid var(--border);border-radius:12px;padding:14px;margin:12px 0;background:var(--card)}
+  .card h3{margin:0 0 10px 0;font-size:13px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;color:var(--muted)}
+  a{color:var(--accent);text-decoration:none}
+  a:hover{text-decoration:underline}
+  code{background:var(--input);padding:2px 6px;border-radius:5px;border:1px solid var(--border);font-size:12px}
+  .muted{color:var(--muted)}
+
+  /* requirement pills */
+  .statusGrid{display:flex;flex-wrap:wrap;gap:6px}
+  .pill{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--border);border-radius:999px;padding:5px 11px;font-size:12px;font-weight:500;background:var(--input)}
+  .pill .dot{width:7px;height:7px;border-radius:50%;background:var(--accent);flex-shrink:0}
+  .pill.warn{border-color:rgba(251,191,36,.3);background:var(--warnDim)} .pill.warn .dot{background:var(--warn)}
+
+  /* board selector */
+  label.lbl{display:block;font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin:0 0 6px}
+  select{
+    appearance:none;width:100%;cursor:pointer;
+    background:var(--input);color:var(--text);
+    border:1px solid var(--inputBorder);border-radius:8px;
+    padding:11px 36px 11px 12px;font:600 14px system-ui,sans-serif;
+    background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath fill='%238899ab' d='M1 1l5 5 5-5'/%3E%3C/svg%3E");
+    background-repeat:no-repeat;background-position:right 13px center;
+  }
+  select:focus{outline:none;border-color:var(--accent)}
+
+  .chips{display:flex;gap:5px;flex-wrap:wrap;margin:12px 0 0}
+  .chip{font-size:10px;font-weight:600;letter-spacing:.3px;padding:3px 8px;border-radius:999px;background:var(--input);border:1px solid var(--border);color:var(--muted);text-transform:uppercase}
+  .chip.a{color:var(--accent);border-color:rgba(45,212,191,.35)}
+  .desc{color:var(--muted);font-size:12.5px;margin:10px 0 0}
+
+  button.flash{
+    cursor:pointer;width:100%;padding:11px 14px;border-radius:8px;margin-top:14px;
+    border:1px solid var(--primary);background:var(--primary);color:var(--primaryText);
+    font:600 14px system-ui,sans-serif;transition:filter .1s;
+  }
+  button.flash:hover{filter:brightness(1.08)} button.flash:active{transform:translateY(1px)}
+  esp-web-install-button{--esp-tools-button-color:transparent;display:block}
+  .unsupported{color:var(--danger);font-size:12px}
+
+  .alt{display:flex;gap:14px;flex-wrap:wrap;font-size:12px;margin-top:12px}
+  details{border-top:1px solid var(--border);padding-top:10px;margin-top:12px}
+  summary{cursor:pointer;color:var(--muted);font-size:12px;list-style:none}
+  summary::-webkit-details-marker{display:none}
+  summary::before{content:"▸ ";color:var(--accent)}
+  details[open] summary::before{content:"▾ "}
+  pre{background:var(--input);border:1px solid var(--border);border-radius:7px;padding:11px;overflow:auto;font-size:12px;color:var(--text);margin:9px 0 0;font-family:ui-monospace,Menlo,Consolas,monospace}
+  pre .c{color:var(--muted)}
+
+  footer{margin-top:20px;padding-top:12px;border-top:1px solid var(--border);color:var(--muted);font-size:12px;display:flex;gap:14px;flex-wrap:wrap;justify-content:space-between}
+</style>
+</head>
+<body>
+
+  <div class="header">
+    <div class="logo">&#x1f437;</div>
+    <div>
+      <h1>Piglet Web Flasher <span class="tag">official</span></h1>
+      <p class="sub">Flash Piglet firmware over USB &mdash; no IDE, no toolchain</p>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>Before you start</h3>
+    <div class="statusGrid">
+      <span class="pill"><span class="dot"></span>Chrome or Edge (desktop)</span>
+      <span class="pill"><span class="dot"></span>Data USB cable</span>
+      <span class="pill"><span class="dot"></span>Plugged in directly, no hub</span>
+      <span class="pill warn"><span class="dot"></span>No port? install CP210x / CH343 driver</span>
+    </div>
+    <p class="muted" style="font-size:12.5px;margin:10px 0 0">
+      Flashing a whole batch? <a href="batch.html">Flash several boards at once →</a>
+    </p>
+  </div>
+
+  <div class="card">
+    <h3>Flash a board</h3>
+
+    <label class="lbl" for="board">Board</label>
+    <select id="board" aria-label="Board to flash"></select>
+
+    <div class="chips" id="chips"></div>
+    <p class="desc" id="desc"></p>
+
+    <esp-web-install-button id="installer">
+      <button class="flash" slot="activate">&#9654; Install</button>
+      <span slot="unsupported" class="unsupported">Open in Chrome or Edge (desktop) to flash.</span>
+    </esp-web-install-button>
+
+    <div class="alt">
+      <a id="dl" href="#" download>Download .bin</a>
+      <a id="mf" href="#">View manifest</a>
+    </div>
+
+    <details open>
+      <summary>C5 note &mdash; flash from a terminal if the browser fails</summary>
+<pre><span class="c"># The ESP32-C5 USB-Serial/JTAG can drop</span>
+<span class="c"># when the browser loads the flash stub.</span>
+<span class="c"># If Install fails, flash with esptool:</span>
+esptool --chip esp32c5 --no-stub \
+  write-flash 0x0 <span id="cmdbin">Piglet.ino.merged.bin</span></pre>
+    </details>
+  </div>
+
+  <footer>
+    <span><a href="https://github.com/Hamspiced/piglet">github.com/Hamspiced/piglet</a></span>
+    <span><a href="batch.html">batch flasher →</a></span>
+    <span>build __VERSION__</span>
+  </footer>
+
+<script>
+  // Every board Ham ships a flashable release image for (Hamspiced/piglet
+  // releases/latest). All are ESP32-C5. To add a board later: ship its
+  // *.ino.merged.bin in the release, add a manifest in manifests/, and add
+  // one entry here.
+  var BOARDS = [
+    {
+      value:    "xiao_c5",
+      label:    "Piglet Core — XIAO ESP32-C5",
+      manifest: "manifests/xiao_c5.json",
+      bin:      "Piglet.ino.merged.bin",
+      chips:    ["ESP32-C5","8 MB","GPS","dual-band"],
+      desc:     "Piglet Core — GPS, SD, WiGLE logging, mesh. Dual-band 2.4/5 GHz Wi-Fi."
+    },
+    {
+      value:    "pigletnode_c5",
+      label:    "PigletNode C5 — mesh node",
+      manifest: "manifests/pigletnode_c5.json",
+      bin:      "PigletNode.ino.merged.bin",
+      chips:    ["ESP32-C5","4 MB","mesh node"],
+      desc:     "Headless ESP-NOW mesh node — boots straight into node mode. Dual-band, no display."
+    },
+    {
+      value:    "tdongle_c5",
+      label:    "LilyGo T-Dongle C5",
+      manifest: "manifests/tdongle_c5.json",
+      bin:      "TDongleC5_Piglet.ino.merged.bin",
+      chips:    ["ESP32-C5","8 MB","0.96\" TFT"],
+      desc:     "USB-A dongle — 0.96\" ST7735 TFT, APA102 LED, GPS, SD, dual-band."
+    }
+  ];
+  var RELEASE = "https://github.com/Hamspiced/piglet/releases/latest/download/";
+
+  var sel = document.getElementById("board");
+  BOARDS.forEach(function(b){
+    var o = document.createElement("option");
+    o.value = b.value; o.textContent = b.label;
+    sel.appendChild(o);
+  });
+
+  var installer = document.getElementById("installer");
+  var chips = document.getElementById("chips");
+  var desc  = document.getElementById("desc");
+  var dl    = document.getElementById("dl");
+  var mf    = document.getElementById("mf");
+  var cmdbin = document.getElementById("cmdbin");
+
+  function apply(b){
+    installer.setAttribute("manifest", b.manifest);
+    chips.innerHTML = b.chips.map(function(c,i){
+      return '<span class="chip'+(i===0?' a':'')+'">'+c+'</span>';
+    }).join("");
+    desc.textContent = b.desc;
+    dl.setAttribute("href", RELEASE + b.bin);
+    mf.setAttribute("href", b.manifest);
+    cmdbin.textContent = b.bin;
+  }
+
+  sel.addEventListener("change", function(){
+    var b = BOARDS.filter(function(x){ return x.value === sel.value; })[0];
+    if(b) apply(b);
+  });
+
+  apply(BOARDS[0]); // default to the first board
+</script>
+</body>
+</html>

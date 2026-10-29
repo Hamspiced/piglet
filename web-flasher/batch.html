@@ -1,0 +1,339 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Piglet Batch Flasher</title>
+<meta name="description" content="Flash several Piglet boards at once over USB from the browser.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#x1f437;</text></svg>">
+<style>
+  *,*::before,*::after{box-sizing:border-box}
+  :root{
+    --bg:#0a0e13; --card:#111820; --text:#e2eaf4; --muted:#8899ab;
+    --border:#1e2a3a; --input:#0c1219; --inputBorder:#243044;
+    --accent:#2dd4bf; --accentDim:rgba(45,212,191,.15);
+    --primary:#2dd4bf; --primaryText:#0a0e13;
+    --danger:#fb7185; --dangerDim:rgba(251,113,133,.12);
+    --warn:#fbbf24; --warnDim:rgba(251,191,36,.12);
+    --ok:#2dd4bf; --okDim:rgba(45,212,191,.12);
+  }
+  html{color-scheme:dark}
+  body{font-family:system-ui,-apple-system,sans-serif;margin:0 auto;padding:16px;max-width:760px;background:var(--bg);color:var(--text);line-height:1.5}
+
+  .header{display:flex;align-items:center;gap:10px;margin-bottom:16px;padding-bottom:12px;border-bottom:1px solid var(--border)}
+  .header .logo{font-size:28px;line-height:1}
+  .header h1{font-size:20px;font-weight:700;margin:0}
+  .header .sub{font-size:12px;color:var(--muted);margin:0}
+  .header h1 .tag{font-size:11px;font-weight:600;color:var(--accent);background:var(--accentDim);border:1px solid rgba(45,212,191,.35);padding:2px 7px;border-radius:999px;vertical-align:middle;margin-left:7px;letter-spacing:.3px;white-space:nowrap}
+
+  .card{border:1px solid var(--border);border-radius:12px;padding:14px;margin:12px 0;background:var(--card)}
+  .card h3{margin:0 0 10px 0;font-size:13px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;color:var(--muted)}
+  a{color:var(--accent);text-decoration:none} a:hover{text-decoration:underline}
+  code{background:var(--input);padding:2px 6px;border-radius:5px;border:1px solid var(--border);font-size:12px}
+  .muted{color:var(--muted)}
+
+  .statusGrid{display:flex;flex-wrap:wrap;gap:6px}
+  .pill{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--border);border-radius:999px;padding:5px 11px;font-size:12px;font-weight:500;background:var(--input)}
+  .pill .dot{width:7px;height:7px;border-radius:50%;background:var(--accent);flex-shrink:0}
+  .pill.warn{border-color:rgba(251,191,36,.3);background:var(--warnDim)} .pill.warn .dot{background:var(--warn)}
+
+  label.lbl{display:block;font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin:0 0 6px}
+  select{appearance:none;width:100%;cursor:pointer;background:var(--input);color:var(--text);border:1px solid var(--inputBorder);border-radius:8px;padding:9px 32px 9px 11px;font:600 13.5px system-ui,sans-serif;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath fill='%238899ab' d='M1 1l5 5 5-5'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 11px center}
+  select:focus{outline:none;border-color:var(--accent)}
+  select:disabled{opacity:.55;cursor:not-allowed}
+
+  .row2{display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap}
+  .row2 .grow{flex:1;min-width:220px}
+
+  .check{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--text);margin-top:12px;cursor:pointer}
+  .check input{width:15px;height:15px;accent-color:var(--accent)}
+
+  button{font-family:system-ui,sans-serif}
+  .btn{cursor:pointer;border-radius:8px;padding:10px 14px;font:600 13.5px system-ui,sans-serif;border:1px solid var(--inputBorder);background:var(--input);color:var(--text);transition:filter .1s,background .1s}
+  .btn:hover{background:#121a26}
+  .btn.primary{border-color:var(--primary);background:var(--primary);color:var(--primaryText)}
+  .btn.primary:hover{filter:brightness(1.08)}
+  .btn:disabled{opacity:.5;cursor:not-allowed}
+  .btnrow{display:flex;gap:10px;flex-wrap:wrap;margin-top:14px}
+
+  .devs{display:flex;flex-direction:column;gap:10px;margin-top:4px}
+  .dev{border:1px solid var(--border);border-radius:10px;padding:12px;background:var(--card)}
+  .dev .top{display:flex;align-items:center;gap:10px;justify-content:space-between}
+  .dev .name{font-size:13.5px;font-weight:700;display:flex;align-items:center;gap:8px;min-width:0}
+  .dev .name .ico{font-size:15px}
+  .dev .name .n{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .dev .rm{flex-shrink:0;border:0;background:transparent;color:var(--muted);cursor:pointer;font-size:16px;line-height:1;padding:2px 6px;border-radius:6px}
+  .dev .rm:hover{color:var(--danger);background:var(--dangerDim)}
+  .dev .pick{margin-top:10px}
+  .bar{height:7px;border-radius:999px;background:var(--input);border:1px solid var(--border);overflow:hidden;margin-top:11px}
+  .bar i{display:block;height:100%;width:0;background:var(--accent);transition:width .18s ease}
+  .st{display:flex;justify-content:space-between;gap:8px;font-size:11.5px;color:var(--muted);margin-top:7px}
+  .st .state{font-weight:600}
+  .dev.ok .bar i{background:var(--ok)} .dev.ok .state{color:var(--ok)}
+  .dev.err .bar i{background:var(--danger)} .dev.err .state{color:var(--danger)}
+  .dev.run .state{color:var(--accent)}
+  .dev .c5{font-size:11px;color:var(--warn);margin-top:7px;display:none}
+  .dev[data-c5="1"] .c5{display:block}
+  details.log{margin-top:8px;border:0;padding:0}
+  details.log summary{cursor:pointer;color:var(--muted);font-size:11px;list-style:none}
+  details.log summary::-webkit-details-marker{display:none}
+  details.log summary::before{content:"▸ log";color:var(--accent)}
+  details.log[open] summary::before{content:"▾ log"}
+  details.log pre{background:var(--input);border:1px solid var(--border);border-radius:7px;padding:9px;margin:7px 0 0;max-height:150px;overflow:auto;font-size:11px;color:var(--text);font-family:ui-monospace,Menlo,Consolas,monospace;white-space:pre-wrap}
+
+  .empty{color:var(--muted);font-size:13px;text-align:center;padding:18px;border:1px dashed var(--border);border-radius:10px}
+  .unsupported{color:var(--danger);font-size:13px}
+  .summary{font-size:13px;margin-top:12px}
+  footer{margin-top:20px;padding-top:12px;border-top:1px solid var(--border);color:var(--muted);font-size:12px;display:flex;gap:14px;flex-wrap:wrap;justify-content:space-between}
+</style>
+</head>
+<body>
+
+  <div class="header">
+    <div class="logo">&#x1f437;</div>
+    <div>
+      <h1>Piglet Batch Flasher <span class="tag">multi</span></h1>
+      <p class="sub">Flash several boards at once over USB · <a href="index.html">single flasher →</a></p>
+    </div>
+  </div>
+
+  <div class="card" id="unsupportedCard" style="display:none">
+    <h3>Not supported here</h3>
+    <p class="unsupported">This page needs the Web Serial API — open it in <b>Chrome or Edge on a desktop</b> (not Safari, Firefox, or mobile).</p>
+  </div>
+
+  <div id="app" style="display:none">
+
+    <div class="card">
+      <h3>Before you start</h3>
+      <div class="statusGrid">
+        <span class="pill"><span class="dot"></span>Chrome or Edge (desktop)</span>
+        <span class="pill"><span class="dot"></span>Data USB cables</span>
+        <span class="pill"><span class="dot"></span>Plug in directly, no hub</span>
+        <span class="pill warn"><span class="dot"></span>C5 browser flashing is unreliable — see note</span>
+      </div>
+      <p class="muted" style="font-size:12.5px;margin:10px 0 0">
+        Add each board (one browser prompt per board — Web Serial can't grab them all at once), pick its firmware,
+        then <b style="color:var(--text)">Flash all</b>. Every board flashes at the same time.
+      </p>
+    </div>
+
+    <div class="card">
+      <h3>Firmware</h3>
+      <div class="row2">
+        <div class="grow">
+          <label class="lbl" for="globalBoard">Default board for new devices</label>
+          <select id="globalBoard" aria-label="Default board"></select>
+        </div>
+        <button class="btn" id="applyAll" title="Set every added device to the default board">Apply to all</button>
+      </div>
+      <label class="check"><input type="checkbox" id="eraseAll"> Erase entire flash before writing (slower; wipes saved settings)</label>
+    </div>
+
+    <div class="card">
+      <h3>Devices</h3>
+      <div class="devs" id="devs"></div>
+      <div class="empty" id="empty">No devices added yet. Click <b>Add device</b> and pick a board's serial port.</div>
+      <div class="btnrow">
+        <button class="btn" id="add">+ Add device</button>
+        <button class="btn primary" id="flash" disabled>&#9654; Flash all</button>
+        <button class="btn" id="clear" disabled>Clear</button>
+      </div>
+      <div class="summary muted" id="summary"></div>
+    </div>
+
+  </div>
+
+  <footer>
+    <span><a href="https://github.com/Hamspiced/piglet">github.com/Hamspiced/piglet</a></span>
+    <span>powered by esptool-js · build __VERSION__</span>
+  </footer>
+
+<script type="module">
+import { ESPLoader, Transport } from "https://unpkg.com/esptool-js@0.7.0/bundle.js";
+
+// Every board Piglet ships a flashable release image for — pulled straight
+// from Hamspiced/piglet's latest release. All are ESP32-C5, where browser
+// flashing can be unreliable, so each carries the c5 caution.
+const REL = "https://github.com/Hamspiced/piglet/releases/latest/download/";
+const BOARDS = [
+  { value:"xiao_c5",      label:"Piglet Core — XIAO ESP32-C5",  url:REL+"Piglet.ino.merged.bin",           chip:"ESP32-C5", c5:true },
+  { value:"pigletnode_c5",label:"PigletNode C5 — mesh node",    url:REL+"PigletNode.ino.merged.bin",       chip:"ESP32-C5", c5:true },
+  { value:"tdongle_c5",   label:"LilyGo T-Dongle C5",           url:REL+"TDongleC5_Piglet.ino.merged.bin", chip:"ESP32-C5", c5:true },
+];
+
+boot(BOARDS);
+
+// ---- generic batch-flasher engine (identical across every Piglet flasher) ----
+function boot(BOARDS){
+  if(!("serial" in navigator)){
+    document.getElementById("unsupportedCard").style.display="";
+    return;
+  }
+  document.getElementById("app").style.display="";
+
+  const devsEl   = document.getElementById("devs");
+  const emptyEl   = document.getElementById("empty");
+  const globalSel = document.getElementById("globalBoard");
+  const summaryEl = document.getElementById("summary");
+  const addBtn    = document.getElementById("add");
+  const flashBtn  = document.getElementById("flash");
+  const clearBtn  = document.getElementById("clear");
+  const applyAll  = document.getElementById("applyAll");
+  const eraseChk  = document.getElementById("eraseAll");
+
+  BOARDS.forEach(b=>{ const o=document.createElement("option"); o.value=b.value; o.textContent=b.label; globalSel.appendChild(o); });
+  const boardOf = v => BOARDS.find(b=>b.value===v) || BOARDS[0];
+
+  const devices = [];        // {port, boardValue, els, busy, done}
+  const binCache = new Map(); // url -> Promise<Uint8Array>
+  let flashing = false;
+
+  function fetchBin(url){
+    if(!binCache.has(url)){
+      binCache.set(url, fetch(url, {cache:"no-store"}).then(r=>{
+        if(!r.ok) throw new Error("download failed ("+r.status+")");
+        return r.arrayBuffer();
+      }).then(b=>new Uint8Array(b)));
+    }
+    return binCache.get(url);
+  }
+
+  function refresh(){
+    emptyEl.style.display = devices.length ? "none" : "";
+    clearBtn.disabled = flashing || devices.length===0;
+    flashBtn.disabled = flashing || devices.length===0;
+    addBtn.disabled   = flashing;
+    applyAll.disabled = flashing || devices.length===0;
+    globalSel.disabled = flashing;
+    eraseChk.disabled = flashing;
+  }
+
+  function portName(port, i){
+    try{ const info=port.getInfo?.(); if(info && info.usbVendorId!=null)
+      return "USB "+hex(info.usbVendorId)+":"+hex(info.usbProductId); }catch(e){}
+    return "Serial device";
+    function hex(n){ return (n>>>0).toString(16).padStart(4,"0"); }
+  }
+
+  function addRow(dev, i){
+    const el = document.createElement("div");
+    el.className = "dev";
+    el.innerHTML =
+      '<div class="top"><div class="name"><span class="ico">&#x1f50c;</span>'+
+        '<span class="n">#'+(i+1)+' · '+portName(dev.port,i)+'</span></div>'+
+        '<button class="rm" title="Remove">&times;</button></div>'+
+      '<div class="pick"><select class="devBoard" aria-label="Board for this device"></select></div>'+
+      '<div class="c5">⚠ ESP32-C5: USB-Serial/JTAG can drop when the stub loads. If it fails, flash this one from a terminal with <code>--no-stub</code>.</div>'+
+      '<div class="bar"><i></i></div>'+
+      '<div class="st"><span class="state">Ready</span><span class="pct"></span></div>'+
+      '<details class="log"><summary></summary><pre></pre></details>';
+    const sel = el.querySelector(".devBoard");
+    BOARDS.forEach(b=>{ const o=document.createElement("option"); o.value=b.value; o.textContent=b.label; sel.appendChild(o); });
+    sel.value = dev.boardValue;
+    el.dataset.c5 = boardOf(dev.boardValue).c5 ? "1" : "";
+    sel.addEventListener("change", ()=>{ dev.boardValue=sel.value; el.dataset.c5 = boardOf(sel.value).c5?"1":""; });
+    el.querySelector(".rm").addEventListener("click", ()=>{
+      if(dev.busy) return;
+      const idx=devices.indexOf(dev); if(idx>-1) devices.splice(idx,1);
+      el.remove(); renumber(); refresh();
+    });
+    dev.els = {
+      el, sel, state:el.querySelector(".state"), pct:el.querySelector(".pct"),
+      barI:el.querySelector(".bar i"), log:el.querySelector("pre")
+    };
+    devsEl.appendChild(el);
+  }
+
+  function renumber(){
+    [...devsEl.children].forEach((el,i)=>{
+      const n=el.querySelector(".name .n"); if(n) n.textContent = n.textContent.replace(/^#\d+/, "#"+(i+1));
+    });
+  }
+
+  function setState(dev, cls, text){
+    dev.els.el.classList.remove("run","ok","err");
+    if(cls) dev.els.el.classList.add(cls);
+    dev.els.state.textContent = text;
+  }
+  function setPct(dev, frac){
+    const p = Math.max(0,Math.min(100, Math.round(frac*100)));
+    dev.els.barI.style.width = p+"%"; dev.els.pct.textContent = p+"%";
+  }
+  function logLine(dev, s){ dev.els.log.textContent += s+"\n"; dev.els.log.scrollTop = dev.els.log.scrollHeight; }
+
+  addBtn.addEventListener("click", async ()=>{
+    let port;
+    try{ port = await navigator.serial.requestPort(); }
+    catch(e){ return; } // user cancelled the picker
+    if(devices.some(d=>d.port===port)){ return; } // already added
+    const dev = { port, boardValue: globalSel.value, busy:false, done:false };
+    devices.push(dev); addRow(dev, devices.length-1); refresh();
+  });
+
+  applyAll.addEventListener("click", ()=>{
+    devices.forEach(d=>{ d.boardValue=globalSel.value; if(d.els){ d.els.sel.value=globalSel.value; d.els.el.dataset.c5=boardOf(globalSel.value).c5?"1":""; } });
+  });
+
+  clearBtn.addEventListener("click", ()=>{
+    if(flashing) return;
+    devices.length=0; devsEl.innerHTML=""; summaryEl.textContent=""; refresh();
+  });
+
+  flashBtn.addEventListener("click", async ()=>{
+    if(flashing || !devices.length) return;
+    flashing = true; refresh();
+    summaryEl.textContent = "Flashing "+devices.length+" device"+(devices.length>1?"s":"")+"…";
+    const eraseAll = eraseChk.checked;
+
+    const results = await Promise.allSettled(devices.map(d=>flashOne(d, eraseAll)));
+    const ok = results.filter(r=>r.status==="fulfilled").length;
+    const bad = results.length - ok;
+    summaryEl.innerHTML = "Done — <b style='color:var(--ok)'>"+ok+" ok</b>"+
+      (bad?", <b style='color:var(--danger)'>"+bad+" failed</b>":"")+
+      ". Unplug the finished boards; failures can be retried with Flash all.";
+    flashing = false; refresh();
+  });
+
+  async function flashOne(dev, eraseAll){
+    const board = boardOf(dev.boardValue);
+    dev.busy = true;
+    setState(dev,"run","Connecting…"); setPct(dev,0);
+    const term = { clean(){}, writeLine(d){ logLine(dev, strip(d)); }, write(d){ logLine(dev, strip(d)); } };
+    let transport;
+    try{
+      const binP = fetchBin(board.url);           // starts (or reuses) the download
+      transport = new Transport(dev.port, true);
+      const loader = new ESPLoader({ transport, baudrate:115200, terminal:term, debugLogging:false });
+      const chip = await loader.main();
+      setState(dev,"run","Detected "+chip+" · writing…");
+      const data = await binP;
+      await loader.writeFlash({
+        fileArray:[{ data, address:0 }],
+        flashMode:"keep", flashFreq:"keep", flashSize:"keep",
+        eraseAll, compress:true,
+        reportProgress:(idx, written, total)=>{ setState(dev,"run","Writing…"); setPct(dev, total? written/total : 0); }
+      });
+      setPct(dev,1);
+      setState(dev,"run","Resetting…");
+      try{ await loader.after("hard_reset"); }catch(e){}
+      setState(dev,"ok","Done ✓");
+    }catch(err){
+      const msg = (err && err.message) ? err.message : String(err);
+      logLine(dev, "ERROR: "+msg);
+      setState(dev,"err","Failed — "+short(msg));
+      throw err;
+    }finally{
+      try{ await transport?.disconnect(); }catch(e){}
+      dev.busy=false; dev.done=true;
+    }
+  }
+
+  function strip(s){ return String(s).replace(/\x1b\[[0-9;]*m/g,"").replace(/[\r\n]+$/,""); }
+  function short(s){ s=strip(s); return s.length>60 ? s.slice(0,58)+"…" : s; }
+
+  refresh();
+}
+</script>
+</body>
+</html>
