@@ -1,10 +1,24 @@
-name: Build firmware & deploy flasher
+name: Deploy web flasher
 
-# Builds every PlatformIO board env, merges each into a single flashable image,
-# and publishes the ESP Web Tools flasher (web-flasher/) to GitHub Pages.
+# Publishes web-flasher/ (ESP Web Tools install button on index.html, plus the
+# esptool-js batch flasher on batch.html) to GitHub Pages.
 #
-# Runs on a version tag (v*) and on manual dispatch. The first run turns Pages
-# on automatically (configure-pages enablement) — no Settings toggle needed.
+# Firmware itself is built and published to GitHub Releases by
+# release-firmware.yml (Piglet, TDongleC5_Piglet, PigletNode -- all
+# esp32:esp32:XIAO_ESP32C5). The arduino-esp32 core's postobjcopy merge step
+# already produces a single flashable <Sketch>.ino.merged.bin per board as
+# part of that build, so this workflow does not rebuild anything -- it only
+# ships the static site, which fetches those merged images straight from
+# Hamspiced/piglet's latest published release at flash time (see the
+# `RELEASE`/`REL` constants in index.html/batch.html).
+#
+# release-firmware.yml publishes each release immediately (not as a draft),
+# so GitHub's "latest" release resolves to it as soon as that workflow
+# finishes -- no manual publish step needed before the web flasher works.
+#
+# Runs on a version tag (v*) and on manual dispatch. The first run turns
+# Pages on automatically (configure-pages enablement) -- no Settings toggle
+# needed.
 
 on:
   push:
@@ -22,85 +36,8 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  build:
-    name: Build ${{ matrix.env }}
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { env: xiao_c5,                  dir: "warhog_fork",    chip: esp32c5 }
-          - { env: freenove-s3-cyd-ham-ui4,  dir: "WarHog_Freenove_S3_CYD_HAM_UI4", chip: esp32s3 }
-          - { env: guition-jc8048w550,       dir: "WarHog_Freenove_S3_CYD_HAM_UI4", chip: esp32s3 }
-          - { env: esp32c3_oled,             dir: "c3_node",                       chip: esp32c3 }
-          - { env: warhognode_c5,            dir: "WarHogNode",                    chip: esp32c5 }
-          - { env: waveshare_c6,             dir: "waveshareDisplayMiniWarHog",    chip: esp32c6 }
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-
-      - name: Cache PlatformIO
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.platformio
-            ~/.cache/pip
-          key: pio-${{ matrix.env }}-${{ hashFiles('**/platformio.ini') }}
-          restore-keys: pio-${{ matrix.env }}-
-
-      - name: Install PlatformIO + esptool
-        run: |
-          python -m pip install --upgrade pip
-          pip install platformio "esptool==4.8.1"
-
-      - name: Build
-        run: pio run -d "${{ matrix.dir }}" -e "${{ matrix.env }}"
-
-      - name: Merge into a single flashable image
-        run: |
-          set -euo pipefail
-          BUILD="${{ matrix.dir }}/.pio/build/${{ matrix.env }}"
-          BOOT_APP0="$(find "$HOME/.platformio/packages" -name boot_app0.bin | head -n1)"
-          if [ -z "$BOOT_APP0" ]; then echo "boot_app0.bin not found"; exit 1; fi
-          mkdir -p merged
-          # Second-stage bootloader offset is chip-specific: 0x0 on ESP32-S3/C3/C6,
-          # but 0x2000 on ESP32-C5 (its ROM boots from 0x2000, so a bootloader at
-          # 0x0 gives "invalid header" and a boot loop). --target-offset 0x0 keeps
-          # the merged image starting at flash offset 0 (0xFF-padded), so the
-          # flasher manifests can keep writing it at offset 0 for every chip.
-          case "${{ matrix.chip }}" in
-            esp32c5) BOOT_OFF=0x2000 ;;
-            *)       BOOT_OFF=0x0 ;;
-          esac
-          python -m esptool --chip "${{ matrix.chip }}" merge_bin \
-            -o "merged/${{ matrix.env }}.bin" \
-            --target-offset 0x0 \
-            --flash_mode keep --flash_freq keep --flash_size keep \
-            "$BOOT_OFF" "$BUILD/bootloader.bin" \
-            0x8000  "$BUILD/partitions.bin" \
-            0xe000  "$BOOT_APP0" \
-            0x10000 "$BUILD/firmware.bin"
-          ls -l "merged/${{ matrix.env }}.bin"
-          # App-only image (the ota_0 slot) for over-the-air updates: the Core
-          # streams this to a node from its SD card (/fw/warhognode_c5.ota.bin).
-          # The merged image above is for first-time USB/web flashing only.
-          cp "$BUILD/firmware.bin" "merged/${{ matrix.env }}.ota.bin"
-
-      - name: Upload firmware artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: fw-${{ matrix.env }}
-          path: |
-            merged/${{ matrix.env }}.bin
-            merged/${{ matrix.env }}.ota.bin
-          if-no-files-found: error
-
   deploy:
-    name: Assemble site & deploy Pages
-    needs: build
+    name: Deploy web-flasher to Pages
     runs-on: ubuntu-latest
     environment:
       name: github-pages
@@ -108,26 +45,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Collect built firmware
-        uses: actions/download-artifact@v4
-        with:
-          pattern: fw-*
-          path: _artifacts
-
-      - name: Assemble web-flasher/firmware
+      - name: Stamp version
         run: |
           set -euo pipefail
-          mkdir -p web-flasher/firmware
-          # Each artifact dir holds one <env>.bin — flatten into firmware/.
-          find _artifacts -name '*.bin' -exec cp -v {} web-flasher/firmware/ \;
-          # The developer wiki (docs/*.md) is the single source of truth; copy it
-          # in so docs.html can fetch and render it on the deployed site.
-          mkdir -p web-flasher/docs
-          cp -v docs/*.md web-flasher/docs/
           VERSION="${GITHUB_REF_NAME}+${GITHUB_SHA::7}"
           echo "Stamping version: $VERSION"
-          # Substitute __VERSION__ in the pages and every manifest.
-          find web-flasher \( -name '*.json' -o -name 'index.html' -o -name 'docs.html' \) | while read -r f; do
+          # Substitute __VERSION__ in the flasher pages' footers.
+          find web-flasher -name '*.html' | while read -r f; do
             sed -i "s|__VERSION__|${VERSION}|g" "$f"
           done
 

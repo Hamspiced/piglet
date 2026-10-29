@@ -167,5 +167,5 @@ jobs:
           tag_name: ${{ github.event.inputs.tag || github.ref_name }}
           name: ${{ github.event.inputs.tag || github.ref_name }}
           body_path: release_notes.md
-          draft: true
+          draft: false
           files: release_assets/*
