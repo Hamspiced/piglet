@@ -157,10 +157,15 @@ import { ESPLoader, Transport } from "https://unpkg.com/esptool-js@0.7.0/bundle.
 // flashing can be unreliable, so each carries the c5 caution.
 const REL = "https://github.com/Hamspiced/piglet/releases/latest/download/";
 const BOARDS = [
-  { value:"xiao_c5",      label:"Piglet Core — XIAO ESP32-C5",  url:REL+"Piglet.ino.merged.bin",           chip:"ESP32-C5", c5:true },
+  { value:"xiao_c5",      label:"Flash Piglet",                 url:REL+"Piglet.ino.merged.bin",           chip:"ESP32-C5", c5:true },
   { value:"pigletnode_c5",label:"PigletNode C5 — mesh node",    url:REL+"PigletNode.ino.merged.bin",       chip:"ESP32-C5", c5:true },
   { value:"tdongle_c5",   label:"LilyGo T-Dongle C5",           url:REL+"TDongleC5_Piglet.ino.merged.bin", chip:"ESP32-C5", c5:true },
 ];
+// Per-board firmware version actually baked into the latest release's binaries
+// (built by release-firmware.yml from each sketch's own FIRMWARE_VERSION --
+// boards can lag behind each other, so this is NOT just the git tag name).
+// {value: "vX.YY"}; empty until versions.json loads (see boot()).
+let VERSIONS = {};
 
 boot(BOARDS);
 
@@ -182,8 +187,14 @@ function boot(BOARDS){
   const applyAll  = document.getElementById("applyAll");
   const eraseChk  = document.getElementById("eraseAll");
 
-  BOARDS.forEach(b=>{ const o=document.createElement("option"); o.value=b.value; o.textContent=b.label; globalSel.appendChild(o); });
+  function boardLabel(b){ return b.label + (VERSIONS[b.value] ? " \u00b7 " + VERSIONS[b.value] : ""); }
+  function refreshBoardLabels(){
+    globalSel.querySelectorAll("option").forEach(o=>{ o.textContent = boardLabel(boardOf(o.value)); });
+    document.querySelectorAll(".devBoard option").forEach(o=>{ o.textContent = boardLabel(boardOf(o.value)); });
+  }
+
   const boardOf = v => BOARDS.find(b=>b.value===v) || BOARDS[0];
+  BOARDS.forEach(b=>{ const o=document.createElement("option"); o.value=b.value; o.textContent=boardLabel(b); globalSel.appendChild(o); });
 
   const devices = [];        // {port, boardValue, els, busy, done}
   const binCache = new Map(); // url -> Promise<Uint8Array>
@@ -229,7 +240,7 @@ function boot(BOARDS){
       '<div class="st"><span class="state">Ready</span><span class="pct"></span></div>'+
       '<details class="log"><summary></summary><pre></pre></details>';
     const sel = el.querySelector(".devBoard");
-    BOARDS.forEach(b=>{ const o=document.createElement("option"); o.value=b.value; o.textContent=b.label; sel.appendChild(o); });
+    BOARDS.forEach(b=>{ const o=document.createElement("option"); o.value=b.value; o.textContent=boardLabel(b); sel.appendChild(o); });
     sel.value = dev.boardValue;
     el.dataset.c5 = boardOf(dev.boardValue).c5 ? "1" : "";
     sel.addEventListener("change", ()=>{ dev.boardValue=sel.value; el.dataset.c5 = boardOf(sel.value).c5?"1":""; });
@@ -333,6 +344,15 @@ function boot(BOARDS){
   function short(s){ s=strip(s); return s.length>60 ? s.slice(0,58)+"…" : s; }
 
   refresh();
+
+  // Best-effort: fetch the exact per-board versions shipped in the latest
+  // release and refresh every board dropdown's labels once known. If this
+  // fails (offline, rate-limited, older release with no versions.json yet)
+  // the labels just show no version suffix -- flashing itself is unaffected.
+  fetch(REL + "versions.json", {cache:"no-store"})
+    .then(r=>r.ok ? r.json() : {})
+    .then(v=>{ VERSIONS = v || {}; refreshBoardLabels(); })
+    .catch(()=>{});
 }
 </script>
 </body>

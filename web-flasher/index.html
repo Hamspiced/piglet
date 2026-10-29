@@ -146,7 +146,7 @@ esptool --chip esp32c5 --no-stub \
   var BOARDS = [
     {
       value:    "xiao_c5",
-      label:    "Piglet Core — XIAO ESP32-C5",
+      label:    "Flash Piglet",
       manifest: "manifests/xiao_c5.json",
       bin:      "Piglet.ino.merged.bin",
       chips:    ["ESP32-C5","8 MB","GPS","dual-band"],
@@ -170,6 +170,11 @@ esptool --chip esp32c5 --no-stub \
     }
   ];
   var RELEASE = "https://github.com/Hamspiced/piglet/releases/latest/download/";
+  // Per-board firmware version actually baked into the latest release's binaries
+  // (built by release-firmware.yml from each sketch's own FIRMWARE_VERSION --
+  // boards can lag behind each other, so this is NOT just the git tag name).
+  // {value: "vX.YY"}; empty until versions.json loads below.
+  var VERSIONS = {};
 
   var sel = document.getElementById("board");
   BOARDS.forEach(function(b){
@@ -184,11 +189,15 @@ esptool --chip esp32c5 --no-stub \
   var dl    = document.getElementById("dl");
   var mf    = document.getElementById("mf");
   var cmdbin = document.getElementById("cmdbin");
+  var current = BOARDS[0];
 
   function apply(b){
+    current = b;
     installer.setAttribute("manifest", b.manifest);
-    chips.innerHTML = b.chips.map(function(c,i){
-      return '<span class="chip'+(i===0?' a':'')+'">'+c+'</span>';
+    var ver = VERSIONS[b.value];
+    var verChip = ver ? '<span class="chip a">'+ver+'</span>' : '';
+    chips.innerHTML = verChip + b.chips.map(function(c,i){
+      return '<span class="chip'+((!verChip && i===0)?' a':'')+'">'+c+'</span>';
     }).join("");
     desc.textContent = b.desc;
     dl.setAttribute("href", RELEASE + b.bin);
@@ -202,6 +211,15 @@ esptool --chip esp32c5 --no-stub \
   });
 
   apply(BOARDS[0]); // default to the first board
+
+  // Best-effort: fetch the exact per-board versions shipped in the latest
+  // release and re-render once known. If this fails (offline, rate-limited,
+  // older release with no versions.json yet) the chips just show hardware
+  // specs with no version badge -- flashing itself is unaffected.
+  fetch(RELEASE + "versions.json", {cache:"no-store"})
+    .then(function(r){ return r.ok ? r.json() : {}; })
+    .then(function(v){ VERSIONS = v || {}; apply(current); })
+    .catch(function(){});
 </script>
 </body>
 </html>

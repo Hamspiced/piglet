@@ -131,6 +131,26 @@ jobs:
           find artifacts -type f \( -name "*.bin" -o -name "*.zip" \) -exec cp {} release_assets/ \;
           ls -la release_assets
 
+      - name: Build versions.json
+        run: |
+          set -eu
+          # Per-board firmware version actually embedded in this release's binaries
+          # (boards can lag behind each other -- e.g. PigletNode isn't always bumped
+          # alongside the others), keyed by the web-flasher's board value. Consumed
+          # by web-flasher/index.html and batch.html to show the exact version
+          # they're about to flash, instead of just the overall release tag.
+          XIAO_VER="$(grep -oE '#define FIRMWARE_VERSION "[^"]+"' "Arduino Files/Piglet/Globals.h" | sed -E 's/.*"(.*)"/\1/')"
+          TDONGLE_VER="$(grep -oE '#define FIRMWARE_VERSION "[^"]+"' "TDongleC5_Piglet/TDongleC5_Piglet.ino" | sed -E 's/.*"(.*)"/\1/')"
+          NODE_VER="$(grep -oE '#define FIRMWARE_VERSION "[^"]+"' "PigletNode/PigletNode.ino" | sed -E 's/.*"(.*)"/\1/')"
+          cat > release_assets/versions.json <<EOF
+          {
+            "xiao_c5": "${XIAO_VER}",
+            "tdongle_c5": "${TDONGLE_VER}",
+            "pigletnode_c5": "${NODE_VER}"
+          }
+          EOF
+          cat release_assets/versions.json
+
       - name: Build release notes
         run: |
           set -eu

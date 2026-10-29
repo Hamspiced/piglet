@@ -1,5 +1,5 @@
 {
-  "name": "Piglet — XIAO ESP32-C5 (Piglet Core)",
+  "name": "Flash Piglet",
   "version": "latest",
   "funding_url": "https://github.com/Hamspiced/piglet",
   "builds": [
