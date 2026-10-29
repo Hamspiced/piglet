@@ -206,7 +206,7 @@ static void pollButton() {
       cfg.wardriveGoBridge = !cfg.wardriveGoBridge;
       saveConfigToSD();
       if (cfg.wardriveGoBridge) wardriveGoBleBegin(meshCoreActive);
-      else                      wardriveGoBleStop();
+      else                      wardriveGoBleSuspend();
       Serial.print("[BTN] Double press -> Wardrive Go bridge ");
       Serial.println(cfg.wardriveGoBridge ? "ENABLED" : "DISABLED");
     } else {

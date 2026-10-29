@@ -30,6 +30,17 @@
 // relays whatever channel each node already reported over ESP-NOW, so it is never
 // restricted by its own radio and always reports/accepts the full dual-band list.
 void wardriveGoBleBegin(bool isCore);
+
+// Lightweight disable for use while the Mesh Node/Core page stays active (e.g. the
+// double-press toggle): stops advertising and drops any linked phone, but leaves the
+// NimBLE stack/GATT server initialized so a later wardriveGoBleBegin() is an instant
+// restart instead of a full re-init. Prefer this over wardriveGoBleStop() for anything
+// that must not risk blocking -- a full NimBLEDevice::deinit() while a phone is
+// connected can stall waiting on the BT controller, especially with Wi-Fi/ESP-NOW
+// busy on the shared radio.
+void wardriveGoBleSuspend();
+
+// Full teardown -- only call when actually leaving the Mesh Node/Core page.
 void wardriveGoBleStop();
 
 // Main-loop service: drains inbound commands, streams queued WD: lines,

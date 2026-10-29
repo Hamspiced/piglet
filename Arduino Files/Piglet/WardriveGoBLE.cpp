@@ -15,12 +15,25 @@ static const char* WG_SERVICE_UUID = "47686F73-7445-5350-4272-696467655376";
 #define WG_CH_CTRL  "0347686F-7374-4553-5042-72694C525443"   // write / write-NR
 #define WG_CH_OTA   "0447686F-7374-4553-5042-72694F544144"   // write-NR (stubbed)
 
-// Reported in WD:CAPS/`info` as the protocol-compatible firmware version. Deliberately NOT tied to Piglet's own
-// FIRMWARE_VERSION: the app compares this number-by-number against the latest known WardriveESP release and
-// nags about an "outdated" board if it looks old. Since we don't implement that app's OTA update path anyway
-// (ota=0 below), there's nothing to gain from reporting our real version here -- keep this at or above the
-// latest official release to avoid a false update prompt.
-#define WG_FW_VERSION "1.7.1"
+// Reported in WD:CAPS/`info` as this board's firmware version -- tracks Piglet's own
+// FIRMWARE_VERSION (e.g. "v2.82"), reformatted as 1<major>.<minor>.00 (e.g. "12.82.00")
+// rather than a fixed/official WardriveESP release number. The leading "1" digit is
+// deliberate: it keeps the reported version numerically well above the real WardriveESP
+// release line (currently 1.x), so the app's "outdated firmware" nag -- which compares
+// this number-by-number -- never triggers, while the rest still tracks Piglet's actual
+// version for support/debugging.
+static const char* wgFwVersion() {
+  static char buf[16] = "";
+  if (buf[0]) return buf;
+  const char* v = FIRMWARE_VERSION;
+  if (*v == 'v' || *v == 'V') v++;
+  int major = atoi(v);
+  int minor = 0;
+  const char* dot = strchr(v, '.');
+  if (dot) minor = atoi(dot + 1);
+  snprintf(buf, sizeof(buf), "1%d.%02d.00", major, minor);
+  return buf;
+}
 #ifdef CONFIG_IDF_TARGET
 #define WG_CHIP CONFIG_IDF_TARGET      // "esp32s3", "esp32c5", ...
 #else
@@ -168,7 +181,7 @@ static void wgSendCaps() {
   char chanBuf[200];
   wgFormatChannelList(chanBuf, sizeof(chanBuf), JCMK_CHANNELS, wgSupportedCount);
   wgEmit("WD:CAPS fw=%s chip=%s bands=%s ota=0 bt=0 gps=%d cap=0 chans=%s",
-         WG_FW_VERSION, WG_CHIP, wgDualBand ? "2g,5g" : "2g", wgGpsPresent ? 1 : 0, chanBuf);
+         wgFwVersion(), WG_CHIP, wgDualBand ? "2g,5g" : "2g", wgGpsPresent ? 1 : 0, chanBuf);
 }
 
 void wardriveGoSetGpsPresent(bool present) {
@@ -228,7 +241,7 @@ static void wgCmdHelp() {
   wgEmit("commands: wdstream start|stop, start, stop, caps, info, status, ch, reboot");
 }
 static void wgCmdInfo() {
-  wgEmit("iosESP %s chip=%s name=%s uptime=%lus", WG_FW_VERSION, WG_CHIP, wgName,
+  wgEmit("iosESP %s chip=%s name=%s uptime=%lus", wgFwVersion(), WG_CHIP, wgName,
          (unsigned long)(millis() / 1000));
 }
 static void wgCmdStatus() {
@@ -353,7 +366,11 @@ class WgServerCB : public NimBLEServerCallbacks {
     Serial.printf("[WARDRIVEGO] central disconnected (reason %d)\n", reason);
     wgNotifyOn = false; wgStreaming = false;
     wgPlanResetToAll();   // the channel list resets to every supported channel on disconnect
-    NimBLEDevice::startAdvertising();
+    // Only re-arm if the bridge is still meant to be running -- this disconnect may be
+    // the tail end of a wardriveGoBleSuspend()/wardriveGoBleStop() initiated disconnect,
+    // in which case re-advertising (or touching advertising after deinit) would undo the
+    // suspend or use a freed stack.
+    if (wgActive) NimBLEDevice::startAdvertising();
   }
 };
 
@@ -377,6 +394,14 @@ static void wgBuildName() {
 // ================================================================
 //  Lifecycle
 // ================================================================
+// True once the NimBLE stack, GATT server/service/characteristics, and advertising
+// payloads have been built for this boot. Stays true across wardriveGoBleSuspend() so a
+// later wardriveGoBleBegin() (double-press re-enable, or re-entering the Mesh page) only
+// has to restart advertising -- cheap and fast -- instead of re-running the full
+// NimBLEDevice::init()/createServer()/createService() sequence. Only cleared by the full
+// teardown in wardriveGoBleStop() (page exit).
+static bool wgStackReady = false;
+
 void wardriveGoBleBegin(bool isCore) {
   if (wgActive) return;
 
@@ -388,41 +413,45 @@ void wardriveGoBleBegin(bool isCore) {
   wgSupportedCount = wgDualBand ? JCMK_NUM_CHANNELS : 14;  // JCMK_CHANNELS[0..13] = 2.4 GHz ch 1..14
   wgPlanResetToAll();
 
-  NimBLEDevice::init("iosESP");
-  NimBLEDevice::setMTU(247);
-  NimBLEDevice::setPower(9);   // +9 dBm
+  if (!wgStackReady) {
+    NimBLEDevice::init("iosESP");
+    NimBLEDevice::setMTU(247);
+    NimBLEDevice::setPower(9);   // +9 dBm
 
-  wgBuildName();
-  NimBLEDevice::setDeviceName(wgName);
+    wgBuildName();
+    NimBLEDevice::setDeviceName(wgName);
 
-  NimBLEServer* server = NimBLEDevice::createServer();
-  // false => NimBLE must NOT delete this static callback object on deinit.
-  server->setCallbacks(&wgServerCb, false);
+    NimBLEServer* server = NimBLEDevice::createServer();
+    // false => NimBLE must NOT delete this static callback object on deinit.
+    server->setCallbacks(&wgServerCb, false);
 
-  NimBLEService* svc = server->createService(WG_SERVICE_UUID);
-  svc->createCharacteristic(WG_CH_RX, NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR)
-     ->setCallbacks(&ieCommandCb);
-  chTx = svc->createCharacteristic(WG_CH_TX, NIMBLE_PROPERTY::NOTIFY);
-  chTx->setCallbacks(&wgTxCb);
-  svc->createCharacteristic(WG_CH_CTRL, NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR)
-     ->setCallbacks(&ieCommandCb);
-  svc->createCharacteristic(WG_CH_OTA, NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR)
-     ->setCallbacks(&wgOtaCb);
-  svc->start();
+    NimBLEService* svc = server->createService(WG_SERVICE_UUID);
+    svc->createCharacteristic(WG_CH_RX, NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR)
+       ->setCallbacks(&ieCommandCb);
+    chTx = svc->createCharacteristic(WG_CH_TX, NIMBLE_PROPERTY::NOTIFY);
+    chTx->setCallbacks(&wgTxCb);
+    svc->createCharacteristic(WG_CH_CTRL, NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR)
+       ->setCallbacks(&ieCommandCb);
+    svc->createCharacteristic(WG_CH_OTA, NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR)
+       ->setCallbacks(&wgOtaCb);
+    svc->start();
 
-  // Service UUID MUST be in the primary advertisement -- it's the app's scan
-  // filter. The (longer) name goes in the scan response so the 31-byte
-  // advertising payload doesn't overflow.
-  NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
-  NimBLEAdvertisementData advData;
-  advData.setFlags(0x06);
-  advData.addServiceUUID(NimBLEUUID(WG_SERVICE_UUID));
-  adv->setAdvertisementData(advData);
+    // Service UUID MUST be in the primary advertisement -- it's the app's scan
+    // filter. The (longer) name goes in the scan response so the 31-byte
+    // advertising payload doesn't overflow.
+    NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
+    NimBLEAdvertisementData advData;
+    advData.setFlags(0x06);
+    advData.addServiceUUID(NimBLEUUID(WG_SERVICE_UUID));
+    adv->setAdvertisementData(advData);
 
-  NimBLEAdvertisementData scanData;
-  scanData.setName(wgName);
-  adv->setScanResponseData(scanData);
-  adv->enableScanResponse(true);
+    NimBLEAdvertisementData scanData;
+    scanData.setName(wgName);
+    adv->setScanResponseData(scanData);
+    adv->enableScanResponse(true);
+
+    wgStackReady = true;
+  }
 
   wgNotifyOn = false;
   wgStreaming = false;
@@ -437,9 +466,38 @@ void wardriveGoBleBegin(bool isCore) {
   Serial.printf("[WARDRIVEGO] Up as \"%s\" (chip=%s)\n", wgName, WG_CHIP);
 }
 
-void wardriveGoBleStop() {
+void wardriveGoBleSuspend() {
   if (!wgActive) return;
   wgActive = false;
+  if (wgStackReady) {
+    // Drop any linked phone first -- disconnect() just posts a termination request to
+    // the controller, so this is cheap/non-blocking, unlike tearing the whole stack
+    // down (wardriveGoBleStop()) while a central is still connected.
+    NimBLEServer* server = NimBLEDevice::getServer();
+    if (server) {
+      for (uint16_t h : server->getPeerDevices()) server->disconnect(h);
+    }
+    NimBLEDevice::stopAdvertising();
+  }
+  wgNotifyOn = false;
+  wgStreaming = false;
+  wgConnected = 0;
+  wgCmdHead = wgCmdTail = 0;
+  wgTxHead = wgTxTail = 0;
+  Serial.println("[WARDRIVEGO] Suspended");
+}
+
+void wardriveGoBleStop() {
+  if (!wgStackReady) { wgActive = false; return; }
+  wgActive = false;
+  // Drop any linked phone before tearing the stack down -- NimBLEDevice::deinit() while
+  // a central is still connected can otherwise block the caller waiting on the BT
+  // controller, which can take a long time (or stall outright) with Wi-Fi/ESP-NOW also
+  // busy on the shared radio.
+  NimBLEServer* server = NimBLEDevice::getServer();
+  if (server) {
+    for (uint16_t h : server->getPeerDevices()) server->disconnect(h);
+  }
   NimBLEDevice::stopAdvertising();
   // Full deinit frees the BT controller RAM for the WiFi/ESP-Now path --
   // Piglet has no other concurrent BLE consumer, so this is always safe.
@@ -450,6 +508,7 @@ void wardriveGoBleStop() {
   wgConnected = 0;
   wgCmdHead = wgCmdTail = 0;
   wgTxHead = wgTxTail = 0;
+  wgStackReady = false;
   Serial.println("[WARDRIVEGO] Down");
 }
 

@@ -43,7 +43,7 @@
 #include "esp32-hal-matrix.h"
 
 // Firmware version
-#define FIRMWARE_VERSION "v2.81"
+#define FIRMWARE_VERSION "v2.82"
 
 // ---------------- Pins (T-DONGLE C5) ----------------
 struct PinMap {
@@ -4573,7 +4573,7 @@ static void pollButton() {
       cfg.wardriveGoBridge = !cfg.wardriveGoBridge;
       saveConfigToSD();
       if (cfg.wardriveGoBridge) wardriveGoBleBegin(meshCoreActive);
-      else                      wardriveGoBleStop();
+      else                      wardriveGoBleSuspend();
       Serial.print("[BTN] Double press -> Wardrive Go bridge ");
       Serial.println(cfg.wardriveGoBridge ? "ENABLED" : "DISABLED");
     } else {

@@ -1,5 +1,15 @@
 # Changelog
 
+## v2.82 (2026-10-29)
+
+### Bug Fixes
+- **Double-pressing to disable the Wardrive Go BLE bridge could stall the board** -- the toggle called a full `NimBLEDevice::deinit()` to tear down the BT stack, which can block the main loop for a long time (or hang outright) while a phone is actively linked and Wi-Fi/ESP-NOW is also busy on the shared radio. It also unconditionally deleted the GATT server/advertising objects even if that teardown didn't actually complete, which could corrupt the bridge's BLE state for the rest of the session and plausibly explains reports of the board not being reliably recognized by the app after being toggled. The double-press toggle now only stops advertising and drops any linked phone, leaving the BT stack initialized so turning it back on is instant; the full stack teardown is reserved for actually leaving the Mesh Node/Core page, and now always disconnects any linked phone first so it doesn't have to fight a live connection while shutting down. Applied to both the main Piglet firmware and the T-Dongle C5 standalone firmware.
+
+### Technical Changes
+- **Wardrive Go reported firmware version format changed** -- the `fw=` field in `WD:CAPS`/`info` now reports Piglet's version as `1<major>.<minor>.00` (e.g. `12.82.00` for Piglet v2.82) instead of `<major>.<minor>.00`. The leading `1` keeps the number well above the real WardriveESP release line (currently 1.x), so the app's version-based "outdated firmware" check never triggers. Applied to both the main Piglet firmware and the T-Dongle C5 standalone firmware.
+
+---
+
 ## v2.81 (2026-10-29)
 
 ### Bug Fixes
