@@ -152,10 +152,14 @@
 <script type="module">
 import { ESPLoader, Transport } from "https://unpkg.com/esptool-js@0.7.0/bundle.js";
 
-// Every board Piglet ships a flashable release image for — pulled straight
-// from Hamspiced/piglet's latest release. All are ESP32-C5, where browser
-// flashing can be unreliable, so each carries the c5 caution.
-const REL = "https://github.com/Hamspiced/piglet/releases/latest/download/";
+// Same-origin, mirrored here from the latest GitHub release by
+// build-and-deploy.yml. Deliberately NOT the GitHub releases URL directly:
+// esptool-js fetch()es these bytes in-browser to flash them, and GitHub's
+// release-asset CDN doesn't send CORS headers for cross-origin fetch() (only
+// for normal browser downloads), which fails as "Failed to fetch". All
+// boards are ESP32-C5, where browser flashing can be unreliable, so each
+// carries the c5 caution.
+const REL = "firmware/";
 const BOARDS = [
   { value:"xiao_c5",      label:"Flash Piglet",                 url:REL+"Piglet.ino.merged.bin",           chip:"ESP32-C5", c5:true },
   { value:"pigletnode_c5",label:"PigletNode C5 — mesh node",    url:REL+"PigletNode.ino.merged.bin",       chip:"ESP32-C5", c5:true },

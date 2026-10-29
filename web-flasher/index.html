@@ -169,7 +169,13 @@ esptool --chip esp32c5 --no-stub \
       desc:     "USB-A dongle — 0.96\" ST7735 TFT, APA102 LED, GPS, SD, dual-band."
     }
   ];
-  var RELEASE = "https://github.com/Hamspiced/piglet/releases/latest/download/";
+  // Same-origin, mirrored here from the latest GitHub release by
+  // build-and-deploy.yml. Deliberately NOT the GitHub releases URL directly:
+  // ESP Web Tools fetch()es these bytes in-browser to flash them, and
+  // GitHub's release-asset CDN doesn't send CORS headers for cross-origin
+  // fetch() (only for normal browser downloads), which fails as "Failed to
+  // fetch".
+  var RELEASE = "firmware/";
   // Per-board firmware version actually baked into the latest release's binaries
   // (built by release-firmware.yml from each sketch's own FIRMWARE_VERSION --
   // boards can lag behind each other, so this is NOT just the git tag name).

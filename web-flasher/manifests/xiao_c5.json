@@ -6,7 +6,7 @@
     {
       "chipFamily": "ESP32-C5",
       "parts": [
-        { "path": "https://github.com/Hamspiced/piglet/releases/latest/download/Piglet.ino.merged.bin", "offset": 0 }
+        { "path": "../firmware/Piglet.ino.merged.bin", "offset": 0 }
       ]
     }
   ]

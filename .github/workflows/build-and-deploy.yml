@@ -5,24 +5,31 @@ name: Deploy web flasher
 #
 # Firmware itself is built and published to GitHub Releases by
 # release-firmware.yml (Piglet, TDongleC5_Piglet, PigletNode -- all
-# esp32:esp32:XIAO_ESP32C5). The arduino-esp32 core's postobjcopy merge step
-# already produces a single flashable <Sketch>.ino.merged.bin per board as
-# part of that build, so this workflow does not rebuild anything -- it only
-# ships the static site, which fetches those merged images straight from
-# Hamspiced/piglet's latest published release at flash time (see the
-# `RELEASE`/`REL` constants in index.html/batch.html).
+# esp32:esp32:XIAO_ESP32C5). This workflow does not rebuild anything -- it
+# mirrors that release's already-built *.ino.merged.bin files (and
+# versions.json) into web-flasher/firmware/ before deploying, so the flasher
+# pages fetch them same-origin from GitHub Pages instead of cross-origin from
+# GitHub's release-asset CDN.
 #
-# release-firmware.yml publishes each release immediately (not as a draft),
-# so GitHub's "latest" release resolves to it as soon as that workflow
-# finishes -- no manual publish step needed before the web flasher works.
+# That mirroring step is NOT cosmetic: ESP Web Tools and esptool-js both
+# fetch() the firmware bytes in-browser to flash them over Web Serial, and
+# GitHub's release-asset storage (release-assets.githubusercontent.com, what
+# github.com/.../releases/.../download/... redirects to) does not send
+# Access-Control-Allow-Origin, so a cross-origin fetch() of it fails with
+# "Failed to fetch" even though the same URL downloads fine via a normal
+# browser navigation/anchor click. Serving the binaries from the same origin
+# as the page sidesteps CORS entirely.
 #
-# Runs on a version tag (v*) and on manual dispatch. The first run turns
-# Pages on automatically (configure-pages enablement) -- no Settings toggle
-# needed.
+# Triggered by release-firmware.yml completing (via workflow_run), not by the
+# same tag push directly -- that avoids a race where this workflow tries to
+# download release assets before release-firmware.yml has finished building
+# and uploading them. Also supports manual dispatch, which mirrors whatever
+# release is currently "latest".
 
 on:
-  push:
-    tags: ['v*']
+  workflow_run:
+    workflows: ["Build and Release Firmware"]
+    types: [completed]
   workflow_dispatch:
 
 permissions:
@@ -38,17 +45,56 @@ concurrency:
 jobs:
   deploy:
     name: Deploy web-flasher to Pages
+    # Skip workflow_run firings for a failed/cancelled release build -- there's
+    # nothing new to mirror, and the download step below would just fail.
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          # workflow_run checks out the default branch by default; pin to the
+          # commit release-firmware.yml actually ran against instead.
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Resolve release tag
+        id: tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+        run: |
+          set -euo pipefail
+          # release-firmware.yml only runs on a `vX.Y` tag push (or a manual
+          # dispatch naming one), so the triggering run's head_branch IS that
+          # tag name. Fall back to whatever release GitHub currently calls
+          # "latest" for manual dispatch of *this* workflow.
+          case "$HEAD_BRANCH" in
+            v*) TAG="$HEAD_BRANCH" ;;
+            *)  TAG="$(gh release view --json tagName -q .tagName -R "${{ github.repository }}")" ;;
+          esac
+          echo "Using release tag: $TAG"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Mirror release firmware into web-flasher/firmware
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p web-flasher/firmware
+          gh release download "${{ steps.tag.outputs.tag }}" \
+            --repo "${{ github.repository }}" \
+            --pattern "*.ino.merged.bin" \
+            --pattern "versions.json" \
+            --dir web-flasher/firmware \
+            --clobber
+          ls -la web-flasher/firmware
 
       - name: Stamp version
         run: |
           set -euo pipefail
-          VERSION="${GITHUB_REF_NAME}+${GITHUB_SHA::7}"
+          VERSION="${{ steps.tag.outputs.tag }}+${GITHUB_SHA::7}"
           echo "Stamping version: $VERSION"
           # Substitute __VERSION__ in the flasher pages' footers.
           find web-flasher -name '*.html' | while read -r f; do
