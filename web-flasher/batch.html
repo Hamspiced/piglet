@@ -85,6 +85,18 @@
   .unsupported{color:var(--danger);font-size:13px}
   .summary{font-size:13px;margin-top:12px}
   footer{margin-top:20px;padding-top:12px;border-top:1px solid var(--border);color:var(--muted);font-size:12px;display:flex;gap:14px;flex-wrap:wrap;justify-content:space-between}
+
+  .modalOverlay{position:fixed;inset:0;background:rgba(5,8,12,.72);backdrop-filter:blur(2px);display:none;align-items:center;justify-content:center;z-index:50;padding:16px}
+  .modal{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:18px;max-width:380px;width:100%;box-shadow:0 20px 60px rgba(0,0,0,.5)}
+  .modalHead{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:4px}
+  .modalHead span{font-size:14px;font-weight:700}
+  .modalClose{border:0;background:transparent;color:var(--muted);font-size:20px;line-height:1;cursor:pointer;padding:2px 8px;border-radius:6px;flex-shrink:0}
+  .modalClose:hover{color:var(--text);background:var(--input)}
+  .doneNote{text-align:center;margin-top:8px}
+  .doneNote .doneIcon{width:42px;height:42px;border-radius:50%;background:var(--okDim);color:var(--ok);font-size:22px;font-weight:700;display:flex;align-items:center;justify-content:center;margin:4px auto 10px}
+  .doneNote p{margin:6px 0;font-size:13px}
+  .doneNote p b{color:var(--text)}
+  .modalBtn{cursor:pointer;width:100%;padding:10px 14px;border-radius:8px;margin-top:14px;border:1px solid var(--primary);background:var(--primary);color:var(--primaryText);font:600 13.5px system-ui,sans-serif}
 </style>
 </head>
 <body>
@@ -144,6 +156,21 @@
 
   </div>
 
+  <div class="modalOverlay" id="flashOverlay">
+    <div class="modal">
+      <div class="modalHead">
+        <span id="flashModalTitle">Flash complete</span>
+        <button class="modalClose" id="flashModalCloseBtn" aria-label="Close" title="Close">&times;</button>
+      </div>
+      <div class="doneNote" id="flashDoneNote">
+        <div class="doneIcon">&#10003;</div>
+        <p id="flashSummaryText"><b>Done.</b></p>
+        <p>Unplug each finished Piglet from USB, then plug it back in (or power-cycle it) to boot the new firmware.</p>
+      </div>
+      <button class="modalBtn" id="flashModalCloseBtn2">Close</button>
+    </div>
+  </div>
+
   <footer>
     <span><a href="https://github.com/Hamspiced/piglet">github.com/Hamspiced/piglet</a></span>
     <span>powered by esptool-js · build __VERSION__</span>
@@ -191,6 +218,13 @@ function boot(BOARDS){
   const clearBtn  = document.getElementById("clear");
   const applyAll  = document.getElementById("applyAll");
   const eraseChk  = document.getElementById("eraseAll");
+
+  const flashOverlay     = document.getElementById("flashOverlay");
+  const flashModalTitle  = document.getElementById("flashModalTitle");
+  const flashSummaryText = document.getElementById("flashSummaryText");
+  function closeFlashModal(){ flashOverlay.style.display = "none"; }
+  document.getElementById("flashModalCloseBtn").addEventListener("click", closeFlashModal);
+  document.getElementById("flashModalCloseBtn2").addEventListener("click", closeFlashModal);
 
   function boardLabel(b){ return b.label + (VERSIONS[b.value] ? " \u00b7 " + VERSIONS[b.value] : ""); }
   function refreshBoardLabels(){
@@ -308,6 +342,10 @@ function boot(BOARDS){
     summaryEl.innerHTML = "Done — <b style='color:var(--ok)'>"+ok+" ok</b>"+
       (bad?", <b style='color:var(--danger)'>"+bad+" failed</b>":"")+
       ". Unplug the finished boards; failures can be retried with Flash all.";
+    flashModalTitle.textContent = bad ? "Flash finished with errors" : "Flash complete";
+    flashSummaryText.innerHTML = "<b>"+ok+" of "+results.length+" board"+(results.length>1?"s":"")+" flashed successfully"+
+      (bad ? " ("+bad+" failed — see each device's log above)" : "")+".</b>";
+    flashOverlay.style.display = "flex";
     flashing = false; refresh();
   });
 

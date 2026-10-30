@@ -4,6 +4,7 @@
 #include "GPS.h"
 #include "SDUtils.h"
 #include "WardriveGoBLE.h"
+#include "YieldSched.h"
 #include <esp_now.h>
 #include "esp_wifi.h"
 
@@ -182,6 +183,18 @@ static uint8_t  coreAssignVer  = 0;
 static uint32_t coreLastHbMs   = 0;
 static uint32_t coreHbCounter  = 0;
 static uint8_t  corePigletSlotCount = 0;  // active Piglet-confirmed node count; recomputed in coreReassignChannels()
+
+// Per-5GHz-channel yield tracking (see YieldSched.h), fed from every TEXT
+// record the Core receives regardless of which node reported it. Folded into
+// an EWMA every ~4s and used only to ORDER the channel list a Biscuit node is
+// given -- the channel SET/COUNT a node is assigned is unaffected, so this is
+// a no-op for real-JCMK/Piglet-to-Piglet nodes (which never see this list;
+// they keep the packed binary ADMIN message, unchanged).
+#define CORE_5G_COUNT 26  // JCMK_NUM_CHANNELS(40) - 14 2.4GHz entries
+static ChanStat  core5gStat[CORE_5G_COUNT];
+static uint16_t  core5gHits[CORE_5G_COUNT];
+static uint32_t  coreYieldLastMs = 0;
+static SchedCfg  coreSchedCfg;
 
 static const uint32_t CORE_HB_MS        = 5000;
 static const uint32_t CORE_NODE_TIMEOUT = 90000;  // 90 s — generous for many-node ESP-Now collisions
@@ -418,6 +431,28 @@ static void coreSendReply(const uint8_t* mac) {
   esp_now_send(mac, (uint8_t*)&msg, sizeof(msg));
 }
 
+// Maps a 5GHz channel number to its index in core5gStat[]/core5gHits[]
+// (JCMK_CHANNELS[14..39]), or -1 if `ch` isn't a known 5GHz channel.
+static int core5gIndexOf(uint8_t ch) {
+  for (uint8_t i = 14; i < JCMK_NUM_CHANNELS; i++)
+    if (JCMK_CHANNELS[i] == ch) return (int)(i - 14);
+  return -1;
+}
+
+// Folds accumulated per-channel hit counts into the yield EWMA once per 4s
+// window. Called every coreModeTick(); a no-op between windows.
+static void coreYieldUpdate(uint32_t now) {
+  if (coreYieldLastMs == 0) { coreYieldLastMs = now; return; }
+  if (now - coreYieldLastMs < 4000) return;
+  float dt = (float)(now - coreYieldLastMs) / 1000.0f;
+  for (uint8_t i = 0; i < CORE_5G_COUNT; i++) {
+    uint8_t h = core5gHits[i] > 255 ? 255 : (uint8_t)core5gHits[i];
+    sched_on_yield(core5gStat, i, h, h, dt, coreSchedCfg);
+    core5gHits[i] = 0;
+  }
+  coreYieldLastMs = now;
+}
+
 // Send Biscuit Node a role assignment (MSG_ROLE_ASSIGN, type=5) then a channel
 // config (MSG_CONFIG_UPDATE, type=10). Both packets must be full size (212 bytes).
 // Called from coreReassignChannels / coreResendAdminToAll for isBiscuit nodes.
@@ -436,17 +471,47 @@ static void coreSendBiscuitRoleAndConfig(const uint8_t* mac, uint8_t startIdx, u
 
   // Step 2: channel config — "channels=1,2,...;dwell=80"
   // Biscuit MSG_CONFIG_UPDATE = type 10. Payload uses actual channel numbers
-  // (not indices) in comma-separated list.
+  // (not indices) in a comma-separated list, which Biscuit's wire format
+  // allows in any order. The SET of channels in [startIdx, endIdx] is exactly
+  // what today's plain contiguous split assigned this node -- unchanged --
+  // but the 5GHz ones among them are reordered by descending measured yield
+  // (see core5gStat / YieldSched.h) so the most productive channels this
+  // node has access to are listed first. 2.4GHz channels (always worth
+  // scanning) are kept in natural order ahead of the ranked 5GHz ones.
+  uint8_t end = (endIdx < JCMK_NUM_CHANNELS) ? endIdx : (JCMK_NUM_CHANNELS - 1);
+  uint8_t lo[JCMK_NUM_CHANNELS]; uint8_t loN = 0;
+  uint8_t hi[JCMK_NUM_CHANNELS]; uint8_t hiN = 0;
+  ChanStat hiStat[JCMK_NUM_CHANNELS];
+  for (uint8_t j = startIdx; j <= end; j++) {
+    uint8_t ch = JCMK_CHANNELS[j];
+    if (ch <= 14) {
+      lo[loN++] = ch;
+    } else {
+      int gi = core5gIndexOf(ch);
+      hi[hiN] = ch;
+      hiStat[hiN] = (gi >= 0) ? core5gStat[gi] : ChanStat{};
+      hiN++;
+    }
+  }
+  uint8_t order[JCMK_NUM_CHANNELS];
+  if (hiN > 0) sched_rank(hiStat, hi, hiN, millis(), coreSchedCfg, order);
+
   jcmk_text_msg_t cfgMsg = {};
   memcpy(cfgMsg.magic, JCMK_MAGIC, 4);
   cfgMsg.type    = 10;  // MSG_CONFIG_UPDATE
   cfgMsg.counter = 0;
 
   String chList = "channels=";
-  uint8_t end = (endIdx < JCMK_NUM_CHANNELS) ? endIdx : (JCMK_NUM_CHANNELS - 1);
-  for (uint8_t j = startIdx; j <= end; j++) {
-    if (j > startIdx) chList += ",";
-    chList += String(JCMK_CHANNELS[j]);
+  bool first = true;
+  for (uint8_t j = 0; j < loN; j++) {
+    if (!first) chList += ",";
+    chList += String(lo[j]);
+    first = false;
+  }
+  for (uint8_t j = 0; j < hiN; j++) {
+    if (!first) chList += ",";
+    chList += String(hi[order[j]]);
+    first = false;
   }
   chList += ";dwell=";
   chList += String((uint32_t)NODE_SCAN_DWELL_MS);
@@ -458,7 +523,7 @@ static void coreSendBiscuitRoleAndConfig(const uint8_t* mac, uint8_t startIdx, u
   cfgMsg.text[slen] = '\0';
   esp_now_send(mac, (uint8_t*)&cfgMsg, sizeof(cfgMsg));
 
-  Serial.printf("[CORE] Biscuit role+config sent (ch %d-%d, dwell %dms)\n",
+  Serial.printf("[CORE] Biscuit role+config sent (ch %d-%d, dwell %dms, yield-ranked)\n",
     JCMK_CHANNELS[startIdx],
     JCMK_CHANNELS[end],
     (int)NODE_SCAN_DWELL_MS);
@@ -753,6 +818,11 @@ static void coreParseAndLogText(const char* line) {
   wardriveGoPushAp(bssid, ssid, auth, ch, rssi);
   if (appendWigleRow(bssid, ssid, auth, iso8601NowUTC(), ch, rssi, lat, lon, altM, accM)) {
     coreRecordsRx++;
+  }
+  // Feed the yield tracker regardless of source node -- see core5gStat above.
+  if (ch > 14) {
+    int gi = core5gIndexOf((uint8_t)ch);
+    if (gi >= 0) core5gHits[gi]++;
   }
 }
 
@@ -1125,6 +1195,10 @@ void coreModeTick() {
     coreTextHead = (coreTextHead + 1) % CORE_TEXT_QUEUE;
     coreParseAndLogText(coreTextBuf[i].line);
   }
+
+  // Fold this window's per-channel hit counts into the yield EWMA (no-op
+  // between 4s windows) -- see core5gStat / coreSendBiscuitRoleAndConfig.
+  coreYieldUpdate(now);
 
   // 3. Periodic heartbeat + ADMIN refresh to all connected nodes.
   // Nodes that missed the ADMIN while scanning will recover within one cycle.

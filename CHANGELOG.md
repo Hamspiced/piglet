@@ -1,5 +1,15 @@
 # Changelog
 
+## v2.84 (2026-10-30)
+
+### New Features
+- **Biscuit mesh nodes get a yield-ranked channel list** — when a real Biscuit Node is assigned 5 GHz channels, the Core now tracks how many scan records each 5 GHz channel has actually produced (a smoothed per-channel yield estimate) and lists the most productive channels first in the `channels=...` config it sends. The exact set and count of channels a node is assigned is unchanged from before -- only the order within that assignment changes -- so this is a no-op for real-JCMK and Piglet-to-Piglet nodes, which are assigned channels over a different, unaffected wire format. Applied to both the main Piglet firmware and the T-Dongle C5 standalone firmware. Contributed by Skonsolo.
+
+### Web Flasher
+- **Install/flash progress now shows in a modal** — clicking **Install** (single-board flasher) or **Flash all** (batch flasher) now pops up a modal dialog showing live progress instead of an inline panel, and shows a clear "done" screen on completion reminding you to unplug the board from USB and power it back on (or power-cycle it) to boot the new firmware. Contributed by Skonsolo.
+
+---
+
 ## v2.83 (2026-10-30)
 
 ### Bug Fixes
@@ -33,7 +43,7 @@
 
 ### New Features
 - **Wardrive Go BLE bridge protocol refinements** -- following up the bridge below: the board now reports a protocol-compatible firmware version (`fw=1.7.1` in `WD:CAPS`, decoupled from Piglet's own version) so the app doesn't flag it as needing an update it has no way to deliver; requests a faster 30-50 ms BLE connection interval right after linking, matching the official WardriveESP firmware's throughput tuning; and now reports the real scan bands/channels (`bands=2g,5g` and the full channel list on C5 hardware, instead of a hardcoded 2.4 GHz-only list) and honors the app's channel selection -- `-ch` on `wdstream start`, or the `ch`/`ch all` command -- by only forwarding AP sightings on the requested channels. The channel selection resets to every supported channel on disconnect, matching the official protocol. Applied to both the main Piglet firmware and the T-Dongle C5 standalone firmware.
-- **Wardrive Go BLE bridge** — while on the Mesh Node or Core page, the device can advertise a RocketGod "iosESP" BLE bridge (service UUID `47686F73-7445-5350-4272-696467655376`, advertised as `iosESP-XXXX`) so the Wardrive Go / WarBLE Go phone app can pair and plot APs live on its map. A Node pushes its own scan finds plus its own GPS fix; a Core pushes every node-forwarded AP plus its own GPS fix. Enable with the new **Wardrive Go BLE Bridge** toggle in the Web UI's Configuration card (`wardriveGoBridge`, default off) — the bridge is only ever active on the Mesh Node/Core page and is fully torn down when leaving it. The Mesh page's hold-button hint is replaced with a `WG: off / advertising / connected` status line while the toggle is on. While on the Mesh page, double-pressing the button also toggles the bridge immediately and persists the new state to `/wardriver.cfg`, without needing the Web UI. A solo Node (no mesh coordinator in range) now scans and feeds the bridge even without ever pairing with a Core, instead of sitting idle on "Searching..." and sending nothing — background Core-search broadcasts are unaffected, so a real coordinator can still be picked up later. Applied to both the main Piglet firmware and the T-Dongle C5 standalone firmware.
+- **Wardrive Go BLE bridge** — while on the Mesh Node or Core page, the device can advertise a RocketGod "iosESP" BLE bridge (service UUID `47686F73-7445-5350-4272-696467655376`, advertised as `iosESP-XXXX`) so the Wardrive Go / WarBLE Go phone app can pair and plot APs live on its map. A Node pushes its own scan finds plus its own GPS fix; a Core pushes every node-forwarded AP plus its own GPS fix. Enable with the new **Wardrive Go BLE Bridge** toggle in the Web UI's Configuration card (`wardriveGoBridge`, default off) — the bridge is only ever active on the Mesh Node/Core page and is fully torn down when leaving it. The Mesh page's hold-button hint is replaced with a `WG: off / advertising / connected` status line while the toggle is on. While on the Mesh page, double-pressing the button also toggles the bridge immediately and persists the new state to `/wardriver.cfg`, without needing the Web UI. A solo Node (no mesh coordinator in range) now scans and feeds the bridge even without ever pairing with a Core, instead of sitting idle on "Searching..." and sending nothing — background Core-search broadcasts are unaffected, so a real coordinator can still be picked up later. Applied to both the main Piglet firmware and the T-Dongle C5 standalone firmware. Contributed by Skonsolo.
 
 ### Configuration
 - New config option: `wardriveGoBridge` — advertise the Wardrive Go / WarBLE Go BLE bridge while on the Mesh Node/Core page (default: false).

@@ -99,6 +99,18 @@
   details.log pre{max-height:150px;font-size:11px;white-space:pre-wrap}
 
   footer{margin-top:20px;padding-top:12px;border-top:1px solid var(--border);color:var(--muted);font-size:12px;display:flex;gap:14px;flex-wrap:wrap;justify-content:space-between}
+
+  .modalOverlay{position:fixed;inset:0;background:rgba(5,8,12,.72);backdrop-filter:blur(2px);display:none;align-items:center;justify-content:center;z-index:50;padding:16px}
+  .modal{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:18px;max-width:380px;width:100%;box-shadow:0 20px 60px rgba(0,0,0,.5)}
+  .modalHead{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:4px}
+  .modalHead span{font-size:14px;font-weight:700}
+  .modalClose{display:none;border:0;background:transparent;color:var(--muted);font-size:20px;line-height:1;cursor:pointer;padding:2px 8px;border-radius:6px;flex-shrink:0}
+  .modalClose:hover{color:var(--text);background:var(--input)}
+  .doneNote{display:none;text-align:center;margin-top:8px}
+  .doneNote .doneIcon{width:42px;height:42px;border-radius:50%;background:var(--accentDim);color:var(--accent);font-size:22px;font-weight:700;display:flex;align-items:center;justify-content:center;margin:4px auto 10px}
+  .doneNote p{margin:6px 0;font-size:13px}
+  .doneNote p b{color:var(--text)}
+  .modalBtn{display:none;cursor:pointer;width:100%;padding:10px 14px;border-radius:8px;margin-top:14px;border:1px solid var(--primary);background:var(--primary);color:var(--primaryText);font:600 13.5px system-ui,sans-serif}
 </style>
 </head>
 <body>
@@ -147,15 +159,6 @@
     <p class="unsupported" id="unsupportedMsg" style="display:none">Open in Chrome or Edge (desktop) to flash.</p>
     <label class="check"><input type="checkbox" id="eraseAll"> Erase entire flash before writing (slower; wipes saved settings)</label>
 
-    <div class="progress" id="progress" style="display:none">
-      <div class="bar"><i id="barI"></i></div>
-      <div class="st"><span class="state" id="stateText">Ready</span><span id="pctText"></span></div>
-      <details class="log" id="logDetails" style="display:none">
-        <summary>log</summary>
-        <pre id="logPre"></pre>
-      </details>
-    </div>
-
     <div class="alt">
       <a id="dl" href="#" download>Download .bin</a>
     </div>
@@ -172,6 +175,29 @@ esptool --chip esp32c5 --no-stub \
         tap <b style="color:var(--text)">RESET</b>, release BOOT, then try again.
       </p>
     </details>
+  </div>
+
+  <div class="modalOverlay" id="installOverlay">
+    <div class="modal">
+      <div class="modalHead">
+        <span id="modalTitle">Installing…</span>
+        <button class="modalClose" id="modalCloseBtn" aria-label="Close" title="Close">&times;</button>
+      </div>
+      <div class="progress" id="progress">
+        <div class="bar"><i id="barI"></i></div>
+        <div class="st"><span class="state" id="stateText">Ready</span><span id="pctText"></span></div>
+        <details class="log" id="logDetails" style="display:none">
+          <summary>log</summary>
+          <pre id="logPre"></pre>
+        </details>
+      </div>
+      <div class="doneNote" id="doneNote">
+        <div class="doneIcon">&#10003;</div>
+        <p><b>Flash complete.</b></p>
+        <p>Unplug the Piglet from USB, then plug it back in (or power-cycle it) to boot the new firmware.</p>
+      </div>
+      <button class="modalBtn" id="modalDoneBtn">Close</button>
+    </div>
   </div>
 
   <footer>
@@ -318,12 +344,21 @@ fetch("releases.json", {cache:"no-store"})
 var installBtn     = document.getElementById("installBtn");
 var unsupportedMsg = document.getElementById("unsupportedMsg");
 var eraseChk       = document.getElementById("eraseAll");
+var installOverlay = document.getElementById("installOverlay");
+var modalTitle     = document.getElementById("modalTitle");
+var modalCloseBtn  = document.getElementById("modalCloseBtn");
+var modalDoneBtn   = document.getElementById("modalDoneBtn");
+var doneNote       = document.getElementById("doneNote");
 var progress       = document.getElementById("progress");
 var barI           = document.getElementById("barI");
 var stateText      = document.getElementById("stateText");
 var pctText        = document.getElementById("pctText");
 var logDetails     = document.getElementById("logDetails");
 var logPre         = document.getElementById("logPre");
+
+function closeInstallModal(){ installOverlay.style.display = "none"; }
+modalCloseBtn.addEventListener("click", closeInstallModal);
+modalDoneBtn.addEventListener("click", closeInstallModal);
 
 if (!("serial" in navigator)) {
   installBtn.style.display = "none";
@@ -372,9 +407,14 @@ installBtn.addEventListener("click", async function(){
   boardSel.disabled = true;
   verSel.disabled = true;
   eraseChk.disabled = true;
+  modalTitle.textContent = "Installing "+board.label;
+  modalCloseBtn.style.display = "none";
+  modalDoneBtn.style.display = "none";
+  doneNote.style.display = "none";
   progress.style.display = "";
   logDetails.style.display = "";
   logPre.textContent = "";
+  installOverlay.style.display = "flex";
   setState("run", "Connecting…"); setPct(0);
   var term = { clean(){}, writeLine:function(d){ logLine(strip(d)); }, write:function(d){ logLine(strip(d)); } };
 
@@ -383,8 +423,7 @@ installBtn.addEventListener("click", async function(){
     port = await navigator.serial.requestPort();
   } catch (err) {
     // user cancelled the port picker -- not a real failure
-    progress.style.display = "none";
-    logDetails.style.display = "none";
+    installOverlay.style.display = "none";
     flashing = false;
     installBtn.disabled = false;
     boardSel.disabled = false;
@@ -432,7 +471,13 @@ installBtn.addEventListener("click", async function(){
     var msg = (lastErr && lastErr.message) ? lastErr.message : String(lastErr);
     logLine("ERROR: "+msg);
     setState("err", "Failed after "+MAX_FLASH_ATTEMPTS+" attempts — "+msg);
+    modalTitle.textContent = "Install failed";
+  } else {
+    modalTitle.textContent = "Install complete";
+    doneNote.style.display = "";
   }
+  modalCloseBtn.style.display = "";
+  modalDoneBtn.style.display = "";
 
   flashing = false;
   installBtn.disabled = false;

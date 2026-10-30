@@ -36,6 +36,17 @@ contributed by dagnazty and merged in v2.2.
 
 ---
 
+## Wardrive Go BLE Bridge & Biscuit Mesh Improvements
+
+**Contributor:** Skonsolo
+
+The Wardrive Go / WarBLE Go BLE bridge (Mesh Node/Core page) — including its
+protocol refinements, channel-selection honoring, and the double-press toggle —
+along with the later yield-ranked channel list for Biscuit mesh nodes and the
+web flasher's install-progress modal, were contributed by Skonsolo.
+
+---
+
 ## Project
 
 **Author:** Midwest Gadgets LLC  
