@@ -1,19 +1,21 @@
 name: Deploy web flasher
 
-# Publishes web-flasher/ (ESP Web Tools install button on index.html, plus the
-# esptool-js batch flasher on batch.html) to GitHub Pages.
+# Publishes web-flasher/ (the esptool-js single-board and batch flashers) to
+# GitHub Pages.
 #
 # Firmware itself is built and published to GitHub Releases by
 # release-firmware.yml (Piglet, TDongleC5_Piglet, PigletNode -- all
 # esp32:esp32:XIAO_ESP32C5). This workflow does not rebuild anything -- it
-# mirrors that release's already-built *.ino.merged.bin files (and
-# versions.json) into web-flasher/firmware/ before deploying, so the flasher
-# pages fetch them same-origin from GitHub Pages instead of cross-origin from
-# GitHub's release-asset CDN.
+# mirrors the last RELEASE_HISTORY_LIMIT releases' already-built
+# *.ino.merged.bin files (and versions.json) into
+# web-flasher/firmware/<tag>/ before deploying, plus a releases.json index
+# (per-tag board versions + the matching CHANGELOG.md section as it read at
+# that tag), so the flasher pages can offer a firmware-version picker with
+# release notes instead of only ever flashing "latest".
 #
-# That mirroring step is NOT cosmetic: ESP Web Tools and esptool-js both
-# fetch() the firmware bytes in-browser to flash them over Web Serial, and
-# GitHub's release-asset storage (release-assets.githubusercontent.com, what
+# That mirroring is NOT cosmetic: esptool-js fetch()es the firmware bytes
+# in-browser to flash them over Web Serial, and GitHub's release-asset
+# storage (release-assets.githubusercontent.com, what
 # github.com/.../releases/.../download/... redirects to) does not send
 # Access-Control-Allow-Origin, so a cross-origin fetch() of it fails with
 # "Failed to fetch" even though the same URL downloads fine via a normal
@@ -23,14 +25,21 @@ name: Deploy web flasher
 # Triggered by release-firmware.yml completing (via workflow_run), not by the
 # same tag push directly -- that avoids a race where this workflow tries to
 # download release assets before release-firmware.yml has finished building
-# and uploading them. Also supports manual dispatch, which mirrors whatever
-# release is currently "latest".
+# and uploading them. Also supports manual dispatch, which re-mirrors
+# whatever releases currently exist.
 
 on:
   workflow_run:
     workflows: ["Build and Release Firmware"]
     types: [completed]
   workflow_dispatch:
+
+env:
+  # How many of the most recent releases to make flashable from the web UI.
+  # Each mirrored board binary is trimmed to its meaningful prefix (trailing
+  # 0xFF flash padding stripped -- see the mirror step), so this is roughly
+  # RELEASE_HISTORY_LIMIT x 3 boards x ~2 MB in the deployed Pages artifact.
+  RELEASE_HISTORY_LIMIT: "10"
 
 permissions:
   contents: read
@@ -58,6 +67,11 @@ jobs:
           # workflow_run checks out the default branch by default; pin to the
           # commit release-firmware.yml actually ran against instead.
           ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          # Full history + all tags -- the release-notes extraction below
+          # reads CHANGELOG.md as it existed AT each historical tag via
+          # `git show <tag>:CHANGELOG.md`, which needs those tags' commits
+          # actually present locally, not just a shallow single commit.
+          fetch-depth: 0
 
       - name: Resolve release tag
         id: tag
@@ -77,19 +91,105 @@ jobs:
           echo "Using release tag: $TAG"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
-      - name: Mirror release firmware into web-flasher/firmware
+      - name: Mirror recent releases + build releases.json
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          mkdir -p web-flasher/firmware
-          gh release download "${{ steps.tag.outputs.tag }}" \
-            --repo "${{ github.repository }}" \
-            --pattern "*.ino.merged.bin" \
-            --pattern "versions.json" \
-            --dir web-flasher/firmware \
-            --clobber
-          ls -la web-flasher/firmware
+          python3 - "${{ github.repository }}" "${{ env.RELEASE_HISTORY_LIMIT }}" <<'PYEOF'
+          import json, os, re, shutil, subprocess, sys
+
+          repo, limit = sys.argv[1], int(sys.argv[2])
+
+          def run(cmd):
+              return subprocess.run(cmd, capture_output=True, text=True)
+
+          def trim_trailing_ff(path):
+              # The ESP32 core's merge-bin step pads each merged.bin out to the
+              # full flash size (8 MB) with 0xFF filler so esptool can write it
+              # at a fixed offset; mirroring that padding for every historical
+              # release would bloat the Pages deploy for no benefit (erased
+              # flash already reads as 0xFF, so a shorter image flashes
+              # byte-identically on first flash or a same-partition-scheme
+              # re-flash). Trim to the last non-0xFF byte, rounded up to a 4 KB
+              # sector boundary.
+              data = open(path, "rb").read()
+              end = len(data)
+              while end > 0 and data[end - 1] == 0xFF:
+                  end -= 1
+              end = ((end + 4095) // 4096) * 4096
+              if 0 < end < len(data):
+                  open(path, "wb").write(data[:end])
+
+          tags_out = run([
+              "gh", "release", "list", "--repo", repo, "--exclude-drafts",
+              "--limit", str(limit), "--json", "tagName", "-q", ".[].tagName",
+          ])
+          if tags_out.returncode != 0:
+              print(f"gh release list failed: {tags_out.stderr}", file=sys.stderr)
+              sys.exit(1)
+          tags = [t for t in tags_out.stdout.splitlines() if t.strip()]
+          print(f"Mirroring {len(tags)} release(s): {tags}")
+
+          releases = []
+          os.makedirs("web-flasher/firmware", exist_ok=True)
+
+          for tag in tags:
+              outdir = f"web-flasher/firmware/{tag}"
+              os.makedirs(outdir, exist_ok=True)
+              dl = run([
+                  "gh", "release", "download", tag, "--repo", repo,
+                  "--pattern", "*.ino.merged.bin", "--pattern", "versions.json",
+                  "--dir", outdir, "--clobber",
+              ])
+              if dl.returncode != 0:
+                  print(f"warning: download failed for {tag}: {dl.stderr}", file=sys.stderr)
+                  continue
+
+              for name in os.listdir(outdir):
+                  if name.endswith(".ino.merged.bin"):
+                      trim_trailing_ff(os.path.join(outdir, name))
+
+              versions = {}
+              vpath = os.path.join(outdir, "versions.json")
+              if os.path.exists(vpath):
+                  try:
+                      versions = json.load(open(vpath))
+                  except Exception:
+                      versions = {}
+
+              # The changelog section as it existed AT that tag, so historical
+              # notes never shift underfoot if CHANGELOG.md's format changes.
+              notes = ""
+              show = run(["git", "show", f"{tag}:CHANGELOG.md"])
+              if show.returncode == 0:
+                  m = re.search(
+                      r"^## " + re.escape(tag) + r" .*?\n(.*?)(?=\n## v|\Z)",
+                      show.stdout, re.S | re.M,
+                  )
+                  if m:
+                      notes = re.sub(r"\n?-{3,}\s*$", "", m.group(1)).strip()
+
+              releases.append({"tag": tag, "versions": versions, "notes": notes})
+
+          # Also duplicate the newest release's files into the flat
+          # web-flasher/firmware/ root (no tag subdirectory) as a "latest"
+          # alias. index.html defaults to this path before releases.json has
+          # loaded (or if it fails to load at all), so flashing the current
+          # release never depends on that fetch succeeding -- only picking a
+          # specific *older* version does.
+          if releases:
+              latest_dir = f"web-flasher/firmware/{releases[0]['tag']}"
+              for name in os.listdir(latest_dir):
+                  shutil.copyfile(os.path.join(latest_dir, name), os.path.join("web-flasher/firmware", name))
+
+          with open("web-flasher/releases.json", "w") as f:
+              json.dump(releases, f, indent=2)
+          print(json.dumps(releases, indent=2))
+          PYEOF
+          find web-flasher/firmware -maxdepth 2 -type f | sort
+          echo "--- releases.json ---"
+          cat web-flasher/releases.json
 
       - name: Stamp version
         run: |

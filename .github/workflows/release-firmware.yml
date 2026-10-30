@@ -17,7 +17,12 @@ env:
   ESP32_CORE_VERSION: "3.3.10"
   # Board config matches the one used for the official releases (see each
   # sketch's build/esp32.esp32.XIAO_ESP32C5/build.options.json).
-  FQBN: "esp32:esp32:XIAO_ESP32C5:CDCOnBoot=cdc,CPUFreq=80,FlashFreq=80,FlashMode=qio,FlashSize=8M,PartitionScheme=huge_app,DebugLevel=none,PSRAM=disabled,EraseFlash=none,JTAGAdapter=default,ZigbeeMode=default"
+  # PSRAM must be enabled -- the firmware itself requires it for TLS/HTTPS
+  # uploads (WiGLE/WDGoWars/Wardrift) per the README's "CRITICAL" note; a
+  # prior version of this FQBN had it disabled, which also starved NimBLE
+  # of heap badly enough to break the Wardrive Go BLE bridge on release/
+  # web-flashed boards.
+  FQBN: "esp32:esp32:XIAO_ESP32C5:CDCOnBoot=cdc,CPUFreq=80,FlashFreq=80,FlashMode=qio,FlashSize=8M,PartitionScheme=huge_app,DebugLevel=none,PSRAM=enabled,EraseFlash=none,JTAGAdapter=default,ZigbeeMode=default"
 
 jobs:
   build:

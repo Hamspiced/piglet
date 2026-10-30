@@ -6,7 +6,6 @@
 <title>Piglet Web Flasher</title>
 <meta name="description" content="Flash the official Piglet wardriving firmware to your ESP32-C5 board straight from the browser.">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#x1f437;</text></svg>">
-<script type="module" src="https://unpkg.com/esp-web-tools@10.4.0/dist/web/install-button.js?module"></script>
 <style>
   *,*::before,*::after{box-sizing:border-box}
   :root{
@@ -42,8 +41,9 @@
   .pill .dot{width:7px;height:7px;border-radius:50%;background:var(--accent);flex-shrink:0}
   .pill.warn{border-color:rgba(251,191,36,.3);background:var(--warnDim)} .pill.warn .dot{background:var(--warn)}
 
-  /* board selector */
+  /* board / version selectors */
   label.lbl{display:block;font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin:0 0 6px}
+  label.lbl.spaced{margin-top:12px}
   select{
     appearance:none;width:100%;cursor:pointer;
     background:var(--input);color:var(--text);
@@ -53,11 +53,19 @@
     background-repeat:no-repeat;background-position:right 13px center;
   }
   select:focus{outline:none;border-color:var(--accent)}
+  select:disabled{opacity:.55;cursor:not-allowed}
 
   .chips{display:flex;gap:5px;flex-wrap:wrap;margin:12px 0 0}
   .chip{font-size:10px;font-weight:600;letter-spacing:.3px;padding:3px 8px;border-radius:999px;background:var(--input);border:1px solid var(--border);color:var(--muted);text-transform:uppercase}
   .chip.a{color:var(--accent);border-color:rgba(45,212,191,.35)}
   .desc{color:var(--muted);font-size:12.5px;margin:10px 0 0}
+
+  .notes{font-size:12.5px;color:var(--text);margin-top:4px;max-height:280px;overflow:auto;padding-right:4px}
+  .notes .mdH{font-weight:700;color:var(--accent);text-transform:uppercase;font-size:11px;letter-spacing:.4px;margin:10px 0 4px}
+  .notes .mdH:first-child{margin-top:0}
+  .notes .mdLi{margin:4px 0;padding-left:2px}
+  .notes b{color:var(--text)}
+  .notes code{background:var(--input);padding:1px 5px;border-radius:4px;border:1px solid var(--border);font-size:11px}
 
   button.flash{
     cursor:pointer;width:100%;padding:11px 14px;border-radius:8px;margin-top:14px;
@@ -65,17 +73,30 @@
     font:600 14px system-ui,sans-serif;transition:filter .1s;
   }
   button.flash:hover{filter:brightness(1.08)} button.flash:active{transform:translateY(1px)}
-  esp-web-install-button{--esp-tools-button-color:transparent;display:block}
+  button.flash:disabled{opacity:.6;cursor:not-allowed}
   .unsupported{color:var(--danger);font-size:12px}
+
+  .check{display:flex;align-items:center;gap:8px;font-size:12.5px;color:var(--muted);margin-top:12px;cursor:pointer}
+  .check input{width:15px;height:15px;accent-color:var(--accent)}
+
+  .bar{height:7px;border-radius:999px;background:var(--input);border:1px solid var(--border);overflow:hidden;margin-top:14px}
+  .bar i{display:block;height:100%;width:0;background:var(--accent);transition:width .18s ease}
+  .st{display:flex;justify-content:space-between;gap:8px;font-size:11.5px;color:var(--muted);margin-top:7px}
+  .st .state{font-weight:600}
+  .progress.ok .state{color:var(--accent)}
+  .progress.err .bar i{background:var(--danger)} .progress.err .state{color:var(--danger)}
+  .progress.run .state{color:var(--accent)}
 
   .alt{display:flex;gap:14px;flex-wrap:wrap;font-size:12px;margin-top:12px}
   details{border-top:1px solid var(--border);padding-top:10px;margin-top:12px}
+  details.log{border-top:0;padding-top:0;margin-top:10px}
   summary{cursor:pointer;color:var(--muted);font-size:12px;list-style:none}
   summary::-webkit-details-marker{display:none}
   summary::before{content:"▸ ";color:var(--accent)}
   details[open] summary::before{content:"▾ "}
   pre{background:var(--input);border:1px solid var(--border);border-radius:7px;padding:11px;overflow:auto;font-size:12px;color:var(--text);margin:9px 0 0;font-family:ui-monospace,Menlo,Consolas,monospace}
   pre .c{color:var(--muted)}
+  details.log pre{max-height:150px;font-size:11px;white-space:pre-wrap}
 
   footer{margin-top:20px;padding-top:12px;border-top:1px solid var(--border);color:var(--muted);font-size:12px;display:flex;gap:14px;flex-wrap:wrap;justify-content:space-between}
 </style>
@@ -109,17 +130,34 @@
     <label class="lbl" for="board">Board</label>
     <select id="board" aria-label="Board to flash"></select>
 
+    <label class="lbl spaced" for="relVersion">Firmware version</label>
+    <select id="relVersion" aria-label="Firmware release to flash">
+      <option value="">Latest</option>
+    </select>
+
     <div class="chips" id="chips"></div>
     <p class="desc" id="desc"></p>
 
-    <esp-web-install-button id="installer">
-      <button class="flash" slot="activate">&#9654; Install</button>
-      <span slot="unsupported" class="unsupported">Open in Chrome or Edge (desktop) to flash.</span>
-    </esp-web-install-button>
+    <details open>
+      <summary>Release notes</summary>
+      <div class="notes" id="notes"><span class="muted">Loading…</span></div>
+    </details>
+
+    <button class="flash" id="installBtn">&#9654; Install</button>
+    <p class="unsupported" id="unsupportedMsg" style="display:none">Open in Chrome or Edge (desktop) to flash.</p>
+    <label class="check"><input type="checkbox" id="eraseAll"> Erase entire flash before writing (slower; wipes saved settings)</label>
+
+    <div class="progress" id="progress" style="display:none">
+      <div class="bar"><i id="barI"></i></div>
+      <div class="st"><span class="state" id="stateText">Ready</span><span id="pctText"></span></div>
+      <details class="log" id="logDetails" style="display:none">
+        <summary>log</summary>
+        <pre id="logPre"></pre>
+      </details>
+    </div>
 
     <div class="alt">
       <a id="dl" href="#" download>Download .bin</a>
-      <a id="mf" href="#">View manifest</a>
     </div>
 
     <details open>
@@ -129,103 +167,245 @@
 <span class="c"># If Install fails, flash with esptool:</span>
 esptool --chip esp32c5 --no-stub \
   write-flash 0x0 <span id="cmdbin">Piglet.ino.merged.bin</span></pre>
+      <p class="muted" style="font-size:12px;margin:9px 0 0">
+        After installing from the browser, the board's USB auto-reset into bootloader mode can get
+        stuck (the board itself is fine and boots normally). If a later Arduino IDE/esptool upload
+        fails to connect, hold <b style="color:var(--text)">BOOT</b>, tap <b style="color:var(--text)">RESET</b>,
+        release BOOT, then try again.
+      </p>
     </details>
   </div>
 
   <footer>
     <span><a href="https://github.com/Hamspiced/piglet">github.com/Hamspiced/piglet</a></span>
-    <span><a href="batch.html">batch flasher →</a></span>
+    <span>powered by esptool-js · <a href="batch.html">batch flasher →</a></span>
     <span>build __VERSION__</span>
   </footer>
 
-<script>
-  // Every board Ham ships a flashable release image for (Hamspiced/piglet
-  // releases/latest). All are ESP32-C5. To add a board later: ship its
-  // *.ino.merged.bin in the release, add a manifest in manifests/, and add
-  // one entry here.
-  var BOARDS = [
-    {
-      value:    "xiao_c5",
-      label:    "Flash Piglet",
-      manifest: "manifests/xiao_c5.json",
-      bin:      "Piglet.ino.merged.bin",
-      chips:    ["ESP32-C5","8 MB","GPS","dual-band"],
-      desc:     "Piglet Core — GPS, SD, WiGLE logging, mesh. Dual-band 2.4/5 GHz Wi-Fi."
-    },
-    {
-      value:    "pigletnode_c5",
-      label:    "PigletNode C5 — mesh node",
-      manifest: "manifests/pigletnode_c5.json",
-      bin:      "PigletNode.ino.merged.bin",
-      chips:    ["ESP32-C5","4 MB","mesh node"],
-      desc:     "Headless ESP-NOW mesh node — boots straight into node mode. Dual-band, no display."
-    },
-    {
-      value:    "tdongle_c5",
-      label:    "LilyGo T-Dongle C5",
-      manifest: "manifests/tdongle_c5.json",
-      bin:      "TDongleC5_Piglet.ino.merged.bin",
-      chips:    ["ESP32-C5","8 MB","0.96\" TFT"],
-      desc:     "USB-A dongle — 0.96\" ST7735 TFT, APA102 LED, GPS, SD, dual-band."
-    }
-  ];
-  // Same-origin, mirrored here from the latest GitHub release by
-  // build-and-deploy.yml. Deliberately NOT the GitHub releases URL directly:
-  // ESP Web Tools fetch()es these bytes in-browser to flash them, and
-  // GitHub's release-asset CDN doesn't send CORS headers for cross-origin
-  // fetch() (only for normal browser downloads), which fails as "Failed to
-  // fetch".
-  var RELEASE = "firmware/";
-  // Per-board firmware version actually baked into the latest release's binaries
-  // (built by release-firmware.yml from each sketch's own FIRMWARE_VERSION --
-  // boards can lag behind each other, so this is NOT just the git tag name).
-  // {value: "vX.YY"}; empty until versions.json loads below.
-  var VERSIONS = {};
+<script type="module">
+import { ESPLoader, Transport } from "https://unpkg.com/esptool-js@0.7.0/bundle.js";
 
-  var sel = document.getElementById("board");
-  BOARDS.forEach(function(b){
-    var o = document.createElement("option");
-    o.value = b.value; o.textContent = b.label;
-    sel.appendChild(o);
-  });
-
-  var installer = document.getElementById("installer");
-  var chips = document.getElementById("chips");
-  var desc  = document.getElementById("desc");
-  var dl    = document.getElementById("dl");
-  var mf    = document.getElementById("mf");
-  var cmdbin = document.getElementById("cmdbin");
-  var current = BOARDS[0];
-
-  function apply(b){
-    current = b;
-    installer.setAttribute("manifest", b.manifest);
-    var ver = VERSIONS[b.value];
-    var verChip = ver ? '<span class="chip a">'+ver+'</span>' : '';
-    chips.innerHTML = verChip + b.chips.map(function(c,i){
-      return '<span class="chip'+((!verChip && i===0)?' a':'')+'">'+c+'</span>';
-    }).join("");
-    desc.textContent = b.desc;
-    dl.setAttribute("href", RELEASE + b.bin);
-    mf.setAttribute("href", b.manifest);
-    cmdbin.textContent = b.bin;
+// Every board Ham ships a flashable release image for (Hamspiced/piglet
+// releases). All are ESP32-C5. To add a board later: ship its
+// *.ino.merged.bin in the release and add one entry here.
+var BOARDS = [
+  {
+    value: "xiao_c5",
+    label: "Flash Piglet",
+    bin:    "Piglet.ino.merged.bin",
+    chips:  ["ESP32-C5","8 MB","GPS","dual-band"],
+    desc:   "Piglet Core — GPS, SD, WiGLE logging, mesh. Dual-band 2.4/5 GHz Wi-Fi."
+  },
+  {
+    value: "pigletnode_c5",
+    label: "PigletNode C5 — mesh node",
+    bin:    "PigletNode.ino.merged.bin",
+    chips:  ["ESP32-C5","4 MB","mesh node"],
+    desc:   "Headless ESP-NOW mesh node — boots straight into node mode. Dual-band, no display."
+  },
+  {
+    value: "tdongle_c5",
+    label: "LilyGo T-Dongle C5",
+    bin:    "TDongleC5_Piglet.ino.merged.bin",
+    chips:  ["ESP32-C5","8 MB","0.96\" TFT"],
+    desc:   "USB-A dongle — 0.96\" ST7735 TFT, APA102 LED, GPS, SD, dual-band."
   }
+];
+// Same-origin, mirrored here from GitHub Releases by build-and-deploy.yml.
+// Deliberately NOT the GitHub releases URL directly: esptool-js fetch()es
+// these bytes in-browser to flash them, and GitHub's release-asset CDN
+// doesn't send CORS headers for cross-origin fetch() (only for normal
+// browser downloads), which fails as "Failed to fetch".
+//
+// "firmware/<bin>" (no subfolder) is always the latest release -- mirrored
+// there directly by build-and-deploy.yml as a fallback that doesn't depend
+// on releases.json loading. "firmware/<tag>/<bin>" addresses a specific
+// past release once a tag is picked from the version dropdown below.
+var RELEASE = "firmware/";
 
-  sel.addEventListener("change", function(){
-    var b = BOARDS.filter(function(x){ return x.value === sel.value; })[0];
-    if(b) apply(b);
-  });
+// Populated from releases.json: [{tag, versions, notes}, ...], newest first.
+// Empty until that fetch resolves -- the page still works for "Latest" in
+// the meantime (and indefinitely, if the fetch fails) via the plain
+// RELEASE + bin path above.
+var RELEASES = [];
+var currentTag = ""; // "" = latest (the un-suffixed path); else a specific tag
 
-  apply(BOARDS[0]); // default to the first board
+function releaseByTag(tag){
+  return RELEASES.filter(function(r){ return r.tag === tag; })[0] || null;
+}
 
-  // Best-effort: fetch the exact per-board versions shipped in the latest
-  // release and re-render once known. If this fails (offline, rate-limited,
-  // older release with no versions.json yet) the chips just show hardware
-  // specs with no version badge -- flashing itself is unaffected.
-  fetch(RELEASE + "versions.json", {cache:"no-store"})
-    .then(function(r){ return r.ok ? r.json() : {}; })
-    .then(function(v){ VERSIONS = v || {}; apply(current); })
-    .catch(function(){});
+// Tiny, trusted-content-only Markdown -> HTML for CHANGELOG.md excerpts
+// (### headings, - bullets, **bold**, `code`). Not a general sanitizer --
+// fine here since the source is always our own repo's CHANGELOG.md, never
+// user input.
+function mdToHtml(md){
+  if(!md) return '<span class="muted">No notes recorded for this version.</span>';
+  var esc = function(s){ return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); };
+  var html = esc(md).split("\n").map(function(line){
+    var h = line.match(/^###\s+(.*)/);
+    if(h) return '<div class="mdH">'+h[1]+'</div>';
+    var li = line.match(/^-\s+(.*)/);
+    if(li) return '<div class="mdLi">• '+li[1]+'</div>';
+    if(!line.trim()) return '';
+    return '<div>'+line+'</div>';
+  }).join("");
+  return html.replace(/\*\*(.+?)\*\*/g, '<b>$1</b>').replace(/`([^`]+)`/g, '<code>$1</code>');
+}
+
+var boardSel = document.getElementById("board");
+BOARDS.forEach(function(b){
+  var o = document.createElement("option");
+  o.value = b.value; o.textContent = b.label;
+  boardSel.appendChild(o);
+});
+
+var verSel  = document.getElementById("relVersion");
+var chips   = document.getElementById("chips");
+var desc    = document.getElementById("desc");
+var notesEl = document.getElementById("notes");
+var dl      = document.getElementById("dl");
+var cmdbin  = document.getElementById("cmdbin");
+var current = BOARDS[0];
+
+function binUrl(b){ return RELEASE + (currentTag ? currentTag + "/" : "") + b.bin; }
+
+function render(){
+  var b = current;
+  var rel = currentTag ? releaseByTag(currentTag) : (RELEASES[0] || null);
+  var ver = rel && rel.versions ? rel.versions[b.value] : null;
+  var verChip = ver ? '<span class="chip a">'+ver+'</span>' : '';
+  chips.innerHTML = verChip + b.chips.map(function(c,i){
+    return '<span class="chip'+((!verChip && i===0)?' a':'')+'">'+c+'</span>';
+  }).join("");
+  desc.textContent = b.desc;
+  dl.setAttribute("href", binUrl(b));
+  cmdbin.textContent = b.bin;
+  notesEl.innerHTML = rel ? mdToHtml(rel.notes)
+    : (RELEASES.length ? '<span class="muted">No notes recorded for this version.</span>'
+                        : '<span class="muted">Loading…</span>');
+}
+
+boardSel.addEventListener("change", function(){
+  var b = BOARDS.filter(function(x){ return x.value === boardSel.value; })[0];
+  if(b){ current = b; render(); }
+});
+verSel.addEventListener("change", function(){
+  currentTag = verSel.value;
+  render();
+});
+
+render(); // default to the first board, "Latest", before releases.json loads
+
+// Fetch the release index (per-board versions + changelog excerpt for the
+// last several releases) and populate the version dropdown. Best-effort: if
+// this fails (offline, older deploy predating releases.json), "Latest"
+// keeps working via the plain RELEASE + bin path above -- only picking a
+// specific past version requires this to have loaded.
+fetch("releases.json", {cache:"no-store"})
+  .then(function(r){ return r.ok ? r.json() : []; })
+  .then(function(list){
+    RELEASES = list || [];
+    RELEASES.forEach(function(r, i){
+      var o = document.createElement("option");
+      o.value = r.tag;
+      o.textContent = r.tag + (i===0 ? " (latest)" : "");
+      verSel.appendChild(o);
+    });
+    render();
+  })
+  .catch(function(){ render(); });
+
+// ---- flashing engine (same esptool-js engine as batch.html, one device) ----
+var installBtn     = document.getElementById("installBtn");
+var unsupportedMsg = document.getElementById("unsupportedMsg");
+var eraseChk       = document.getElementById("eraseAll");
+var progress       = document.getElementById("progress");
+var barI           = document.getElementById("barI");
+var stateText      = document.getElementById("stateText");
+var pctText        = document.getElementById("pctText");
+var logDetails     = document.getElementById("logDetails");
+var logPre         = document.getElementById("logPre");
+
+if (!("serial" in navigator)) {
+  installBtn.style.display = "none";
+  unsupportedMsg.style.display = "";
+}
+
+var binCache = new Map(); // url -> Promise<Uint8Array>
+function fetchBin(url){
+  if(!binCache.has(url)){
+    binCache.set(url, fetch(url, {cache:"no-store"}).then(function(r){
+      if(!r.ok) throw new Error("download failed ("+r.status+")");
+      return r.arrayBuffer();
+    }).then(function(b){ return new Uint8Array(b); }));
+  }
+  return binCache.get(url);
+}
+
+function setState(cls, text){
+  progress.classList.remove("run","ok","err");
+  if (cls) progress.classList.add(cls);
+  stateText.textContent = text;
+}
+function setPct(frac){
+  var p = Math.max(0, Math.min(100, Math.round(frac*100)));
+  barI.style.width = p+"%"; pctText.textContent = p+"%";
+}
+function logLine(s){ logPre.textContent += s+"\n"; logPre.scrollTop = logPre.scrollHeight; }
+function strip(s){ return String(s).replace(/\x1b\[[0-9;]*m/g,"").replace(/[\r\n]+$/,""); }
+
+var flashing = false;
+installBtn.addEventListener("click", async function(){
+  if (flashing) return;
+  var board = current;
+  flashing = true;
+  installBtn.disabled = true;
+  boardSel.disabled = true;
+  verSel.disabled = true;
+  eraseChk.disabled = true;
+  progress.style.display = "";
+  logDetails.style.display = "";
+  logPre.textContent = "";
+  setState("run", "Connecting…"); setPct(0);
+  var term = { clean(){}, writeLine:function(d){ logLine(strip(d)); }, write:function(d){ logLine(strip(d)); } };
+  var transport;
+  try {
+    var port = await navigator.serial.requestPort();
+    var binP = fetchBin(binUrl(board)); // starts (or reuses) the download
+    transport = new Transport(port, true);
+    var loader = new ESPLoader({ transport: transport, baudrate: 115200, terminal: term, debugLogging: false });
+    var chip = await loader.main();
+    setState("run", "Detected "+chip+" · writing…");
+    var data = await binP;
+    await loader.writeFlash({
+      fileArray: [{ data: data, address: 0 }],
+      flashMode: "keep", flashFreq: "keep", flashSize: "keep",
+      eraseAll: eraseChk.checked, compress: true,
+      reportProgress: function(idx, written, total){ setState("run", "Writing…"); setPct(total ? written/total : 0); }
+    });
+    setPct(1);
+    setState("run", "Resetting…");
+    try { await loader.after("hard_reset"); } catch(e) {}
+    setState("ok", "Done ✓");
+  } catch (err) {
+    if (err && err.name === "NotFoundError") {
+      // user cancelled the port picker -- not a real failure
+      progress.style.display = "none";
+      logDetails.style.display = "none";
+    } else {
+      var msg = (err && err.message) ? err.message : String(err);
+      logLine("ERROR: "+msg);
+      setState("err", "Failed — "+msg);
+    }
+  } finally {
+    try { await transport?.disconnect(); } catch(e) {}
+    flashing = false;
+    installBtn.disabled = false;
+    boardSel.disabled = false;
+    verSel.disabled = false;
+    eraseChk.disabled = false;
+  }
+});
 </script>
 </body>
 </html>

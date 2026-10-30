@@ -239,7 +239,7 @@ function boot(BOARDS){
         '<span class="n">#'+(i+1)+' · '+portName(dev.port,i)+'</span></div>'+
         '<button class="rm" title="Remove">&times;</button></div>'+
       '<div class="pick"><select class="devBoard" aria-label="Board for this device"></select></div>'+
-      '<div class="c5">⚠ ESP32-C5: USB-Serial/JTAG can drop when the stub loads. If it fails, flash this one from a terminal with <code>--no-stub</code>.</div>'+
+      '<div class="c5">⚠ ESP32-C5: USB-Serial/JTAG can drop when the stub loads. If it fails, flash this one from a terminal with <code>--no-stub</code>. Afterward, the board\'s auto-reset into bootloader can get stuck (it boots fine) — hold BOOT, tap RESET, release BOOT before the next Arduino IDE/esptool upload.</div>'+
       '<div class="bar"><i></i></div>'+
       '<div class="st"><span class="state">Ready</span><span class="pct"></span></div>'+
       '<details class="log"><summary></summary><pre></pre></details>';
