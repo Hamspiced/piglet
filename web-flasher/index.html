@@ -160,18 +160,16 @@
       <a id="dl" href="#" download>Download .bin</a>
     </div>
 
-    <details open>
-      <summary>C5 note &mdash; flash from a terminal if the browser fails</summary>
-<pre><span class="c"># The ESP32-C5 USB-Serial/JTAG can drop</span>
-<span class="c"># when the browser loads the flash stub.</span>
-<span class="c"># If Install fails, flash with esptool:</span>
+    <details>
+      <summary>C5 note &mdash; flash from a terminal if the browser still fails</summary>
+<pre><span class="c"># Install already drives the ESP32-C5's ROM bootloader directly</span>
+<span class="c"># (--no-stub mode) for reliability, with up to 3 automatic retries.</span>
+<span class="c"># If it still fails, flash with esptool instead:</span>
 esptool --chip esp32c5 --no-stub \
   write-flash 0x0 <span id="cmdbin">Piglet.ino.merged.bin</span></pre>
       <p class="muted" style="font-size:12px;margin:9px 0 0">
-        After installing from the browser, the board's USB auto-reset into bootloader mode can get
-        stuck (the board itself is fine and boots normally). If a later Arduino IDE/esptool upload
-        fails to connect, hold <b style="color:var(--text)">BOOT</b>, tap <b style="color:var(--text)">RESET</b>,
-        release BOOT, then try again.
+        If a later Arduino IDE/esptool upload fails to connect, hold <b style="color:var(--text)">BOOT</b>,
+        tap <b style="color:var(--text)">RESET</b>, release BOOT, then try again.
       </p>
     </details>
   </div>
@@ -184,6 +182,7 @@ esptool --chip esp32c5 --no-stub \
 
 <script type="module">
 import { ESPLoader, Transport } from "https://unpkg.com/esptool-js@0.7.0/bundle.js";
+import { patchEspLoaderForC5, trimFlashImage } from "./c5flash.js";
 
 // Every board Ham ships a flashable release image for (Hamspiced/piglet
 // releases). All are ESP32-C5. To add a board later: ship its
@@ -354,6 +353,16 @@ function setPct(frac){
 function logLine(s){ logPre.textContent += s+"\n"; logPre.scrollTop = logPre.scrollHeight; }
 function strip(s){ return String(s).replace(/\x1b\[[0-9;]*m/g,"").replace(/[\r\n]+$/,""); }
 
+// ESP32-C5 boards flash via the ROM bootloader directly (patchEspLoaderForC5,
+// c5flash.js) instead of esptool-js's normal RAM-stub flow, since uploading
+// the stub to the C5's native USB-Serial/JTAG interface is what used to drop
+// the connection ("Failed to start stub", "Unexpected response"). This retry
+// loop stays on top as a safety net for unrelated, transient OS/Web-Serial
+// hiccups -- each attempt opens a fresh Transport (same already-granted
+// port, no new picker prompt), so do that automatically instead of making
+// the user click Install repeatedly by hand.
+var MAX_FLASH_ATTEMPTS = 3;
+
 var flashing = false;
 installBtn.addEventListener("click", async function(){
   if (flashing) return;
@@ -368,43 +377,68 @@ installBtn.addEventListener("click", async function(){
   logPre.textContent = "";
   setState("run", "Connecting…"); setPct(0);
   var term = { clean(){}, writeLine:function(d){ logLine(strip(d)); }, write:function(d){ logLine(strip(d)); } };
-  var transport;
+
+  var port;
   try {
-    var port = await navigator.serial.requestPort();
-    var binP = fetchBin(binUrl(board)); // starts (or reuses) the download
-    transport = new Transport(port, true);
-    var loader = new ESPLoader({ transport: transport, baudrate: 115200, terminal: term, debugLogging: false });
-    var chip = await loader.main();
-    setState("run", "Detected "+chip+" · writing…");
-    var data = await binP;
-    await loader.writeFlash({
-      fileArray: [{ data: data, address: 0 }],
-      flashMode: "keep", flashFreq: "keep", flashSize: "keep",
-      eraseAll: eraseChk.checked, compress: true,
-      reportProgress: function(idx, written, total){ setState("run", "Writing…"); setPct(total ? written/total : 0); }
-    });
-    setPct(1);
-    setState("run", "Resetting…");
-    try { await loader.after("hard_reset"); } catch(e) {}
-    setState("ok", "Done ✓");
+    port = await navigator.serial.requestPort();
   } catch (err) {
-    if (err && err.name === "NotFoundError") {
-      // user cancelled the port picker -- not a real failure
-      progress.style.display = "none";
-      logDetails.style.display = "none";
-    } else {
-      var msg = (err && err.message) ? err.message : String(err);
-      logLine("ERROR: "+msg);
-      setState("err", "Failed — "+msg);
-    }
-  } finally {
-    try { await transport?.disconnect(); } catch(e) {}
+    // user cancelled the port picker -- not a real failure
+    progress.style.display = "none";
+    logDetails.style.display = "none";
     flashing = false;
     installBtn.disabled = false;
     boardSel.disabled = false;
     verSel.disabled = false;
     eraseChk.disabled = false;
+    return;
   }
+
+  var binP = fetchBin(binUrl(board)); // starts (or reuses) the download
+  var lastErr = null;
+  for (var attempt = 1; attempt <= MAX_FLASH_ATTEMPTS; attempt++) {
+    var transport = new Transport(port, true);
+    try {
+      if (attempt > 1) setState("run", "Retrying ("+attempt+"/"+MAX_FLASH_ATTEMPTS+")…");
+      var loader = new ESPLoader({ transport: transport, baudrate: 115200, terminal: term, debugLogging: false });
+      patchEspLoaderForC5(loader, { onEraseStart: function(){ setState("run", "Erasing flash (ROM mode)…"); } });
+      var chip = await loader.main();
+      setState("run", "Detected "+chip+" · writing…");
+      var trimmed = trimFlashImage(await binP, 0);
+      await loader.writeFlash({
+        fileArray: [{ data: trimmed.data, address: trimmed.address }],
+        flashMode: "keep", flashFreq: "keep", flashSize: "keep",
+        eraseAll: eraseChk.checked, compress: true,
+        reportProgress: function(idx, written, total){ setState("run", "Writing…"); setPct(total ? written/total : 0); }
+      });
+      setPct(1);
+      setState("run", "Resetting…");
+      try { await loader.after("hard_reset"); } catch(e) {}
+      setState("ok", "Done ✓");
+      lastErr = null;
+      break;
+    } catch (err) {
+      lastErr = err;
+    } finally {
+      try { await transport.disconnect(); } catch(e) {}
+    }
+    if (lastErr && attempt < MAX_FLASH_ATTEMPTS) {
+      var retryMsg = (lastErr && lastErr.message) ? lastErr.message : String(lastErr);
+      logLine("Attempt "+attempt+" failed ("+retryMsg+") -- retrying…");
+      await new Promise(function(r){ setTimeout(r, 1000); });
+    }
+  }
+
+  if (lastErr) {
+    var msg = (lastErr && lastErr.message) ? lastErr.message : String(lastErr);
+    logLine("ERROR: "+msg);
+    setState("err", "Failed after "+MAX_FLASH_ATTEMPTS+" attempts — "+msg);
+  }
+
+  flashing = false;
+  installBtn.disabled = false;
+  boardSel.disabled = false;
+  verSel.disabled = false;
+  eraseChk.disabled = false;
 });
 </script>
 </body>
