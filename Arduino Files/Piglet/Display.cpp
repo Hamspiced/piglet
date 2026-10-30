@@ -12,14 +12,18 @@ static const char* SPLASH_SLOGANS[] = {
   "Makin' Bacon",
   "Magic Smoke..",
   "Ahhhhhhhhhhhhh",
-  "BOSH",
+  "Birds aren't Real",
   "Oink Oink Oink",
   "T5577's are Blank",
-  "Love your Face",
-  "NFC Propaganda",
-  "Maker Propaganda",
+  "The Cake is a Lie",
+  "Defcon35 is Canceled",
+  "Pigs CAN Fly",
   "Pigs R Friends",
+  "Wake Up Neo",
   "Ham Wuz Here",
+  "Follow The Rabbit",
+  "Daves not Here",
+  "There is no Spoon"
 };
 static const size_t SPLASH_SLOGAN_COUNT = sizeof(SPLASH_SLOGANS) / sizeof(SPLASH_SLOGANS[0]);
 
@@ -462,8 +466,14 @@ static void drawPageStatus(float speedValue) {
       display.print("Uploading");
     display.setTextSize(1);
   } else {
-    // Match the real scan eligibility logic from loop()
-    bool allowScan = scanningEnabled && sdOk && (userScanOverride || !autoPaused);
+    // allowScanForOled is computed in loop() from the actual page-aware scan
+    // eligibility logic (scanningEnabled/sdOk/AP-active/userScanOverride-or-
+    // autoPaused, AND -- on this page -- statusPagePaused). Reuse it here
+    // instead of recomputing a separate local copy: a prior local copy of
+    // this formula omitted statusPagePaused entirely, so double-pressing to
+    // pause on this page left the glyph stuck on PLAY even though scanning
+    // was actually paused.
+    bool allowScan = allowScanForOled;
 
     display.print("Status:");
 

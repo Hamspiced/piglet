@@ -136,9 +136,15 @@ static void pollButton() {
   static uint32_t pressStartMs = 0;
   static bool longPressTriggered = false;
 
-  // Double-press detection
+  // Multi-click detection -- sliding window: each new click only needs to
+  // land within DOUBLE_PRESS_MS of the PREVIOUS click, not of the very first
+  // one. Anchoring the window to the first click made a 3-tap trigger (e.g.
+  // the pig page's sasquatch easter egg) much harder to land than a 2-tap
+  // one, since all 3 taps had to fit inside one fixed window measured from
+  // tap 1 -- a sliding window gives the same per-tap timing tolerance no
+  // matter how many taps are in the sequence.
   static uint8_t  clickCount = 0;
-  static uint32_t firstClickMs = 0;
+  static uint32_t lastClickMs = 0;
 
   if (millis() < btnBootSettleUntilMs) return;
 
@@ -177,18 +183,20 @@ static void pollButton() {
     } else {
       // Released
       if (latched && !longPressTriggered) {
-        clickCount++;
-        if (clickCount == 1) {
-          firstClickMs = millis();
+        uint32_t now = millis();
+        if (clickCount > 0 && (now - lastClickMs) > DOUBLE_PRESS_MS) {
+          clickCount = 0;  // previous sequence timed out -- start a fresh one
         }
+        clickCount++;
+        lastClickMs = now;
       }
       latched = false;
       longPressTriggered = false;
     }
   }
 
-  // Evaluate click count after double-press window expires
-  if (clickCount > 0 && (millis() - firstClickMs) > DOUBLE_PRESS_MS) {
+  // Evaluate once the window has elapsed since the most recent click
+  if (clickCount > 0 && (millis() - lastClickMs) > DOUBLE_PRESS_MS) {
     if (clickCount >= 3 && currentPage == 4) {
       sasquatchStart();
     } else if (clickCount == 2 && currentPage == 4) {

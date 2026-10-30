@@ -43,7 +43,7 @@
 #include "esp32-hal-matrix.h"
 
 // Firmware version
-#define FIRMWARE_VERSION "v2.82"
+#define FIRMWARE_VERSION "v2.83"
 
 // ---------------- Pins (T-DONGLE C5) ----------------
 struct PinMap {
@@ -4527,9 +4527,15 @@ static void pollButton() {
   static uint32_t pressStartMs  = 0;
   static bool     pressing      = false;
   static bool     longTriggered = false;
-  // Multi-click detection
+  // Multi-click detection -- sliding window: each new click only needs to
+  // land within MULTI_MS of the PREVIOUS click, not of the very first one.
+  // Anchoring the window to the first click made a 3-tap trigger (e.g. the
+  // pig page's sasquatch easter egg) much harder to land than a 2-tap one,
+  // since all 3 taps had to fit inside one fixed window measured from tap 1
+  // -- a sliding window gives the same per-tap timing tolerance no matter
+  // how many taps are in the sequence.
   static uint8_t  clickCount    = 0;
-  static uint32_t firstClickMs  = 0;
+  static uint32_t lastClickMs   = 0;
   static const uint32_t MULTI_MS = 400;  // max gap between taps
 
   if (millis() < btnBootSettleUntilMs) return;
@@ -4553,14 +4559,18 @@ static void pollButton() {
 
   if (!low && pressing) {
     if (!longTriggered) {
+      uint32_t now = millis();
+      if (clickCount > 0 && (now - lastClickMs) > MULTI_MS) {
+        clickCount = 0;  // previous sequence timed out -- start a fresh one
+      }
       clickCount++;
-      if (clickCount == 1) firstClickMs = millis();
+      lastClickMs = now;
     }
     pressing = false;
   }
 
-  // Evaluate click count after multi-tap window expires
-  if (clickCount > 0 && (millis() - firstClickMs) > MULTI_MS) {
+  // Evaluate once the window has elapsed since the most recent click
+  if (clickCount > 0 && (millis() - lastClickMs) > MULTI_MS) {
     if (clickCount >= 3 && currentPage == 3) {
       sasquatchStartTFT();
     } else if (clickCount == 2 && currentPage == 3) {

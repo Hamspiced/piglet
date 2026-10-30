@@ -1,5 +1,16 @@
 # Changelog
 
+## v2.83 (2026-10-30)
+
+### Bug Fixes
+- **Status page play/pause icon didn't reflect double-press pause** -- the icon's own local copy of the scan-eligibility logic never accounted for `statusPagePaused`, so double-pressing to pause scanning on the Status page left the icon showing PLAY even though scanning was genuinely paused (scanning itself was gated correctly; this was a display-only bug). The icon now reuses the same `allowScanForOled` value `loop()` already computes from the real eligibility logic, instead of recomputing an incomplete copy of it.
+- **Triple-press easter eggs (e.g. the pig page's sasquatch) were hard to land** -- the multi-click window was anchored to the *first* tap, so all 3 taps had to land inside one fixed window measured from tap 1, giving a 3-tap sequence much less per-tap timing tolerance than a 2-tap one. Multi-click detection is now a sliding window: each new tap just needs to land within the window of the *previous* tap, so a 3-tap sequence gets the same per-tap forgiveness as a 2-tap one. Applied to both the main Piglet firmware and the T-Dongle C5 standalone firmware.
+
+### Technical Changes
+- **Release/web-flasher builds now compile with PSRAM enabled** -- `release-firmware.yml`'s FQBN had `PSRAM=disabled`, contradicting the README's own "CRITICAL: enable PSRAM" build instructions. Besides the documented TLS/HTTPS upload risk, this was also starving NimBLE of heap badly enough to break the Wardrive Go BLE bridge on release-downloaded or web-flashed boards. Does not affect boards built locally with PSRAM already enabled in the Arduino IDE.
+
+---
+
 ## v2.82 (2026-10-29)
 
 ### Bug Fixes
