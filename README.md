@@ -134,6 +134,19 @@ All networking, SPI, SD, ESP-Now, and ESP-IDF headers are included in the ESP32 
 **Board setup:** Add `https://espressif.github.io/arduino-esp32/package_esp32_dev_index.json` to Additional Boards Manager URLs, install **esp32 by Espressif v3.x or later**, and select **ESP32C5 Dev Module**.
 
 
+## Waveshare ESP32-C5 Touch LCD 3.5 Variant
+
+A self-contained PlatformIO port for the **Waveshare ESP32-C5-Touch-LCD-3.5**
+is available in [WaveshareC5_Piglet](WaveshareC5_Piglet/README.md), with ST7796
+TFT, FT6336 touch, onboard LC76G GPS, SD logging, and a matching standalone
+**XIAO ESP32-C5** mesh node. Hardware dependencies are pinned.
+
+The tested mesh profile is Waveshare Core plus one matching XIAO Node. Its
+record acknowledgment/retry extension requires the matching firmware pair;
+legacy peers, reverse roles, and multiple nodes are not hardware-qualified.
+See the variant's [verification notes](WaveshareC5_Piglet/docs/VERIFICATION.md)
+for delivery, recovery, storage tests, and remaining limits.
+
 ## Supported Hardware
 
 ### Microcontroller Boards
