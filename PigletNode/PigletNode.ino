@@ -19,8 +19,11 @@
 #include <WiFi.h>
 #include <esp_now.h>
 #include "esp_wifi.h"
+#include <Update.h>
+#include "mbedtls/sha256.h"
+#include "OtaProto.h"
 
-#define FIRMWARE_VERSION "v2.65"
+#define FIRMWARE_VERSION "v3.01"
 
 // ================================================================
 //  Board — XIAO ESP32-C5
@@ -88,6 +91,41 @@ static const uint8_t CHANNELS[] = {
   149, 153, 157, 161, 165, 169, 173, 177
 };
 static const uint8_t NUM_CHANNELS = (uint8_t)(sizeof(CHANNELS));
+
+// ---- Piglet identification: lets a Core recognize this as a genuine
+// Piglet-family node (for the board-type-matched OTA push below) rather
+// than treating it as anonymous JCMK hardware. Carried in the otherwise-
+// always-empty text field of CORE_REQUEST/HEARTBEAT; real JCMK hardware
+// and Biscuit cores simply ignore this payload. PigletNode broadcasts its
+// finds the same way regardless of what the Core reports back (no
+// transmit-slot scheduling here, unlike the XIAO/T-Dongle variants) --
+// the marker exists purely so the Core can identify the board type.
+static const char*   PIGLET_MARKER     = "PIGLET1";
+static const uint8_t PIGLET_MARKER_LEN = 7;
+static const uint8_t PIGLET_MARKER_TOTAL_LEN = PIGLET_MARKER_LEN + 1;  // + board-type byte
+// Fixed-width, null-padded copy of FIRMWARE_VERSION immediately follows the
+// board-type byte -- lets a Core detect this node is running different
+// firmware than itself (drives the Core's "Update Nodes through Core?"
+// prompt / cfg.autoUpdateHeadlessNodes auto-push for PIGLET_BOARD_NODE).
+// Send-side only: PigletNode has no Core mode, so it never needs to parse
+// an incoming version field itself.
+static const uint8_t PIGLET_VERSION_LEN = 8;
+static const uint8_t PIGLET_MARKER_TOTAL_LEN_V2 = PIGLET_MARKER_TOTAL_LEN + PIGLET_VERSION_LEN;
+
+// Writes the marker + board-type byte + null-padded version string starting
+// at msg.text[0], and sets msg.len to PIGLET_MARKER_TOTAL_LEN_V2. Shared by
+// sendRequest()/sendHeartbeat() below so the version encoding stays in sync
+// with the Core's jcmkGetPigletVersion() parser (MeshNode.cpp).
+static void fillPigletMarker(jcmk_text_msg_t& msg) {
+  msg.len = PIGLET_MARKER_TOTAL_LEN_V2;
+  memcpy(msg.text, PIGLET_MARKER, PIGLET_MARKER_LEN);
+  msg.text[PIGLET_MARKER_LEN] = (char)PIGLET_BOARD_NODE;
+  size_t vlen = strlen(FIRMWARE_VERSION);
+  if (vlen > PIGLET_VERSION_LEN) vlen = PIGLET_VERSION_LEN;
+  memset(msg.text + PIGLET_MARKER_TOTAL_LEN, 0, PIGLET_VERSION_LEN);
+  memcpy(msg.text + PIGLET_MARKER_TOTAL_LEN, FIRMWARE_VERSION, vlen);
+  msg.text[PIGLET_MARKER_TOTAL_LEN_V2] = '\0';
+}
 
 // ================================================================
 //  Node state
@@ -163,6 +201,7 @@ static void sendRequest() {
   jcmk_text_msg_t msg = {};
   memcpy(msg.magic, JCMK_MAGIC, 4);
   msg.type = MSG_CORE_REQUEST;
+  fillPigletMarker(msg);
   esp_now_send(JCMK_BCAST, (uint8_t*)&msg, sizeof(msg));
 }
 
@@ -171,6 +210,7 @@ static void sendHeartbeat() {
   memcpy(msg.magic, JCMK_MAGIC, 4);
   msg.type    = MSG_HEARTBEAT;
   msg.counter = ++hbCounter;
+  fillPigletMarker(msg);
   esp_now_send(plainBiscuit ? coreMac : JCMK_BCAST, (uint8_t*)&msg, sizeof(msg));
 }
 
@@ -258,6 +298,146 @@ static String authStr(wifi_auth_mode_t m) {
 }
 
 // ================================================================
+//  OTA update from the Core (PIG_MSG_OTA_BEGIN / _DATA / _ACK)
+// ================================================================
+// The Core streams our app image over ESP-NOW (see OtaProto.h). The recv
+// callback only validates + queues chunks; all flash writes, hashing and
+// acks happen from otaTick() in loop(). While an update runs we stop
+// scanning and sit on the home channel so every chunk is heard. The whole
+// image is checked against the SHA-256 from OTA_BEGIN before the boot
+// partition is switched, so a corrupt or truncated transfer is discarded
+// and the node keeps running as-is. Needs an OTA-capable flash layout
+// (two app slots -- PartitionScheme="8M with spiffs"/default_8MB).
+#define OTA_QDEPTH 8
+static const uint32_t OTA_IDLE_ABORT_MS = 15000;   // no chunk for this long -> abandon
+
+struct OtaSlot { uint8_t len; uint8_t data[PIG_OTA_CHUNK]; };
+static OtaSlot           otaQ[OTA_QDEPTH];
+static volatile uint8_t  otaQHead = 0, otaQTail = 0;   // callback produces, loop consumes
+static volatile bool     otaActive       = false;
+static volatile uint8_t  otaSession      = 0;
+static volatile uint16_t otaQNext        = 0;          // next seq the callback will accept
+static volatile bool     otaBeginPending = false;
+static volatile bool     otaReack        = false;      // stale/gap chunk seen -> re-send our ack
+static pig_ota_begin_t   otaBeginMsg;
+static uint16_t          otaWritten = 0, otaChunks = 0;
+static uint32_t          otaSize = 0, otaBytes = 0, otaLastRxMs = 0;
+static uint8_t           otaSha[32];
+static mbedtls_sha256_context otaShaCtx;
+
+static void otaAck(uint8_t status) {
+  pig_ota_ack_t a = {};
+  memcpy(a.magic, JCMK_MAGIC, 4);
+  a.type    = PIG_MSG_OTA_ACK;
+  a.session = otaSession;
+  a.next    = otaWritten;
+  a.status  = status;
+  esp_now_send(coreMac, (uint8_t*)&a, sizeof(a));
+}
+
+static void otaFail(uint8_t status, const char* why) {
+  Serial.printf("[OTA] FAILED: %s\n", why);
+  Update.abort();
+  mbedtls_sha256_free(&otaShaCtx);
+  otaActive = false;
+  otaAck(status);
+}
+
+static void otaStart() {
+  otaBeginPending = false;
+  const pig_ota_begin_t& b = otaBeginMsg;
+  if (otaActive) {
+    // Core re-sent BEGIN because our READY was lost: just repeat it.
+    if (b.session == otaSession) { if (otaWritten == 0) otaAck(PIG_OTA_ST_READY); return; }
+    Update.abort();
+    mbedtls_sha256_free(&otaShaCtx);
+    otaActive = false;
+  }
+  otaSession = b.session;
+  otaWritten = 0;
+  uint32_t size = b.size;
+  if (size == 0 || ((size + PIG_OTA_CHUNK - 1) / PIG_OTA_CHUNK) != b.chunks) {
+    otaAck(PIG_OTA_ST_ERR_ARGS);
+    return;
+  }
+  // Stop any scan in flight and park on the home channel.
+  WiFi.scanDelete();
+  scanActive   = false;
+  scanAdminWin = false;
+  setChannel(ESPNOW_CH);
+
+  if (!Update.begin(size, U_FLASH)) {
+    Serial.printf("[OTA] Update.begin(%lu) failed: %s\n", (unsigned long)size, Update.errorString());
+    otaAck(PIG_OTA_ST_ERR_SPACE);
+    return;
+  }
+  mbedtls_sha256_init(&otaShaCtx);
+  mbedtls_sha256_starts(&otaShaCtx, 0);
+  memcpy(otaSha, b.sha256, 32);
+  otaChunks   = b.chunks;
+  otaSize     = size;
+  otaBytes    = 0;
+  otaQHead    = otaQTail = 0;
+  otaQNext    = 0;
+  otaReack    = false;
+  otaLastRxMs = millis();
+  otaActive   = true;
+  Serial.printf("[OTA] Start: %lu bytes, %u chunks\n", (unsigned long)size, (unsigned)b.chunks);
+  otaAck(PIG_OTA_ST_READY);
+}
+
+static void otaFinish() {
+  uint8_t h[32];
+  mbedtls_sha256_finish(&otaShaCtx, h);
+  mbedtls_sha256_free(&otaShaCtx);
+  if (otaBytes != otaSize) { otaFail(PIG_OTA_ST_ERR_ARGS, "size mismatch"); return; }
+  if (memcmp(h, otaSha, 32) != 0) {
+    Update.abort();
+    otaActive = false;
+    Serial.println("[OTA] FAILED: SHA-256 mismatch — update discarded");
+    otaAck(PIG_OTA_ST_ERR_SHA);
+    return;
+  }
+  if (!Update.end(true)) { otaFail(PIG_OTA_ST_ERR_WRITE, Update.errorString()); return; }
+  otaActive = false;
+  Serial.println("[OTA] Verified — rebooting into the new image");
+  for (uint8_t i = 0; i < 3; i++) { otaAck(PIG_OTA_ST_DONE); delay(30); }
+  delay(200);
+  ESP.restart();
+}
+
+static void otaTick() {
+  if (otaBeginPending) otaStart();
+  if (!otaActive) return;
+  uint32_t now = millis();
+  bool progressed = false;
+  while (otaQTail != otaQHead) {
+    OtaSlot& sl = otaQ[otaQTail];
+    if (Update.write(sl.data, sl.len) != sl.len) { otaFail(PIG_OTA_ST_ERR_WRITE, "flash write"); return; }
+    mbedtls_sha256_update(&otaShaCtx, sl.data, sl.len);
+    otaBytes += sl.len;
+    otaWritten++;
+    otaQTail = (otaQTail + 1) % OTA_QDEPTH;
+    progressed = true;
+  }
+  if (progressed || otaReack) {
+    otaReack = false;
+    otaAck(PIG_OTA_ST_OK);
+  }
+  if (progressed) {
+    otaLastRxMs = now;
+    lastAdminMs = now;                 // we are talking to the Core: don't time out
+  }
+  if (otaWritten == otaChunks) { otaFinish(); return; }
+  if (now - otaLastRxMs > OTA_IDLE_ABORT_MS) {
+    Serial.println("[OTA] Timed out waiting for chunks — abandoning update");
+    Update.abort();
+    mbedtls_sha256_free(&otaShaCtx);
+    otaActive = false;                 // scanning resumes; Core can retry
+  }
+}
+
+// ================================================================
 //  ESP-Now receive callback (runs in ISR context — keep minimal)
 // ================================================================
 static void onRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
@@ -294,6 +474,30 @@ static void onRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len
       endIdx    = adm->end_channel_idx;
     }
     lastAdminMs = millis();
+
+  } else if (type == PIG_MSG_OTA_BEGIN && haveCore && memcmp(info->src_addr, coreMac, 6) == 0
+             && len >= (int)sizeof(pig_ota_begin_t)) {
+    // ---- Core wants to update us. Queue it for loop(); never touch flash from here.
+    if (!otaBeginPending) { memcpy(&otaBeginMsg, data, sizeof(otaBeginMsg)); otaBeginPending = true; }
+
+  } else if (type == PIG_MSG_OTA_DATA && otaActive && haveCore
+             && memcmp(info->src_addr, coreMac, 6) == 0
+             && len > (int)offsetof(pig_ota_data_t, data)) {
+    const pig_ota_data_t* d = (const pig_ota_data_t*)data;
+    if (d->session == otaSession && d->len >= 1 && d->len <= PIG_OTA_CHUNK
+        && len >= (int)offsetof(pig_ota_data_t, data) + (int)d->len) {
+      if (d->seq == otaQNext) {
+        uint8_t nh = (uint8_t)((otaQHead + 1) % OTA_QDEPTH);
+        if (nh != otaQTail) {
+          otaQ[otaQHead].len = d->len;
+          memcpy(otaQ[otaQHead].data, d->data, d->len);
+          otaQHead = nh;
+          otaQNext++;
+        }
+      } else {
+        otaReack = true;   // stale or out-of-order: tell the Core where we are
+      }
+    }
 
   } else if (type == MSG_HEARTBEAT && haveCore) {
     // Core is still alive — reset timeout
@@ -454,7 +658,7 @@ static void nodeTick() {
   }
 
   // --- Channel scan (runs continuously once paired) ---
-  if (haveCore) scanTick();
+  if (haveCore && !otaActive) scanTick();   // scanning is paused during an OTA update
 }
 
 // ================================================================
@@ -586,8 +790,9 @@ void setup() {
 // ================================================================
 void loop() {
   nodeTick();
+  otaTick();
   ledTick();
   buttonTick();
   statusTick();
-  delay(10);
+  delay(otaActive ? 1 : 10);
 }

@@ -42,9 +42,54 @@
 #include "soc/gpio_sig_map.h"
 #include "esp32-hal-matrix.h"
 #include "YieldSched.h"
+#include "OtaProto.h"
+#include <Update.h>
+#include "mbedtls/sha256.h"
+#include "esp_heap_caps.h"
+
+// ---- Core-side OTA engine types ----
+// Defined here, at the very top of the file, rather than alongside the
+// coreOta* functions further down: the Arduino .ino preprocessor auto-
+// generates function prototypes near the top of the file (before most of
+// the sketch has been parsed), so any top-level function whose signature
+// uses a type defined later in the file fails to compile (see
+// biscuitSetChannels()'s comment below for the same issue). Defining these
+// types up front avoids that for coreOtaLoadOne()/coreOtaClose()/coreOtaStatus().
+enum class CoreOtaPhase : uint8_t { Idle, Starting, Sending, Done, Failed };
+struct CoreOtaStatus {
+  CoreOtaPhase phase;
+  int8_t       nodeIdx;      // roster index being updated, -1 if none
+  uint32_t     sentBytes;    // bytes acknowledged by the node so far
+  uint32_t     totalBytes;
+  char         msg[28];      // short human-readable result / failure reason
+  char         loadMsg[28];  // per-board-type summary of what's staged on SD
+};
+// Per-board-type image, preloaded from the Core's SD card at boot.
+struct CoreOtaImage {
+  uint8_t     boardType;    // PigletBoardType this file is for
+  const char* path;         // /Firmware/<Board>.ota.bin
+  const char* label;        // short tag for status messages
+  uint8_t*    image;        // whole image in PSRAM, null if not loaded
+  uint32_t    size;
+  uint16_t    chunks;
+  uint8_t     sha[32];
+  char        failMsg[28];  // why this image is not loaded
+};
+
+// On-device "Update Nodes through Core?" prompt status, read by
+// drawPageMeshNode() and pollButton(). Defined here (not alongside the
+// coreUpdate* functions further down) for the same top-of-file-prototype
+// reason as CoreOtaStatus above.
+struct CoreUpdatePromptStatus {
+  bool     promptActive;       // true while the 30s confirm window is open
+  uint32_t promptRemainingMs;  // time left in the confirm window, valid when promptActive
+  uint8_t  pendingCount;       // nodes queued for update (including the one currently pushing)
+  bool     pushActive;         // a coreOta transfer for this queue is in flight
+  uint8_t  pushNodeIdx;        // coreNodes[] index being pushed, valid when pushActive
+};
 
 // Firmware version
-#define FIRMWARE_VERSION "v2.84"
+#define FIRMWARE_VERSION "v3.01"
 
 // ---------------- Pins (T-DONGLE C5) ----------------
 struct PinMap {
@@ -168,6 +213,14 @@ struct Config {
   // its own scan finds + GPS, Core pushes every node-forwarded AP + its own
   // GPS. Default off.
   bool wardriveGoBridge = false;
+  // When true: a headless PigletNode (PIGLET_BOARD_NODE, no display/buttons
+  // of its own) that connects to this Core running older firmware is
+  // automatically pushed the staged /Firmware/PigletNode.ota.bin image over
+  // ESP-NOW, with no on-device confirmation (there's no screen to confirm
+  // on). XIAO-based nodes (Piglet/TDongleC5_Piglet) always get the on-screen
+  // "Update Nodes through Core?" confirm prompt instead. Use an SD card
+  // rated at least 16GB for sustained-write reliability. Default off.
+  bool autoUpdateHeadlessNodes = false;
 };
 
 Config cfg;
@@ -450,6 +503,10 @@ static void cfgAssignKV(const String& k, const String& v) {
     String vv = v; vv.toLowerCase();
     cfg.wardriveGoBridge = (vv == "true" || vv == "1");
   }
+  else if (k == "autoUpdateHeadlessNodes") {
+    String vv = v; vv.toLowerCase();
+    cfg.autoUpdateHeadlessNodes = (vv == "true" || vv == "1");
+  }
 }
 
 static bool saveConfigToSD() {
@@ -492,6 +549,11 @@ static bool saveConfigToSD() {
 
   f.println("# Wardrive Go / WarBLE Go BLE bridge -- active only on the Mesh Node/Core page.");
   f.print("wardriveGoBridge="); f.println(cfg.wardriveGoBridge ? "true" : "false");
+
+  f.println("# Auto-push firmware to out-of-date headless PigletNode nodes (no on-screen");
+  f.println("# confirm -- they have no display). XIAO nodes always use the on-device");
+  f.println("# confirm prompt instead. Use an SD card rated at least 16GB.");
+  f.print("autoUpdateHeadlessNodes="); f.println(cfg.autoUpdateHeadlessNodes ? "true" : "false");
 
   f.flush(); f.close();
   Serial.println("[CFG] Saved OK");
@@ -2376,6 +2438,21 @@ static const uint32_t NODE_ADMIN_WIN_MS   = 500;   // ch-6 window after each sca
 // of a pairing are confirmed to be genuine Piglet devices.
 static const char*   PIGLET_MARKER     = "PIGLET1";
 static const uint8_t PIGLET_MARKER_LEN = 7;
+// Board-type byte (PigletBoardType, OtaProto.h) immediately follows the
+// marker text, letting a Core pick the right /Firmware/<Board>.ota.bin
+// image for a connected node -- every Piglet variant is ESP32-C5, so the
+// image's own chip_id can't disambiguate boards the way it could for a
+// mixed-silicon fleet. See coreOtaStart() below.
+static const uint8_t PIGLET_MARKER_TOTAL_LEN = PIGLET_MARKER_LEN + 1;
+#define PIGLET_THIS_BOARD_TYPE PIGLET_BOARD_TDONGLE
+// Fixed-width, null-padded copy of FIRMWARE_VERSION immediately follows the
+// board-type byte, letting a Core detect a connected Piglet/TDongleC5_Piglet
+// node running different firmware than itself (see the on-device "Update
+// Nodes through Core?" prompt in coreModeTick()/drawPageMeshNode()). A node
+// still on the shorter pre-version marker reports an empty version string --
+// treated as "unknown", never flagged as a mismatch.
+static const uint8_t PIGLET_VERSION_LEN = 8;
+static const uint8_t PIGLET_MARKER_TOTAL_LEN_V2 = PIGLET_MARKER_TOTAL_LEN + PIGLET_VERSION_LEN;
 
 // Deterministic transmit-slot width for Piglet-to-Piglet nodes. Each
 // confirmed-Piglet node gets an exclusive [slotIndex*SLOT_MS, +SLOT_MS) window
@@ -2521,6 +2598,11 @@ struct CoreNodeInfo {
   bool     isBiscuit;  // true = Biscuit Node protocol (requires full-size 212-byte packets)
   bool     isPiglet;   // true = confirmed genuine Piglet node (via marker handshake)
   uint8_t  slotIndex;  // this node's transmit slot among other Piglet nodes (valid when isPiglet)
+  uint8_t  boardType;  // PigletBoardType (PIGLET_BOARD_UNKNOWN unless isPiglet) -- which
+                        // /Firmware/<Board>.ota.bin image this node can be pushed
+  char     version[9]; // node's reported FIRMWARE_VERSION, empty if unknown (pre-version node)
+  bool     updateDeclined;      // user let the on-device update prompt time out for this node
+  bool     autoUpdateAttempted; // headless-node auto-push already tried this session (no retry loop)
 };
 static bool         meshCoreActive  = false;
 static uint32_t     coreRecordsRx   = 0;
@@ -2547,7 +2629,7 @@ static const uint32_t CORE_NODE_TIMEOUT  = 90000;  // 90 s — generous for many
 
 #define CORE_REQ_QUEUE  16
 #define CORE_TEXT_QUEUE 192  // sized for burst from 12 nodes x ~15 networks each
-struct CorReqSlot  { uint8_t mac[6]; bool isBiscuit; bool isPiglet; };
+struct CorReqSlot  { uint8_t mac[6]; bool isBiscuit; bool isPiglet; uint8_t boardType; char version[9]; };
 struct CorTextSlot { char    line[JCMK_TEXT_MAX + 1]; };
 static CorReqSlot         coreReqBuf[CORE_REQ_QUEUE];
 static volatile uint8_t   coreReqHead = 0, coreReqTail = 0;
@@ -2592,16 +2674,34 @@ static bool jcmkAddPeer(const uint8_t* mac) {
 // Biscuit Pro drops any packet < 212 bytes; JCMK Cores only check len >= 5
 // so full-size packets are backward-compatible with both coordinators.
 
+// Writes the marker + board-type byte + null-padded version string starting
+// at `text[0]` and returns the total marker length (PIGLET_MARKER_TOTAL_LEN_V2).
+// Shared by every marker-sending function below so the version encoding
+// stays in sync. Takes a raw char* (not jcmk_text_msg_t&) because the
+// Arduino .ino preprocessor auto-generates function prototypes near the top
+// of the file, before the jcmk_text_msg_t typedef is defined further down --
+// any top-level function taking that type directly fails to compile (same
+// issue noted on biscuitSetChannels() below).
+static uint16_t fillPigletMarker(char* text) {
+  memcpy(text, PIGLET_MARKER, PIGLET_MARKER_LEN);
+  text[PIGLET_MARKER_LEN] = (char)PIGLET_THIS_BOARD_TYPE;
+  size_t vlen = strlen(FIRMWARE_VERSION);
+  if (vlen > PIGLET_VERSION_LEN) vlen = PIGLET_VERSION_LEN;
+  memset(text + PIGLET_MARKER_TOTAL_LEN, 0, PIGLET_VERSION_LEN);
+  memcpy(text + PIGLET_MARKER_TOTAL_LEN, FIRMWARE_VERSION, vlen);
+  text[PIGLET_MARKER_TOTAL_LEN_V2] = '\0';
+  return PIGLET_MARKER_TOTAL_LEN_V2;
+}
+
 static void jcmkSendCoreRequest() {
   jcmk_text_msg_t msg = {};
   memcpy(msg.magic, JCMK_MAGIC, 4);
   msg.type    = JCMK_MSG_CORE_REQUEST;
   msg.counter = 0;
-  // Marker identifies this as a genuine Piglet node to a Piglet Core; real
-  // JCMK hardware and Biscuit Cores simply ignore this payload.
-  msg.len     = PIGLET_MARKER_LEN;
-  memcpy(msg.text, PIGLET_MARKER, PIGLET_MARKER_LEN);
-  msg.text[PIGLET_MARKER_LEN] = '\0';
+  // Marker + board-type byte + version identify this as a genuine Piglet
+  // node (which board, which firmware) to a Piglet Core; real JCMK hardware
+  // and Biscuit Cores simply ignore this payload.
+  msg.len = fillPigletMarker(msg.text);
   esp_now_send(JCMK_BCAST, (uint8_t*)&msg, sizeof(msg));
 }
 
@@ -2610,11 +2710,10 @@ static void jcmkSendHeartbeat() {
   memcpy(msg.magic, JCMK_MAGIC, 4);
   msg.type    = JCMK_MSG_HEARTBEAT;
   msg.counter = ++jcmkHbCounter;
-  // Carry the marker here too so a Core can learn isPiglet even if it first
-  // (re)discovers this node via a heartbeat rather than a fresh CORE_REQUEST.
-  msg.len     = PIGLET_MARKER_LEN;
-  memcpy(msg.text, PIGLET_MARKER, PIGLET_MARKER_LEN);
-  msg.text[PIGLET_MARKER_LEN] = '\0';
+  // Carry the marker here too so a Core can learn isPiglet/version even if
+  // it first (re)discovers this node via a heartbeat rather than a fresh
+  // CORE_REQUEST.
+  msg.len = fillPigletMarker(msg.text);
   // Unicast only for a confirmed Piglet-to-Piglet pairing, where we control
   // peer registration on both ends and gain real link-layer retry/ACK.
   // Broadcast for everything else (real JCMK hardware / Biscuit): field
@@ -2678,6 +2777,33 @@ static bool jcmkHasPigletMarker(const void* data, int len) {
   return memcmp(tm->text, PIGLET_MARKER, PIGLET_MARKER_LEN) == 0;
 }
 
+// Returns the sender's declared PigletBoardType if the marker AND the
+// board-type byte that follows it are both present, else PIGLET_BOARD_UNKNOWN
+// (a pre-v3.0 Piglet node that only sends the bare 7-byte marker, or
+// non-Piglet hardware -- jcmkHasPigletMarker() already gates isPiglet itself).
+static uint8_t jcmkGetPigletBoardType(const void* data, int len) {
+  if (len < (int)sizeof(jcmk_text_msg_t)) return PIGLET_BOARD_UNKNOWN;
+  const jcmk_text_msg_t* tm = (const jcmk_text_msg_t*)data;
+  if (tm->len < PIGLET_MARKER_TOTAL_LEN) return PIGLET_BOARD_UNKNOWN;
+  if (memcmp(tm->text, PIGLET_MARKER, PIGLET_MARKER_LEN) != 0) return PIGLET_BOARD_UNKNOWN;
+  return (uint8_t)tm->text[PIGLET_MARKER_LEN];
+}
+
+// Writes the sender's declared firmware version into `out` (size >= 9) if the
+// marker AND the version bytes that follow the board-type byte are both
+// present, else writes an empty string -- a pre-version Piglet node (or
+// non-Piglet hardware) simply reports "unknown", which never triggers the
+// on-device "Update Nodes through Core?" mismatch prompt.
+static void jcmkGetPigletVersion(const void* data, int len, char* out) {
+  out[0] = '\0';
+  if (len < (int)sizeof(jcmk_text_msg_t)) return;
+  const jcmk_text_msg_t* tm = (const jcmk_text_msg_t*)data;
+  if (tm->len < PIGLET_MARKER_TOTAL_LEN_V2) return;
+  if (memcmp(tm->text, PIGLET_MARKER, PIGLET_MARKER_LEN) != 0) return;
+  memcpy(out, tm->text + PIGLET_MARKER_TOTAL_LEN, PIGLET_VERSION_LEN);
+  out[PIGLET_VERSION_LEN] = '\0';
+}
+
 // True if a received CORE_REPLY indicates a Biscuit Core running in
 // unencrypted-reply mode (carries "encrypt=0" somewhere in its text field).
 static bool biscuitHasPlainReply(const void* data, int len) {
@@ -2734,6 +2860,142 @@ static void biscuitSetChannels(const void* data, int len) {
   nodeScanChOffset = 0;
 }
 
+// ================================================================
+//  Node-side OTA receiver (PIG_MSG_OTA_BEGIN / _DATA / _ACK)
+//  Ported from olosnoks/warhog's WarHogNode otaTick()/otaStart()/otaFinish().
+//  The recv callback (further down, jcmkOnRecv) only enqueues chunks; all
+//  flash writes, hashing and acks happen here from nodeOtaTick(), called
+//  every nodeModeTick(). Scanning is paused for the duration.
+// ================================================================
+#define NODE_OTA_QDEPTH 8
+struct NodeOtaSlot { uint8_t len; uint8_t data[PIG_OTA_CHUNK]; };
+static NodeOtaSlot        nodeOtaQ[NODE_OTA_QDEPTH];
+static volatile uint8_t   nodeOtaQHead = 0, nodeOtaQTail = 0;   // callback produces, loop consumes
+static volatile bool      nodeOtaActive       = false;
+static volatile uint8_t   nodeOtaSession      = 0;
+static volatile uint16_t  nodeOtaQNext        = 0;              // next seq the callback will accept
+static volatile bool      nodeOtaBeginPending = false;
+static volatile bool      nodeOtaReack        = false;          // stale/gap chunk seen -> re-send our ack
+static pig_ota_begin_t    nodeOtaBeginMsg;
+static uint16_t           nodeOtaWritten = 0, nodeOtaChunks = 0;
+static uint32_t           nodeOtaSize = 0, nodeOtaBytes = 0, nodeOtaLastRxMs = 0;
+static uint8_t            nodeOtaSha[32];
+static mbedtls_sha256_context nodeOtaShaCtx;
+static const uint32_t NODE_OTA_IDLE_ABORT_MS = 15000;  // no chunk for this long -> abandon
+
+static void nodeOtaAck(uint8_t status) {
+  pig_ota_ack_t a = {};
+  memcpy(a.magic, JCMK_MAGIC, 4);
+  a.type    = PIG_MSG_OTA_ACK;
+  a.session = nodeOtaSession;
+  a.next    = nodeOtaWritten;
+  a.status  = status;
+  esp_now_send(jcmkCoreMac, (uint8_t*)&a, sizeof(a));
+}
+
+static void nodeOtaFail(uint8_t status, const char* why) {
+  Serial.printf("[OTA] FAILED: %s\n", why);
+  Update.abort();
+  mbedtls_sha256_free(&nodeOtaShaCtx);
+  nodeOtaActive = false;
+  nodeOtaAck(status);
+}
+
+static void nodeOtaStart() {
+  nodeOtaBeginPending = false;
+  const pig_ota_begin_t& b = nodeOtaBeginMsg;
+  if (nodeOtaActive) {
+    // Core re-sent BEGIN because our READY was lost: just repeat it.
+    if (b.session == nodeOtaSession) { if (nodeOtaWritten == 0) nodeOtaAck(PIG_OTA_ST_READY); return; }
+    Update.abort();
+    mbedtls_sha256_free(&nodeOtaShaCtx);
+    nodeOtaActive = false;
+  }
+  nodeOtaSession = b.session;
+  nodeOtaWritten = 0;
+  uint32_t size = b.size;
+  if (size == 0 || ((size + PIG_OTA_CHUNK - 1) / PIG_OTA_CHUNK) != b.chunks) {
+    nodeOtaAck(PIG_OTA_ST_ERR_ARGS);
+    return;
+  }
+  // Stop any scan in flight and park on the home channel.
+  WiFi.scanDelete();
+  nodeScanActive   = false;
+  nodeScanAdminWin = false;
+  jcmkSetChannel(JCMK_ESPNOW_CH);
+
+  if (!Update.begin(size, U_FLASH)) {
+    Serial.printf("[OTA] Update.begin(%lu) failed: %s\n", (unsigned long)size, Update.errorString());
+    nodeOtaAck(PIG_OTA_ST_ERR_SPACE);
+    return;
+  }
+  mbedtls_sha256_init(&nodeOtaShaCtx);
+  mbedtls_sha256_starts(&nodeOtaShaCtx, 0);
+  memcpy(nodeOtaSha, b.sha256, 32);
+  nodeOtaChunks   = b.chunks;
+  nodeOtaSize     = size;
+  nodeOtaBytes    = 0;
+  nodeOtaQHead    = nodeOtaQTail = 0;
+  nodeOtaQNext    = 0;
+  nodeOtaReack    = false;
+  nodeOtaLastRxMs = millis();
+  nodeOtaActive   = true;
+  Serial.printf("[OTA] Start: %lu bytes, %u chunks\n", (unsigned long)size, (unsigned)b.chunks);
+  nodeOtaAck(PIG_OTA_ST_READY);
+}
+
+static void nodeOtaFinish() {
+  uint8_t h[32];
+  mbedtls_sha256_finish(&nodeOtaShaCtx, h);
+  mbedtls_sha256_free(&nodeOtaShaCtx);
+  if (nodeOtaBytes != nodeOtaSize) { nodeOtaFail(PIG_OTA_ST_ERR_ARGS, "size mismatch"); return; }
+  if (memcmp(h, nodeOtaSha, 32) != 0) {
+    Update.abort();
+    nodeOtaActive = false;
+    Serial.println("[OTA] FAILED: SHA-256 mismatch — update discarded");
+    nodeOtaAck(PIG_OTA_ST_ERR_SHA);
+    return;
+  }
+  if (!Update.end(true)) { nodeOtaFail(PIG_OTA_ST_ERR_WRITE, Update.errorString()); return; }
+  nodeOtaActive = false;
+  Serial.println("[OTA] Verified — rebooting into the new image");
+  for (uint8_t i = 0; i < 3; i++) { nodeOtaAck(PIG_OTA_ST_DONE); delay(30); }
+  delay(200);
+  ESP.restart();
+}
+
+// Called every nodeModeTick(). No-op unless a transfer is pending/active.
+static void nodeOtaTick() {
+  if (nodeOtaBeginPending) nodeOtaStart();
+  if (!nodeOtaActive) return;
+  uint32_t now = millis();
+  bool progressed = false;
+  while (nodeOtaQTail != nodeOtaQHead) {
+    NodeOtaSlot& sl = nodeOtaQ[nodeOtaQTail];
+    if (Update.write(sl.data, sl.len) != sl.len) { nodeOtaFail(PIG_OTA_ST_ERR_WRITE, "flash write"); return; }
+    mbedtls_sha256_update(&nodeOtaShaCtx, sl.data, sl.len);
+    nodeOtaBytes += sl.len;
+    nodeOtaWritten++;
+    nodeOtaQTail = (nodeOtaQTail + 1) % NODE_OTA_QDEPTH;
+    progressed = true;
+  }
+  if (progressed || nodeOtaReack) {
+    nodeOtaReack = false;
+    nodeOtaAck(PIG_OTA_ST_OK);
+  }
+  if (progressed) {
+    nodeOtaLastRxMs = now;
+    jcmkCoreLastSeenMs = now;   // we are talking to the Core: don't time out
+  }
+  if (nodeOtaWritten == nodeOtaChunks) { nodeOtaFinish(); return; }
+  if (now - nodeOtaLastRxMs > NODE_OTA_IDLE_ABORT_MS) {
+    Serial.println("[OTA] Timed out waiting for chunks — abandoning update");
+    Update.abort();
+    mbedtls_sha256_free(&nodeOtaShaCtx);
+    nodeOtaActive = false;      // scanning resumes; Core can retry
+  }
+}
+
 // ---- Core forward decls (used inside jcmkOnRecv callback) ----
 static void coreSendReply(const uint8_t* mac) {
   // Use full-size jcmk_text_msg_t (212 bytes) instead of jcmk_req_msg_t (5 bytes).
@@ -2743,11 +3005,10 @@ static void coreSendReply(const uint8_t* mac) {
   memcpy(msg.magic, JCMK_MAGIC, 4);
   msg.type    = JCMK_MSG_CORE_REPLY;
   msg.counter = 0;
-  // Marker tells a Piglet node that this Core is also a genuine Piglet, so it
-  // can safely switch to slot-scheduled transmit; ignored by third-party nodes.
-  msg.len     = PIGLET_MARKER_LEN;
-  memcpy(msg.text, PIGLET_MARKER, PIGLET_MARKER_LEN);
-  msg.text[PIGLET_MARKER_LEN] = '\0';
+  // Marker + board-type byte + version tell a Piglet node that this Core is
+  // also a genuine Piglet (and its firmware version), so it can safely
+  // switch to slot-scheduled transmit; ignored by third-party nodes.
+  msg.len = fillPigletMarker(msg.text);
   esp_now_send(mac, (uint8_t*)&msg, sizeof(msg));
 }
 
@@ -2844,6 +3105,397 @@ static void coreSendBiscuitRoleAndConfig(const uint8_t* mac, uint8_t startIdx, u
     (int)NODE_SCAN_DWELL_MS);
 }
 
+// ================================================================
+//  Core-side OTA engine (PIG_MSG_OTA_BEGIN / _DATA / _ACK)
+//  Ported from olosnoks/warhog's coreOta* functions. Pushes a connected
+//  node's app image over the existing ESP-NOW link -- no USB. Images are
+//  staged once per boot from the Core's own SD card (/Firmware/<Board>.ota.bin,
+//  one per PigletBoardType) into PSRAM, since mid-session SD reads are not
+//  reliable once Wi-Fi/BLE are both running. coreOtaStart() just arms a
+//  transfer; coreOtaTick() (called from coreModeTick()) drives it.
+// ================================================================
+static const uint32_t CORE_OTA_BEGIN_RETRY_MS   = 400;      // resend OTA_BEGIN this often
+static const uint32_t CORE_OTA_START_TIMEOUT_MS = 20000;    // node never answered
+static const uint32_t CORE_OTA_ACK_TIMEOUT_MS   = 250;      // no ack progress -> resend window
+static const uint32_t CORE_OTA_STALL_MS         = 10000;    // no ack progress at all -> give up
+static const uint32_t CORE_OTA_RESULT_SHOW_MS   = 15000;    // keep Done/Failed visible this long
+static const uint32_t CORE_OTA_MAX_IMAGE        = 0x330000; // size of an ota_0/ota_1 slot in default_8MB
+static const uint16_t CORE_OTA_CHIP_ESP32C5     = 23;       // esp_image_header_t.chip_id for the C5
+
+static CoreOtaImage coreOtaImages[] = {
+  { PIGLET_BOARD_NODE,    "/Firmware/PigletNode.ota.bin", "Node", nullptr, 0, 0, {0}, {0} },
+  { PIGLET_BOARD_XIAO,    "/Firmware/Piglet.ota.bin",     "XIAO", nullptr, 0, 0, {0}, {0} },
+  { PIGLET_BOARD_TDONGLE, "/Firmware/TDongleC5_Piglet.ota.bin", "TDongle", nullptr, 0, 0, {0}, {0} },
+};
+static const int CORE_OTA_IMAGE_COUNT = (int)(sizeof(coreOtaImages) / sizeof(coreOtaImages[0]));
+
+static struct {
+  CoreOtaPhase phase   = CoreOtaPhase::Idle;
+  int8_t       node    = -1;
+  uint8_t      mac[6]  = {0};
+  uint8_t      session = 0;
+  uint8_t*     image   = nullptr;   // whole node image, in PSRAM (null = none loaded)
+  uint32_t     size    = 0;
+  uint16_t     chunks  = 0;
+  uint8_t      sha[32] = {0};
+  char         loadMsg[28] = {0};
+  uint16_t     base    = 0;         // chunks the node has acknowledged
+  uint16_t     nextSend = 0;
+  uint32_t     startMs = 0, lastBeginMs = 0, ackMs = 0, progressMs = 0, endMs = 0;
+  char         msg[28] = {0};
+} coreOta;
+
+// Written by the ESP-NOW callback, consumed by coreOtaTick().
+static volatile bool     coreOtaGotReady  = false;
+static volatile uint16_t coreOtaAckNext   = 0;
+static volatile uint8_t  coreOtaFinalStat = 0xFF;   // PIG_OTA_ST_DONE / PIG_OTA_ST_ERR_*; 0xFF = none yet
+
+static bool coreOtaBusy() {
+  return coreOta.phase == CoreOtaPhase::Starting || coreOta.phase == CoreOtaPhase::Sending;
+}
+
+// True if a loaded (PSRAM-resident) image is available for pushing to a node
+// of the given board type. Used by the update-prompt/auto-push logic below
+// to avoid offering/attempting a push with nothing to actually send.
+static bool coreOtaHasImage(uint8_t boardType) {
+  for (int i = 0; i < CORE_OTA_IMAGE_COUNT; i++)
+    if (coreOtaImages[i].boardType == boardType) return coreOtaImages[i].image != nullptr;
+  return false;
+}
+
+static void coreOtaSetMsg(const char* m) { snprintf(coreOta.msg, sizeof(coreOta.msg), "%s", m); }
+static void coreOtaLoadFail(const char* m) {
+  snprintf(coreOta.loadMsg, sizeof(coreOta.loadMsg), "%s", m);
+  Serial.printf("[OTA] no image loaded: %s\n", m);
+}
+
+// Load one board's image file from SD into PSRAM, validating its ESP image
+// magic + chip_id. A missing file is not an error here (that board may simply
+// not be part of this mesh) -- it only matters once coreOtaStart() wants it.
+static void coreOtaLoadOne(CoreOtaImage& im) {
+  if (im.image) { heap_caps_free(im.image); im.image = nullptr; }
+  im.size = 0; im.chunks = 0; im.failMsg[0] = 0;
+  if (!SD.exists(im.path)) { snprintf(im.failMsg, sizeof(im.failMsg), "NO IMAGE ON SD"); return; }
+  File f = SD.open(im.path, FILE_READ);
+  if (!f) { snprintf(im.failMsg, sizeof(im.failMsg), "CANNOT OPEN IMAGE"); return; }
+  uint32_t size = (uint32_t)f.size();
+  if (size < 1024 || size > CORE_OTA_MAX_IMAGE) {
+    f.close(); snprintf(im.failMsg, sizeof(im.failMsg), "BAD IMAGE SIZE"); return;
+  }
+  uint8_t* img = (uint8_t*)heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!img) { f.close(); snprintf(im.failMsg, sizeof(im.failMsg), "OUT OF MEMORY"); return; }
+  uint32_t got = 0;
+  uint8_t buf[4096];
+  while (got < size) {
+    uint32_t want = size - got; if (want > sizeof(buf)) want = (uint32_t)sizeof(buf);
+    int n = f.read(buf, want);
+    if (n <= 0) break;
+    memcpy(img + got, buf, (size_t)n);
+    got += (uint32_t)n;
+  }
+  f.close();
+  if (got != size) { heap_caps_free(img); snprintf(im.failMsg, sizeof(im.failMsg), "SD READ ERROR"); return; }
+  if (img[0] != 0xE9) { heap_caps_free(img); snprintf(im.failMsg, sizeof(im.failMsg), "NOT AN APP IMAGE"); return; }
+  uint16_t chip = (uint16_t)(img[12] | (img[13] << 8));
+  if (chip != CORE_OTA_CHIP_ESP32C5) {
+    heap_caps_free(img); snprintf(im.failMsg, sizeof(im.failMsg), "NOT A C5 IMAGE"); return;
+  }
+  mbedtls_sha256(img, size, im.sha, 0);
+  im.image  = img;
+  im.size   = size;
+  im.chunks = (uint16_t)((size + PIG_OTA_CHUNK - 1) / PIG_OTA_CHUNK);
+  Serial.printf("[OTA] %s image loaded: %lu bytes, %u chunks\n", im.label, (unsigned long)size, (unsigned)im.chunks);
+}
+
+// Call once from setup(), right after the SD card mounts. Loads every board's
+// image present on SD and leaves a short per-board summary for the Web UI.
+static void coreOtaPreload() {
+  coreOta.loadMsg[0] = 0;
+  if (!sdOk) { coreOtaLoadFail("NO SD CARD"); return; }
+  if (!SD.exists("/Firmware")) SD.mkdir("/Firmware");
+  int loaded = 0;
+  String summary;
+  for (int i = 0; i < CORE_OTA_IMAGE_COUNT; i++) {
+    coreOtaLoadOne(coreOtaImages[i]);
+    if (coreOtaImages[i].image) loaded++;
+    if (summary.length()) summary += " ";
+    summary += coreOtaImages[i].label;
+    summary += ":";
+    summary += coreOtaImages[i].image ? "ok" : "-";
+  }
+  if (loaded == 0) coreOtaLoadFail("NO FIRMWARE IMAGES ON SD");
+  else snprintf(coreOta.loadMsg, sizeof(coreOta.loadMsg), "%s", summary.c_str());
+}
+
+static void coreOtaClose(CoreOtaPhase endPhase, const char* msg) {
+  coreOta.phase = endPhase;
+  coreOta.endMs = millis();
+  coreOtaSetMsg(msg);
+}
+
+// ESP-NOW callback context: record only, no sends.
+static void coreOtaOnAck(const uint8_t* mac, const uint8_t* data, int len) {
+  if (len < (int)sizeof(pig_ota_ack_t)) return;
+  if (coreOta.phase != CoreOtaPhase::Starting && coreOta.phase != CoreOtaPhase::Sending) return;
+  if (memcmp(mac, coreOta.mac, 6) != 0) return;
+  const pig_ota_ack_t* a = (const pig_ota_ack_t*)data;
+  if (a->session != coreOta.session) return;
+  if (coreOta.node >= 0) coreNodes[coreOta.node].lastHbMs = millis();   // an ack proves the node is alive
+  if (a->status == PIG_OTA_ST_READY) coreOtaGotReady = true;
+  else if (a->status >= PIG_OTA_ST_DONE) coreOtaFinalStat = a->status;
+  if (a->next > coreOtaAckNext) coreOtaAckNext = a->next;
+}
+
+static bool coreOtaStart(uint8_t nodeIdx) {
+  if (coreOtaBusy()) return false;
+  coreOta.node  = (int8_t)nodeIdx;
+  coreOta.phase = CoreOtaPhase::Failed;      // until proven otherwise; keeps msg visible
+  coreOta.endMs = millis();
+  if (!meshCoreActive || nodeIdx >= CORE_MAX_NODES || !coreNodes[nodeIdx].active) {
+    coreOtaSetMsg("NODE NOT CONNECTED"); return false;
+  }
+  uint8_t bt = coreNodes[nodeIdx].boardType;
+  if (bt == PIGLET_BOARD_UNKNOWN) { coreOtaSetMsg("BOARD TYPE UNKNOWN"); return false; }
+  CoreOtaImage* im = nullptr;
+  for (int i = 0; i < CORE_OTA_IMAGE_COUNT; i++)
+    if (coreOtaImages[i].boardType == bt) { im = &coreOtaImages[i]; break; }
+  if (!im || !im->image) {
+    coreOtaSetMsg(im && im->failMsg[0] ? im->failMsg : "NO IMAGE FOR NODE");
+    return false;
+  }
+  coreOta.image  = im->image;
+  coreOta.size   = im->size;
+  coreOta.chunks = im->chunks;
+  memcpy(coreOta.sha, im->sha, 32);
+
+  memcpy(coreOta.mac, coreNodes[nodeIdx].mac, 6);
+  coreOta.session  = (uint8_t)(esp_random() & 0xFF);
+  coreOta.base     = coreOta.nextSend = 0;
+  coreOtaGotReady  = false;
+  coreOtaAckNext   = 0;
+  coreOtaFinalStat = 0xFF;
+  coreOtaSetMsg("");
+  coreOta.startMs     = millis();
+  coreOta.lastBeginMs = 0;
+  coreOta.phase       = CoreOtaPhase::Starting;
+  Serial.printf("[OTA] node %u: %lu bytes, %u chunks, session %u\n", (unsigned)nodeIdx,
+                (unsigned long)coreOta.size, (unsigned)coreOta.chunks, (unsigned)coreOta.session);
+  return true;
+}
+
+static void coreOtaAbort() {
+  if (!coreOtaBusy()) return;
+  coreOtaClose(CoreOtaPhase::Failed, "CANCELLED");   // the node abandons an idle update after 15 s
+}
+
+static CoreOtaStatus coreOtaStatus() {
+  CoreOtaStatus st = {};
+  st.phase      = coreOta.phase;
+  st.nodeIdx    = coreOta.node;
+  st.totalBytes = coreOta.size;
+  uint32_t b    = (uint32_t)coreOta.base * PIG_OTA_CHUNK;
+  st.sentBytes  = b > coreOta.size ? coreOta.size : b;
+  snprintf(st.msg, sizeof(st.msg), "%s", coreOta.msg);
+  snprintf(st.loadMsg, sizeof(st.loadMsg), "%s", coreOta.loadMsg);
+  return st;
+}
+
+static bool coreOtaSendBegin() {
+  pig_ota_begin_t b = {};
+  memcpy(b.magic, JCMK_MAGIC, 4);
+  b.type    = PIG_MSG_OTA_BEGIN;
+  b.session = coreOta.session;
+  b.size    = coreOta.size;
+  b.chunks  = coreOta.chunks;
+  memcpy(b.sha256, coreOta.sha, 32);
+  return esp_now_send(coreOta.mac, (uint8_t*)&b, sizeof(b)) == ESP_OK;
+}
+
+// Returns false if the chunk could not be sent right now (retry next tick).
+static bool coreOtaSendChunk(uint16_t seq) {
+  pig_ota_data_t d;
+  memcpy(d.magic, JCMK_MAGIC, 4);
+  d.type    = PIG_MSG_OTA_DATA;
+  d.session = coreOta.session;
+  d.seq     = seq;
+  uint32_t off = (uint32_t)seq * PIG_OTA_CHUNK;
+  uint32_t n   = coreOta.size - off;
+  if (n > PIG_OTA_CHUNK) n = PIG_OTA_CHUNK;
+  memcpy(d.data, coreOta.image + off, n);
+  d.len = (uint8_t)n;
+  return esp_now_send(coreOta.mac, (uint8_t*)&d, offsetof(pig_ota_data_t, data) + n) == ESP_OK;
+}
+
+static const char* coreOtaErrText(uint8_t st) {
+  switch (st) {
+    case PIG_OTA_ST_ERR_SPACE: return "NODE HAS NO OTA SLOT";   // old flash layout: needs one reflash
+    case PIG_OTA_ST_ERR_WRITE: return "NODE FLASH WRITE ERR";
+    case PIG_OTA_ST_ERR_SHA:   return "NODE: SHA MISMATCH";
+    default:                   return "NODE REJECTED UPDATE";
+  }
+}
+
+// Called every coreModeTick(). No-op unless a transfer is pending/active.
+static void coreOtaTick() {
+  uint32_t now = millis();
+  if (!coreOtaBusy()) {
+    if ((coreOta.phase == CoreOtaPhase::Done || coreOta.phase == CoreOtaPhase::Failed) &&
+        now - coreOta.endMs > CORE_OTA_RESULT_SHOW_MS) {
+      coreOta.phase = CoreOtaPhase::Idle;
+      coreOta.node  = -1;
+    }
+    return;
+  }
+  if (coreOta.node < 0 || !coreNodes[coreOta.node].active) {
+    coreOtaClose(CoreOtaPhase::Failed, "NODE LOST");
+    return;
+  }
+
+  switch (coreOta.phase) {
+    case CoreOtaPhase::Starting:
+      if (coreOtaFinalStat != 0xFF && coreOtaFinalStat != PIG_OTA_ST_DONE) {
+        coreOtaClose(CoreOtaPhase::Failed, coreOtaErrText(coreOtaFinalStat));
+      } else if (coreOtaGotReady) {
+        coreOta.phase = CoreOtaPhase::Sending;
+        coreOta.base = coreOta.nextSend = 0;
+        coreOta.ackMs = coreOta.progressMs = now;
+        Serial.println("[OTA] node ready — sending image");
+      } else if (now - coreOta.startMs > CORE_OTA_START_TIMEOUT_MS) {
+        coreOtaClose(CoreOtaPhase::Failed, "NODE DID NOT REPLY");
+      } else if (coreOta.lastBeginMs == 0 || now - coreOta.lastBeginMs >= CORE_OTA_BEGIN_RETRY_MS) {
+        coreOta.lastBeginMs = now;
+        coreOtaSendBegin();
+      }
+      break;
+
+    case CoreOtaPhase::Sending: {
+      uint8_t fin = coreOtaFinalStat;
+      if (fin == PIG_OTA_ST_DONE) { coreOta.base = coreOta.chunks; coreOtaClose(CoreOtaPhase::Done, "UPDATED - REBOOTING"); return; }
+      if (fin != 0xFF)            { coreOtaClose(CoreOtaPhase::Failed, coreOtaErrText(fin)); return; }
+
+      uint16_t acked = coreOtaAckNext;
+      if (acked > coreOta.chunks) acked = coreOta.chunks;
+      if (acked > coreOta.base) { coreOta.base = acked; coreOta.ackMs = coreOta.progressMs = now; }
+      if (coreOta.nextSend < coreOta.base) coreOta.nextSend = coreOta.base;
+
+      if (now - coreOta.progressMs > CORE_OTA_STALL_MS) { coreOtaClose(CoreOtaPhase::Failed, "TRANSFER STALLED"); return; }
+      // Lost frame or ack: go back to the first unacknowledged chunk.
+      if (coreOta.nextSend > coreOta.base && now - coreOta.ackMs > CORE_OTA_ACK_TIMEOUT_MS) {
+        coreOta.nextSend = coreOta.base;
+        coreOta.ackMs    = now;
+      }
+      while (coreOta.nextSend < coreOta.chunks && coreOta.nextSend < (uint16_t)(coreOta.base + PIG_OTA_WINDOW)) {
+        if (!coreOtaSendChunk(coreOta.nextSend)) break;   // busy radio -> retry next tick
+        coreOta.nextSend++;
+      }
+      break;
+    }
+    default: break;
+  }
+}
+
+// ================================================================
+//  On-device "Update Nodes through Core?" prompt (XIAO nodes) and
+//  automatic push to out-of-date headless PigletNode nodes
+//  (cfg.autoUpdateHeadlessNodes). Both share the single-transfer-at-a-time
+//  coreOta engine above; neither ever starts a push while coreOtaBusy().
+//  Rendered by drawPageMeshNode() below; the mesh-page button handler in
+//  pollButton() calls coreUpdatePromptConfirm() when a press should be
+//  treated as "confirm" (gated on coreUpdatePromptStatus().promptActive).
+// ================================================================
+static const uint32_t CORE_UPDATE_PROMPT_MS = 30000;  // confirm window
+static uint8_t  pendingUpdateNodes[CORE_MAX_NODES];
+static uint8_t  pendingUpdateCount  = 0;
+static bool     updatePromptActive  = false;
+static uint32_t updatePromptStartMs = 0;
+static int8_t   updateExecutingPos  = -1;  // index into pendingUpdateNodes[], -1 = not executing
+
+static bool coreUpdateAlreadyQueued(uint8_t nodeIdx) {
+  for (uint8_t i = 0; i < pendingUpdateCount; i++) if (pendingUpdateNodes[i] == nodeIdx) return true;
+  return false;
+}
+
+// Scans the roster for newly-mismatched XIAO nodes (queued for the on-screen
+// prompt) and headless PigletNode auto-push candidates (pushed immediately,
+// no prompt -- PigletNode has no UI of its own). Called every coreModeTick().
+static void coreUpdateDetect() {
+  for (uint8_t i = 0; i < CORE_MAX_NODES; i++) {
+    CoreNodeInfo& n = coreNodes[i];
+    if (!n.active || !n.isPiglet || n.version[0] == '\0') continue;  // unknown version -> never flagged
+    if (strncmp(n.version, FIRMWARE_VERSION, sizeof(n.version)) == 0) continue;  // matches Core -- fine
+
+    if (n.boardType == PIGLET_BOARD_XIAO) {
+      if (n.updateDeclined || coreUpdateAlreadyQueued(i)) continue;
+      if (!coreOtaHasImage(PIGLET_BOARD_XIAO)) continue;
+      if (pendingUpdateCount < CORE_MAX_NODES) pendingUpdateNodes[pendingUpdateCount++] = i;
+    } else if (n.boardType == PIGLET_BOARD_NODE && cfg.autoUpdateHeadlessNodes) {
+      if (n.autoUpdateAttempted || coreOtaBusy()) continue;
+      if (!coreOtaHasImage(PIGLET_BOARD_NODE)) continue;
+      n.autoUpdateAttempted = true;  // set before starting -- never retry-loop a failing node
+      Serial.printf("[CORE] Auto-updating headless node %d (%s -> %s)\n", i, n.version, FIRMWARE_VERSION);
+      coreOtaStart(i);
+    }
+  }
+}
+
+// Drives the 30 s confirm window and, once confirmed, steps the queue one
+// node at a time through the shared coreOta engine. Called every
+// coreModeTick(), after coreOtaTick() so a just-finished push is reflected
+// immediately. A no-op whenever there's nothing pending/executing.
+static void coreUpdateProcessTick() {
+  uint32_t now = millis();
+
+  if (updateExecutingPos >= 0) {
+    if (coreOtaBusy()) return;  // still sending (or just started) -- wait
+    updateExecutingPos++;
+    if (updateExecutingPos >= (int)pendingUpdateCount) {
+      pendingUpdateCount = 0;
+      updateExecutingPos = -1;
+    } else {
+      coreOtaStart(pendingUpdateNodes[updateExecutingPos]);
+    }
+    return;
+  }
+
+  if (updatePromptActive) {
+    if (now - updatePromptStartMs >= CORE_UPDATE_PROMPT_MS) {
+      for (uint8_t i = 0; i < pendingUpdateCount; i++) {
+        uint8_t idx = pendingUpdateNodes[i];
+        if (idx < CORE_MAX_NODES) coreNodes[idx].updateDeclined = true;
+      }
+      pendingUpdateCount = 0;
+      updatePromptActive = false;
+    }
+    return;
+  }
+
+  if (pendingUpdateCount > 0 && !coreOtaBusy()) {
+    updatePromptActive  = true;
+    updatePromptStartMs = now;
+  }
+}
+
+static CoreUpdatePromptStatus coreUpdatePromptStatus() {
+  CoreUpdatePromptStatus st = {};
+  st.promptActive = updatePromptActive;
+  st.promptRemainingMs = updatePromptActive
+    ? (uint32_t)(CORE_UPDATE_PROMPT_MS - (millis() - updatePromptStartMs)) : 0;
+  st.pendingCount = pendingUpdateCount;
+  st.pushActive   = coreOtaBusy();
+  CoreOtaStatus ota = coreOtaStatus();
+  st.pushNodeIdx  = (ota.nodeIdx >= 0) ? (uint8_t)ota.nodeIdx : 0;  // valid only when pushActive
+  return st;
+}
+
+// Called from the mesh-page button handler when a press lands while
+// coreUpdatePromptStatus().promptActive is true.
+static void coreUpdatePromptConfirm() {
+  if (!updatePromptActive || pendingUpdateCount == 0) return;
+  updatePromptActive = false;
+  updateExecutingPos = 0;
+  coreOtaStart(pendingUpdateNodes[0]);
+}
+
 // ESP-Now receive callback — handles both Node and Core roles
 static void jcmkOnRecv(const esp_now_recv_info_t* info,
                         const uint8_t* data, int len) {
@@ -2862,6 +3514,8 @@ static void jcmkOnRecv(const esp_now_recv_info_t* info,
         memcpy(coreReqBuf[coreReqTail].mac, info->src_addr, 6);
         coreReqBuf[coreReqTail].isBiscuit = (len >= (int)sizeof(jcmk_text_msg_t));
         coreReqBuf[coreReqTail].isPiglet  = jcmkHasPigletMarker(data, len);
+        coreReqBuf[coreReqTail].boardType = jcmkGetPigletBoardType(data, len);
+        jcmkGetPigletVersion(data, len, coreReqBuf[coreReqTail].version);
         coreReqTail = next;
       }
     } else if (type == JCMK_MSG_TEXT && len >= 11) {
@@ -2890,7 +3544,9 @@ static void jcmkOnRecv(const esp_now_recv_info_t* info,
             coreReqBuf[coreReqTail].isBiscuit = (len >= (int)sizeof(jcmk_text_msg_t));
             // TEXT carries scan-line data, not the marker -- conservatively
             // treat as non-Piglet until the node's next heartbeat.
-            coreReqBuf[coreReqTail].isPiglet = false;
+            coreReqBuf[coreReqTail].isPiglet  = false;
+            coreReqBuf[coreReqTail].boardType = PIGLET_BOARD_UNKNOWN;
+            coreReqBuf[coreReqTail].version[0] = '\0';
             coreReqTail = nxt;
           }
         }
@@ -2901,6 +3557,11 @@ static void jcmkOnRecv(const esp_now_recv_info_t* info,
       for (uint8_t i = 0; i < CORE_MAX_NODES; i++) {
         if (coreNodes[i].active && memcmp(coreNodes[i].mac, info->src_addr, 6) == 0) {
           coreNodes[i].lastHbMs = millis();
+          // Refresh version directly here (ISR-safe memcpy, no flash/SD
+          // access) -- a node that was just pushed a firmware update and
+          // rebooted needs this to clear the mismatch on its very next
+          // heartbeat, not just at (re)registration time.
+          jcmkGetPigletVersion(data, len, coreNodes[i].version);
           found = true; break;
         }
       }
@@ -2910,9 +3571,13 @@ static void jcmkOnRecv(const esp_now_recv_info_t* info,
           memcpy(coreReqBuf[coreReqTail].mac, info->src_addr, 6);
           coreReqBuf[coreReqTail].isBiscuit = (len >= (int)sizeof(jcmk_text_msg_t));
           coreReqBuf[coreReqTail].isPiglet  = jcmkHasPigletMarker(data, len);
+          coreReqBuf[coreReqTail].boardType = jcmkGetPigletBoardType(data, len);
+          jcmkGetPigletVersion(data, len, coreReqBuf[coreReqTail].version);
           coreReqTail = nxt;
         }
       }
+    } else if (type == PIG_MSG_OTA_ACK) {
+      coreOtaOnAck(info->src_addr, data, len);
     }
   } else {
     if (type == JCMK_MSG_CORE_REPLY && !jcmkHaveCore && !jcmkCoreFoundPending) {
@@ -2955,16 +3620,188 @@ static void jcmkOnRecv(const esp_now_recv_info_t* info,
         jcmkSlotIndex = adm->node_index;
         jcmkSlotCount = (adm->node_count > 0) ? adm->node_count : 1;
       }
+    } else if (type == PIG_MSG_OTA_BEGIN && jcmkHaveCore && memcmp(info->src_addr, jcmkCoreMac, 6) == 0
+               && len >= (int)sizeof(pig_ota_begin_t)) {
+      // ---- Core wants to update us. Queue it for the loop; never touch flash from here.
+      if (!nodeOtaBeginPending) { memcpy(&nodeOtaBeginMsg, data, sizeof(nodeOtaBeginMsg)); nodeOtaBeginPending = true; }
+    } else if (type == PIG_MSG_OTA_DATA && nodeOtaActive && jcmkHaveCore
+               && memcmp(info->src_addr, jcmkCoreMac, 6) == 0
+               && len > (int)offsetof(pig_ota_data_t, data)) {
+      const pig_ota_data_t* d = (const pig_ota_data_t*)data;
+      if (d->session == nodeOtaSession && d->len >= 1 && d->len <= PIG_OTA_CHUNK
+          && len >= (int)offsetof(pig_ota_data_t, data) + (int)d->len) {
+        if (d->seq == nodeOtaQNext) {
+          uint8_t nh = (uint8_t)((nodeOtaQHead + 1) % NODE_OTA_QDEPTH);
+          if (nh != nodeOtaQTail) {
+            nodeOtaQ[nodeOtaQHead].len = d->len;
+            memcpy(nodeOtaQ[nodeOtaQHead].data, d->data, d->len);
+            nodeOtaQHead = nh;
+            nodeOtaQNext++;
+          }
+        } else {
+          nodeOtaReack = true;   // stale or out-of-order: tell the Core where we are
+        }
+      }
     }
   }
 }
 
+// Forward declaration -- defined further down this file; meshChOverrideSet()/
+// meshChOverrideClear() below need to re-apply channel assignments immediately.
+static void coreReassignChannels();
+
+// ================================================================
+//  Manual per-node channel-range override (Web UI)
+//  Lets an operator pin a specific node (matched by MAC) to a fixed channel
+//  range instead of the automatic even split in coreReassignChannels() --
+//  e.g. a node with a directional antenna aimed at a specific band. Persisted
+//  to /mesh_channel_overrides.cfg so it survives a reboot; loaded once in
+//  enterCoreMode(). chStart/chEnd are actual channel numbers (e.g. 1, 149),
+//  not JCMK_CHANNELS[] indices -- both must exactly match an entry in
+//  JCMK_CHANNELS[] or the call fails.
+// ================================================================
+#define MESH_CHOVR_MAX CORE_MAX_NODES
+struct MeshChanOverride { uint8_t mac[6]; uint8_t startIdx; uint8_t endIdx; };
+static MeshChanOverride meshChOverrides[MESH_CHOVR_MAX];
+static uint8_t          meshChOverrideCount = 0;
+static const char*      MESH_CHOVR_PATH = "/mesh_channel_overrides.cfg";
+
+static bool meshChannelToIndex(int channel, uint8_t& idxOut) {
+  for (uint8_t i = 0; i < JCMK_NUM_CHANNELS; i++) {
+    if (JCMK_CHANNELS[i] == channel) { idxOut = i; return true; }
+  }
+  return false;
+}
+
+static bool meshMacParse(const String& s, uint8_t* macOut) {
+  unsigned int v[6];
+  if (sscanf(s.c_str(), "%x:%x:%x:%x:%x:%x", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) != 6) return false;
+  for (int i = 0; i < 6; i++) macOut[i] = (uint8_t)v[i];
+  return true;
+}
+
+static void meshChOverrideSave() {
+  if (!sdOk) return;
+  digitalWrite(PINS.tft_cs, HIGH);
+  if (SD.exists(MESH_CHOVR_PATH)) SD.remove(MESH_CHOVR_PATH);
+  File f = SD.open(MESH_CHOVR_PATH, FILE_WRITE);
+  if (!f) return;
+  f.println("# Manual mesh channel overrides: MAC,startChannel,endChannel");
+  for (uint8_t i = 0; i < meshChOverrideCount; i++) {
+    MeshChanOverride& o = meshChOverrides[i];
+    char line[40];
+    snprintf(line, sizeof(line), "%02X:%02X:%02X:%02X:%02X:%02X,%d,%d",
+      o.mac[0], o.mac[1], o.mac[2], o.mac[3], o.mac[4], o.mac[5],
+      JCMK_CHANNELS[o.startIdx], JCMK_CHANNELS[o.endIdx]);
+    f.println(line);
+  }
+  f.close();
+}
+
+// Call once from enterCoreMode() -- populates the in-memory table from SD.
+static void meshChOverrideLoad() {
+  meshChOverrideCount = 0;
+  if (!sdOk) return;
+  digitalWrite(PINS.tft_cs, HIGH);
+  if (!SD.exists(MESH_CHOVR_PATH)) return;
+  File f = SD.open(MESH_CHOVR_PATH, FILE_READ);
+  if (!f) return;
+  while (f.available() && meshChOverrideCount < MESH_CHOVR_MAX) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0 || line[0] == '#') continue;
+    int c1 = line.indexOf(',');
+    int c2 = (c1 >= 0) ? line.indexOf(',', c1 + 1) : -1;
+    if (c1 < 0 || c2 < 0) continue;
+    uint8_t mac[6];
+    if (!meshMacParse(line.substring(0, c1), mac)) continue;
+    uint8_t si, ei;
+    int chStart = line.substring(c1 + 1, c2).toInt();
+    int chEnd   = line.substring(c2 + 1).toInt();
+    if (!meshChannelToIndex(chStart, si) || !meshChannelToIndex(chEnd, ei)) continue;
+    if (ei < si) { uint8_t t = si; si = ei; ei = t; }
+    memcpy(meshChOverrides[meshChOverrideCount].mac, mac, 6);
+    meshChOverrides[meshChOverrideCount].startIdx = si;
+    meshChOverrides[meshChOverrideCount].endIdx   = ei;
+    meshChOverrideCount++;
+  }
+  f.close();
+  Serial.printf("[CORE] Loaded %d channel override(s)\n", (int)meshChOverrideCount);
+}
+
+static bool meshChOverrideFind(const uint8_t* mac, uint8_t& startIdx, uint8_t& endIdx) {
+  for (uint8_t i = 0; i < meshChOverrideCount; i++) {
+    if (memcmp(meshChOverrides[i].mac, mac, 6) == 0) {
+      startIdx = meshChOverrides[i].startIdx;
+      endIdx   = meshChOverrides[i].endIdx;
+      return true;
+    }
+  }
+  return false;
+}
+
+// ---- Public API, used by the Web UI handlers further down ----
+static uint8_t meshChOverrideGetCount() { return meshChOverrideCount; }
+
+static bool meshChOverrideGetAt(uint8_t idx, uint8_t* macOut, uint16_t& chStartOut, uint16_t& chEndOut) {
+  if (idx >= meshChOverrideCount) return false;
+  memcpy(macOut, meshChOverrides[idx].mac, 6);
+  chStartOut = JCMK_CHANNELS[meshChOverrides[idx].startIdx];
+  chEndOut   = JCMK_CHANNELS[meshChOverrides[idx].endIdx];
+  return true;
+}
+
+static bool meshChOverrideSet(const uint8_t* mac, int chStart, int chEnd) {
+  uint8_t si, ei;
+  if (!meshChannelToIndex(chStart, si) || !meshChannelToIndex(chEnd, ei)) return false;
+  if (ei < si) { uint8_t t = si; si = ei; ei = t; }
+  for (uint8_t i = 0; i < meshChOverrideCount; i++) {
+    if (memcmp(meshChOverrides[i].mac, mac, 6) == 0) {
+      meshChOverrides[i].startIdx = si;
+      meshChOverrides[i].endIdx   = ei;
+      meshChOverrideSave();
+      if (meshCoreActive) coreReassignChannels();
+      return true;
+    }
+  }
+  if (meshChOverrideCount >= MESH_CHOVR_MAX) return false;
+  memcpy(meshChOverrides[meshChOverrideCount].mac, mac, 6);
+  meshChOverrides[meshChOverrideCount].startIdx = si;
+  meshChOverrides[meshChOverrideCount].endIdx   = ei;
+  meshChOverrideCount++;
+  meshChOverrideSave();
+  if (meshCoreActive) coreReassignChannels();
+  return true;
+}
+
+static bool meshChOverrideClear(const uint8_t* mac) {
+  for (uint8_t i = 0; i < meshChOverrideCount; i++) {
+    if (memcmp(meshChOverrides[i].mac, mac, 6) == 0) {
+      for (uint8_t j = i; j < meshChOverrideCount - 1; j++) meshChOverrides[j] = meshChOverrides[j + 1];
+      meshChOverrideCount--;
+      meshChOverrideSave();
+      if (meshCoreActive) coreReassignChannels();
+      return true;
+    }
+  }
+  return false;
+}
+
 // ---- Core mode helpers (main loop only) ----
-static void coreFindOrAddNode(const uint8_t* mac, bool isBiscuit, bool isPiglet) {
+static void coreFindOrAddNode(const uint8_t* mac, bool isBiscuit, bool isPiglet, uint8_t boardType, const char* version) {
   for (uint8_t i = 0; i < CORE_MAX_NODES; i++) {
     if (coreNodes[i].active && memcmp(coreNodes[i].mac, mac, 6) == 0) {
       coreNodes[i].lastHbMs = millis();
       if (isPiglet) coreNodes[i].isPiglet = true;  // never downgrade once confirmed
+      if (coreNodes[i].boardType == PIGLET_BOARD_UNKNOWN) coreNodes[i].boardType = boardType;
+      // A changed version (e.g. just pushed a firmware update and rebooted)
+      // needs a fresh mismatch evaluation -- clear any stale decline/attempt.
+      if (version[0] && strncmp(coreNodes[i].version, version, sizeof(coreNodes[i].version)) != 0) {
+        strncpy(coreNodes[i].version, version, sizeof(coreNodes[i].version) - 1);
+        coreNodes[i].version[sizeof(coreNodes[i].version) - 1] = '\0';
+        coreNodes[i].updateDeclined      = false;
+        coreNodes[i].autoUpdateAttempted = false;
+      }
       return;
     }
   }
@@ -2973,6 +3810,11 @@ static void coreFindOrAddNode(const uint8_t* mac, bool isBiscuit, bool isPiglet)
       coreNodes[i].active = true; coreNodes[i].lastHbMs = millis();
       coreNodes[i].recordsRx = 0; coreNodes[i].isBiscuit = isBiscuit;
       coreNodes[i].isPiglet = isPiglet; coreNodes[i].slotIndex = 0;
+      coreNodes[i].boardType = boardType;
+      strncpy(coreNodes[i].version, version, sizeof(coreNodes[i].version) - 1);
+      coreNodes[i].version[sizeof(coreNodes[i].version) - 1] = '\0';
+      coreNodes[i].updateDeclined      = false;
+      coreNodes[i].autoUpdateAttempted = false;
       memcpy(coreNodes[i].mac, mac, 6);
       coreNodeCount++; jcmkAddPeer(mac);
       // Re-send CORE_REPLY now that the peer is registered.
@@ -2994,6 +3836,17 @@ static void coreReassignChannels() {
     coreNodes[slots[n]].startIdx = startIdx;
     coreNodes[slots[n]].endIdx   = (n < count-1) ? (startIdx+perNode-1) : (JCMK_NUM_CHANNELS-1);
     startIdx += perNode;
+  }
+
+  // Manual overrides win over the even split for any matching MAC -- applied
+  // after the split so an overridden node's range doesn't skew how the
+  // remaining channels are divided among everyone else.
+  for (uint8_t n = 0; n < count; n++) {
+    uint8_t si, ei;
+    if (meshChOverrideFind(coreNodes[slots[n]].mac, si, ei)) {
+      coreNodes[slots[n]].startIdx = si;
+      coreNodes[slots[n]].endIdx   = ei;
+    }
   }
   coreAssignVer++;
 
@@ -3101,6 +3954,7 @@ static void enterCoreMode() {
   coreAssignVer=0; coreHbCounter=0; coreLastHbMs=0;
   coreReqHead=coreReqTail=0; coreTextHead=coreTextTail=0;
   memset(coreNodes, 0, sizeof(coreNodes));
+  meshChOverrideLoad();
   // Mesh mode owns the WiFi stack — prevent stopAPIfAllowed() from firing
   // WiFi.disconnect(true,true) after esp_now_init() would kill the ESP-Now driver.
   apWindowActive = false;
@@ -3167,7 +4021,7 @@ static void coreModeTick() {
 
   while (coreReqHead!=coreReqTail) {
     uint8_t i=coreReqHead; coreReqHead=(coreReqHead+1)%CORE_REQ_QUEUE;
-    coreFindOrAddNode(coreReqBuf[i].mac, coreReqBuf[i].isBiscuit, coreReqBuf[i].isPiglet);
+    coreFindOrAddNode(coreReqBuf[i].mac, coreReqBuf[i].isBiscuit, coreReqBuf[i].isPiglet, coreReqBuf[i].boardType, coreReqBuf[i].version);
     coreReassignChannels();
   }
   while (coreTextHead!=coreTextTail) {
@@ -3177,6 +4031,14 @@ static void coreModeTick() {
   // Fold this window's per-channel hit counts into the yield EWMA (no-op
   // between 4s windows) -- see core5gStat / coreSendBiscuitRoleAndConfig.
   coreYieldUpdate(now);
+  // Drive any in-flight push of firmware to a connected node (no-op unless
+  // coreOtaStart() has armed one) -- see the Core-side OTA engine above.
+  coreOtaTick();
+  // Queue newly-mismatched nodes for the on-device update prompt / headless
+  // auto-push, then advance the prompt countdown and step the confirmed
+  // queue through coreOtaStart() one node at a time.
+  coreUpdateDetect();
+  coreUpdateProcessTick();
   // Heartbeat + ADMIN refresh — nodes that missed the ADMIN while scanning recover here.
   if (now-coreLastHbMs>=CORE_HB_MS) { coreLastHbMs=now; coreSendHeartbeatToAll(); coreResendAdminToAll(); }
   bool changed=false;
@@ -3526,7 +4388,12 @@ static void nodeModeTick() {
   // coordinator can still be picked up later without needing a restart.
   // jcmkPigletSlotTick() only ever acts for confirmed-Piglet pairings, and
   // only in the gap between scans, so it never affects scan timing itself.
-  if (jcmkHaveCore || cfg.wardriveGoBridge) {
+  // Drive any in-flight firmware push from a Piglet/XIAO Core (no-op unless
+  // one is pending/active) -- see the Node-side OTA receiver above. Scanning
+  // is paused for the duration (nodeOtaStart() parks the radio on ch 6).
+  nodeOtaTick();
+
+  if ((jcmkHaveCore || cfg.wardriveGoBridge) && !nodeOtaActive) {
     jcmkPigletSlotTick();
     nodeDoScanTick();
   }
@@ -3569,6 +4436,60 @@ static void drawPageMeshNode() {
   int W = tft.width();
 
   if (meshCoreActive) {
+    CoreUpdatePromptStatus ups = coreUpdatePromptStatus();
+    if (ups.promptActive || ups.pushActive) {
+      // A pending node-firmware mismatch takes over the whole page -- this
+      // replaces the normal Core status layout rather than overlaying it.
+      // The mesh-page button handler (pollButton()) consumes a press as
+      // confirm while ups.promptActive, instead of advancing the page.
+      pageNeedsInit[4] = true;  // force a clean redraw once the overlay ends
+      tft.fillScreen(BLACK);
+      tft.setTextColor(WHITE, BLACK); tft.setTextSize(1);
+      tft.setCursor(2, 2);
+      tft.print(ups.pushActive ? "Updating Node" : "Update Node?");
+      tft.drawFastHLine(0, 12, W, WHITE);
+
+      uint8_t idx = ups.pushActive ? ups.pushNodeIdx : pendingUpdateNodes[0];
+      tft.setCursor(2, 18);
+      if (idx < CORE_MAX_NODES && coreNodes[idx].active) {
+        uint8_t* m = coreNodes[idx].mac;
+        char buf[18];
+        snprintf(buf, sizeof(buf), "%02X:%02X:%02X:%02X:%02X:%02X",
+                 m[0], m[1], m[2], m[3], m[4], m[5]);
+        tft.print(buf);
+      } else {
+        tft.print("--:--:--:--:--:--");
+      }
+
+      if (!ups.pushActive && ups.pendingCount > 1) {
+        // Accurate only before a push starts -- pendingCount is the whole
+        // batch, not a "remaining" count, so it's not shown mid-push.
+        tft.setCursor(2, 30);
+        char qb[20]; snprintf(qb, sizeof(qb), "+%d more queued", ups.pendingCount - 1);
+        tft.print(qb);
+      }
+
+      if (ups.pushActive) {
+        CoreOtaStatus ota = coreOtaStatus();
+        tft.setCursor(2, 44);
+        tft.print("Updating...");
+        float pct = ota.totalBytes ? (float)ota.sentBytes / (float)ota.totalBytes : 0.0f;
+        int barW = W - 4;
+        tft.drawRect(2, 56, barW, 10, WHITE);
+        int fillW = (int)((barW - 2) * pct);
+        if (fillW > 0) tft.fillRect(3, 57, fillW, 8, COLOR_GREEN);
+      } else {
+        tft.setCursor(2, 44);
+        uint32_t secLeft = (ups.promptRemainingMs + 999) / 1000;
+        char cb[22]; snprintf(cb, sizeof(cb), "Press=Yes (%lus)", (unsigned long)secLeft);
+        tft.print(cb);
+        tft.setCursor(2, 58);
+        tft.setTextColor(0x4208, BLACK); tft.print("Ignore = Skip");
+        tft.setTextColor(WHITE, BLACK);
+      }
+      return;
+    }
+
     // ---- Core mode ----
     if (pageNeedsInit[4]) {
       pageNeedsInit[4] = false;
@@ -3829,6 +4750,7 @@ static void handleStatus() {
   c["rotateScreen180"] = cfg.rotateScreen180;
   c["uploadOnNetworkSeen"] = cfg.uploadOnNetworkSeen;
   c["wardriveGoBridge"] = cfg.wardriveGoBridge;
+  c["autoUpdateHeadlessNodes"] = cfg.autoUpdateHeadlessNodes;
   for (int i = 0; i < 10; i++) {
     c[String("ssidWhitelist") + String(i + 1)] = cfg.ssidWhitelist[i];
   }
@@ -4236,6 +5158,541 @@ static void handleDownloadAll() {
   cl.write((const uint8_t*)"0\r\n\r\n", 5);
 }
 
+// ================================================================
+//  Mesh Nodes (Core-pushed OTA to connected nodes) -- Web UI endpoints
+// ================================================================
+static const char* meshBoardTypeLabel(uint8_t bt) {
+  switch (bt) {
+    case PIGLET_BOARD_NODE:    return "PigletNode";
+    case PIGLET_BOARD_XIAO:    return "Piglet";
+    case PIGLET_BOARD_TDONGLE: return "TDongleC5_Piglet";
+    default:                   return "Unknown";
+  }
+}
+
+static void handleMeshNodes() {
+  DynamicJsonDocument doc(2048);
+  doc["coreActive"] = meshCoreActive;
+
+  JsonArray arr = doc.createNestedArray("nodes");
+  if (meshCoreActive) {
+    uint32_t now = millis();
+    for (uint8_t i = 0; i < CORE_MAX_NODES; i++) {
+      if (!coreNodes[i].active) continue;
+      JsonObject o = arr.createNestedObject();
+      char macStr[18];
+      snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
+               coreNodes[i].mac[0], coreNodes[i].mac[1], coreNodes[i].mac[2],
+               coreNodes[i].mac[3], coreNodes[i].mac[4], coreNodes[i].mac[5]);
+      o["idx"]           = i;
+      o["mac"]           = macStr;
+      o["boardType"]     = coreNodes[i].boardType;
+      o["board"]         = meshBoardTypeLabel(coreNodes[i].boardType);
+      o["isPiglet"]      = coreNodes[i].isPiglet;
+      o["isBiscuit"]     = coreNodes[i].isBiscuit;
+      o["recordsRx"]     = coreNodes[i].recordsRx;
+      o["lastSeenMsAgo"] = now - coreNodes[i].lastHbMs;
+    }
+  }
+
+  CoreOtaStatus st = coreOtaStatus();
+  JsonObject ota = doc.createNestedObject("ota");
+  ota["phase"]      = (int)st.phase;
+  ota["nodeIdx"]    = st.nodeIdx;
+  ota["sentBytes"]  = st.sentBytes;
+  ota["totalBytes"] = st.totalBytes;
+  ota["msg"]        = st.msg;
+  ota["loadMsg"]    = st.loadMsg;
+
+  String out;
+  serializeJson(doc, out);
+  server.send(200, "application/json", out);
+}
+
+static void handleMeshOtaStart() {
+  if (!meshCoreActive) { server.send(400, "text/plain", "Not in Core mode"); return; }
+  if (!server.hasArg("idx")) { server.send(400, "text/plain", "Missing idx"); return; }
+
+  uint8_t idx = (uint8_t)server.arg("idx").toInt();
+  bool ok = coreOtaStart(idx);
+  CoreOtaStatus st = coreOtaStatus();
+
+  DynamicJsonDocument doc(256);
+  doc["ok"]  = ok;
+  doc["msg"] = st.msg;
+
+  String out;
+  serializeJson(doc, out);
+  server.send(ok ? 200 : 400, "application/json", out);
+}
+
+static void handleMeshOtaCancel() {
+  coreOtaAbort();
+  server.send(200, "text/plain", "OK");
+}
+
+// ================================================================
+//  Firmware Update (self-update from GitHub Releases)
+//  Checks https://api.github.com/repos/Hamspiced/piglet/releases/latest for
+//  a newer FIRMWARE_VERSION and, on a Web UI button click, downloads and
+//  flashes this board's own release asset via Update.h. The other two
+//  boards' assets are staged into /Firmware/ on the SD card in the same
+//  pass, so the mesh Core-push OTA engine above can push them to connected
+//  nodes without the operator ever touching an SD card.
+// ================================================================
+static const char* FW_OWN_ASSET = "TDongleC5_Piglet.ota.bin";
+static const char* FW_OTHER_ASSETS[] = { "Piglet.ota.bin", "PigletNode.ota.bin" };
+static const int   FW_OTHER_ASSET_COUNT = 2;
+static const int   FW_NODE_ASSET_IDX = 1;  // index of "PigletNode.ota.bin" within FW_OTHER_ASSETS[]
+
+static const char* GITHUB_API_HOST = "api.github.com";
+static const char* GITHUB_API_PATH = "/repos/Hamspiced/piglet/releases/latest";
+
+static bool     fwUpdateChecked = false;
+static bool     fwUpdateAvailable = false;
+static String   fwAvailableVersion = "";
+static String   fwReleaseNotes = "";
+static bool     fwInstalling = false;
+static String   fwInstallStage = "";
+static uint32_t fwInstallDownloadedBytes = 0;
+static uint32_t fwInstallTotalBytes = 0;
+static String   fwInstallError = "";
+
+static bool     fwStagingNode = false;
+static String   fwStageNodeError = "";
+
+static String fwOwnAssetUrl;
+static String fwOtherAssetUrls[FW_OTHER_ASSET_COUNT];
+
+// Parses "vMAJOR.MINOR" (or "MAJOR.MINOR", with/without a leading 'v') into
+// a comparable (major, minor) pair -- numeric, not lexical, so e.g. "v2.9"
+// correctly compares as older than "v2.10".
+static void fwParseVersion(const String& verIn, int& major, int& minor) {
+  String v = verIn;
+  v.trim();
+  if (v.length() && (v[0] == 'v' || v[0] == 'V')) v = v.substring(1);
+  int dot = v.indexOf('.');
+  if (dot < 0) { major = v.toInt(); minor = 0; }
+  else { major = v.substring(0, dot).toInt(); minor = v.substring(dot + 1).toInt(); }
+}
+
+static bool fwIsNewer(const String& latest, const String& current) {
+  int lMaj, lMin, cMaj, cMin;
+  fwParseVersion(latest, lMaj, lMin);
+  fwParseVersion(current, cMaj, cMin);
+  if (lMaj != cMaj) return lMaj > cMaj;
+  return lMin > cMin;
+}
+
+static void fwCheckForUpdate() {
+  fwUpdateChecked    = false;
+  fwUpdateAvailable  = false;
+  fwAvailableVersion = "";
+  fwReleaseNotes     = "";
+  fwOwnAssetUrl      = "";
+  for (int i = 0; i < FW_OTHER_ASSET_COUNT; i++) fwOtherAssetUrls[i] = "";
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[FWUPD] Skipped check (no STA WiFi)");
+    fwUpdateChecked = true;
+    return;
+  }
+
+  Serial.println("[FWUPD] Checking GitHub for a newer release...");
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.setTimeout(10000);
+  if (!http.begin(client, String("https://") + GITHUB_API_HOST + GITHUB_API_PATH)) {
+    Serial.println("[FWUPD] HTTP begin failed");
+    fwUpdateChecked = true;
+    return;
+  }
+  http.addHeader("User-Agent", "Piglet-Firmware");
+  http.addHeader("Accept", "application/vnd.github+json");
+
+  int code = http.GET();
+  if (code != HTTP_CODE_OK) {
+    Serial.printf("[FWUPD] GitHub API returned HTTP %d\n", code);
+    http.end();
+    fwUpdateChecked = true;
+    return;
+  }
+
+  DynamicJsonDocument filter(256);
+  filter["tag_name"] = true;
+  filter["body"]     = true;
+  JsonObject assetFilter = filter["assets"].add<JsonObject>();
+  assetFilter["name"] = true;
+  assetFilter["browser_download_url"] = true;
+
+  // GitHub's API serves this response with chunked transfer-encoding. The
+  // chunk-size framing bytes are only stripped by HTTPClient's own body
+  // readers (getString()/writeToStream()) -- reading the raw connection via
+  // getStream() exposes those framing bytes directly to the JSON parser,
+  // corrupting the parse (and was leaving the TLS connection in a state
+  // that could crash a later check). Buffering via getString() first avoids
+  // this; the filtered DynamicJsonDocument below still keeps actual parsed
+  // memory use small regardless of the raw body size.
+  String payload = http.getString();
+  http.end();
+
+  if (payload.length() == 0) {
+    Serial.println("[FWUPD] Empty response body");
+    fwUpdateChecked = true;
+    return;
+  }
+
+  DynamicJsonDocument doc(6144);
+  DeserializationError err =
+    deserializeJson(doc, payload, DeserializationOption::Filter(filter));
+
+  if (err) {
+    Serial.printf("[FWUPD] JSON parse failed: %s\n", err.c_str());
+    fwUpdateChecked = true;
+    return;
+  }
+
+  String tag = doc["tag_name"] | "";
+  if (tag.length() == 0) {
+    Serial.println("[FWUPD] No tag_name in response");
+    fwUpdateChecked = true;
+    return;
+  }
+
+  // Resolve every asset's download URL unconditionally -- even when this
+  // board is already on the latest release (!fwIsNewer() below). "Store
+  // Piglet Node Firmware" (Web UI) needs the PigletNode asset URL whether
+  // or not this board itself needs an update, so bailing out early here (as
+  // this used to do) would leave fwOtherAssetUrls[] empty and break that
+  // button on an up-to-date board.
+  for (JsonObject asset : doc["assets"].as<JsonArray>()) {
+    String name = asset["name"] | "";
+    String url  = asset["browser_download_url"] | "";
+    if (name == FW_OWN_ASSET) fwOwnAssetUrl = url;
+    for (int i = 0; i < FW_OTHER_ASSET_COUNT; i++) {
+      if (name == FW_OTHER_ASSETS[i]) fwOtherAssetUrls[i] = url;
+    }
+  }
+  String notes = doc["body"] | "";
+  fwReleaseNotes = notes.substring(0, 300);
+
+  if (!fwIsNewer(tag, FIRMWARE_VERSION)) {
+    Serial.printf("[FWUPD] Up to date (latest=%s, current=%s)\n", tag.c_str(), FIRMWARE_VERSION);
+    fwAvailableVersion = tag;  // still useful to show "Latest Available" even when not newer
+    fwUpdateChecked = true;
+    return;
+  }
+
+  if (fwOwnAssetUrl.length() == 0) {
+    Serial.println("[FWUPD] Newer release found but no matching asset for this board");
+    fwAvailableVersion = tag;
+    fwUpdateChecked = true;
+    return;
+  }
+
+  fwAvailableVersion = tag;
+  fwUpdateAvailable  = true;
+  fwUpdateChecked    = true;
+  Serial.printf("[FWUPD] Update available: %s -> %s\n", FIRMWARE_VERSION, fwAvailableVersion.c_str());
+}
+
+static bool fwDownloadAndFlashOwn() {
+  fwInstallStage = String("Downloading ") + FW_OWN_ASSET + "...";
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+  http.setTimeout(20000);
+  if (!http.begin(client, fwOwnAssetUrl)) { fwInstallError = "HTTP begin failed"; return false; }
+
+  int code = http.GET();
+  if (code != HTTP_CODE_OK) { fwInstallError = "HTTP " + String(code); http.end(); return false; }
+
+  int len = http.getSize();
+  if (len <= 0) { fwInstallError = "Unknown content length"; http.end(); return false; }
+  fwInstallTotalBytes      = (uint32_t)len;
+  fwInstallDownloadedBytes = 0;
+
+  if (!Update.begin((size_t)len, U_FLASH)) {
+    fwInstallError = String("Update.begin failed: ") + Update.errorString();
+    http.end();
+    return false;
+  }
+
+  WiFiClient* stream = http.getStreamPtr();
+  uint8_t buf[1024];
+  int remaining = len;
+  bool writeFailed = false;
+  while (http.connected() && remaining > 0) {
+    size_t avail = stream->available();
+    if (avail) {
+      int want = (int)((avail > sizeof(buf)) ? sizeof(buf) : avail);
+      int n = stream->readBytes(buf, want);
+      if (n <= 0) break;
+      if (Update.write(buf, n) != (size_t)n) { writeFailed = true; break; }
+      remaining -= n;
+      fwInstallDownloadedBytes += (uint32_t)n;
+    } else {
+      delay(2);
+    }
+    yield();
+  }
+  http.end();
+
+  if (writeFailed) { fwInstallError = "Flash write failed"; Update.abort(); return false; }
+  if (remaining > 0) { fwInstallError = "Download incomplete"; Update.abort(); return false; }
+  if (!Update.end(true)) { fwInstallError = String("Update.end failed: ") + Update.errorString(); return false; }
+  return true;
+}
+
+static bool fwDownloadToSD(const String& url, const String& destPath) {
+  if (url.length() == 0) return false;
+  if (!sdOk) return false;
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+  http.setTimeout(20000);
+  if (!http.begin(client, url)) return false;
+
+  int code = http.GET();
+  if (code != HTTP_CODE_OK) { http.end(); return false; }
+
+  int len = http.getSize();
+  if (len <= 0) { http.end(); return false; }
+
+  digitalWrite(PINS.tft_cs, HIGH);
+  if (!SD.exists("/Firmware")) SD.mkdir("/Firmware");
+  if (SD.exists(destPath)) SD.remove(destPath);  // delete before write
+
+  File f = SD.open(destPath, FILE_WRITE);
+  if (!f) { http.end(); return false; }
+
+  WiFiClient* stream = http.getStreamPtr();
+  uint8_t buf[1024];
+  int remaining = len;
+  bool ok = true;
+  while (http.connected() && remaining > 0) {
+    size_t avail = stream->available();
+    if (avail) {
+      int want = (int)((avail > sizeof(buf)) ? sizeof(buf) : avail);
+      int n = stream->readBytes(buf, want);
+      if (n <= 0) break;
+      if (f.write(buf, n) != (size_t)n) { ok = false; break; }
+      remaining -= n;
+    } else {
+      delay(2);
+    }
+    yield();
+  }
+  f.close();
+  http.end();
+
+  if (!ok || remaining > 0) { SD.remove(destPath); return false; }
+  return true;
+}
+
+static bool fwInstallUpdate() {
+  if (fwInstalling) return false;
+  if (!fwUpdateAvailable || fwOwnAssetUrl.length() == 0) { fwInstallError = "No update available"; return false; }
+  if (WiFi.status() != WL_CONNECTED) { fwInstallError = "STA WiFi not connected"; return false; }
+
+  fwInstalling             = true;
+  fwInstallError           = "";
+  fwInstallDownloadedBytes = 0;
+  fwInstallTotalBytes      = 0;
+
+  for (int i = 0; i < FW_OTHER_ASSET_COUNT; i++) {
+    fwInstallStage = String("Staging ") + FW_OTHER_ASSETS[i] + "...";
+    String dest = String("/Firmware/") + FW_OTHER_ASSETS[i];
+    bool ok = fwDownloadToSD(fwOtherAssetUrls[i], dest);
+    Serial.printf("[FWUPD] Stage %s: %s\n", FW_OTHER_ASSETS[i], ok ? "OK" : "skipped/failed");
+  }
+
+  bool ok = fwDownloadAndFlashOwn();
+  fwInstalling = false;
+  if (!ok) {
+    fwInstallStage = "Failed";
+    Serial.printf("[FWUPD] Install failed: %s\n", fwInstallError.c_str());
+    return false;
+  }
+
+  fwInstallStage = "Rebooting...";
+  Serial.println("[FWUPD] Flash OK -- restarting");
+  closeLogFile();
+  delay(500);
+  ESP.restart();
+  return true;  // unreached
+}
+
+static bool fwHasNodeAsset() {
+  return fwOtherAssetUrls[FW_NODE_ASSET_IDX].length() > 0;
+}
+
+// "Store Piglet Node Firmware": stages /Firmware/PigletNode.ota.bin from the
+// latest GitHub release so headless PigletNode nodes can be pushed updates
+// over ESP-NOW, independent of whether this board's own firmware is current.
+static bool fwStageNodeFirmware() {
+  if (fwStagingNode) return false;
+  if (WiFi.status() != WL_CONNECTED) {
+    fwStageNodeError = "STA WiFi not connected";
+    return false;
+  }
+
+  fwStagingNode    = true;
+  fwStageNodeError = "";
+
+  if (!fwHasNodeAsset()) {
+    // Not resolved yet -- e.g. this board is already on the latest release,
+    // so no Web UI "Check for Update" click has happened this session.
+    fwCheckForUpdate();
+  }
+
+  bool ok = false;
+  if (!fwHasNodeAsset()) {
+    fwStageNodeError = "PigletNode asset not found in latest release";
+  } else {
+    String dest = String("/Firmware/") + FW_OTHER_ASSETS[FW_NODE_ASSET_IDX];
+    ok = fwDownloadToSD(fwOtherAssetUrls[FW_NODE_ASSET_IDX], dest);
+    if (!ok) fwStageNodeError = "Download failed";
+  }
+
+  fwStagingNode = false;
+  Serial.printf("[FWUPD] Store Piglet Node Firmware: %s\n", ok ? "OK" : fwStageNodeError.c_str());
+  return ok;
+}
+
+static void handleUpdateStatus() {
+  DynamicJsonDocument doc(512);
+  doc["checked"]          = fwUpdateChecked;
+  doc["available"]        = fwUpdateAvailable;
+  doc["currentVersion"]   = FIRMWARE_VERSION;
+  doc["availableVersion"] = fwAvailableVersion;
+  doc["notes"]            = fwReleaseNotes;
+  doc["installing"]       = fwInstalling;
+  doc["stage"]            = fwInstallStage;
+  doc["downloadedBytes"]  = fwInstallDownloadedBytes;
+  doc["totalBytes"]       = fwInstallTotalBytes;
+  doc["error"]            = fwInstallError;
+  doc["nodeAssetKnown"]   = fwHasNodeAsset();
+  doc["stagingNode"]      = fwStagingNode;
+  doc["stageNodeError"]   = fwStageNodeError;
+
+  String out;
+  serializeJson(doc, out);
+  server.send(200, "application/json", out);
+}
+
+static void handleUpdateCheck() {
+  if (WiFi.status() != WL_CONNECTED) {
+    server.send(400, "application/json", "{\"ok\":false,\"message\":\"STA WiFi not connected\"}");
+    return;
+  }
+  fwCheckForUpdate();
+
+  DynamicJsonDocument doc(256);
+  doc["ok"]               = true;
+  doc["available"]        = fwUpdateAvailable;
+  doc["availableVersion"] = fwAvailableVersion;
+
+  String out;
+  serializeJson(doc, out);
+  server.send(200, "application/json", out);
+}
+
+static void handleUpdateInstall() {
+  if (!fwUpdateAvailable) { server.send(400, "text/plain", "No update available"); return; }
+  if (WiFi.status() != WL_CONNECTED) { server.send(400, "text/plain", "STA WiFi not connected"); return; }
+
+  bool ok = fwInstallUpdate();
+
+  DynamicJsonDocument doc(256);
+  doc["ok"]    = ok;
+  doc["error"] = fwInstallError;
+
+  String out;
+  serializeJson(doc, out);
+  server.send(ok ? 200 : 500, "application/json", out);
+}
+
+static void handleUpdateStageNode() {
+  if (WiFi.status() != WL_CONNECTED) { server.send(400, "text/plain", "STA WiFi not connected"); return; }
+
+  bool ok = fwStageNodeFirmware();
+  if (ok) coreOtaPreload();  // reload PSRAM images so the new file is usable without a reboot
+
+  DynamicJsonDocument doc(256);
+  doc["ok"]    = ok;
+  doc["error"] = fwStageNodeError;
+
+  String out;
+  serializeJson(doc, out);
+  server.send(ok ? 200 : 500, "application/json", out);
+}
+
+// ---- Manual per-node channel-range overrides (Web UI) ----
+static bool webMacParse(const String& s, uint8_t* macOut) {
+  unsigned int v[6];
+  if (sscanf(s.c_str(), "%x:%x:%x:%x:%x:%x", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) != 6) return false;
+  for (int i = 0; i < 6; i++) macOut[i] = (uint8_t)v[i];
+  return true;
+}
+
+static void handleMeshChannelOverridesGet() {
+  DynamicJsonDocument doc(1024);
+  JsonArray arr = doc.createNestedArray("overrides");
+  uint8_t count = meshChOverrideGetCount();
+  for (uint8_t i = 0; i < count; i++) {
+    uint8_t mac[6]; uint16_t chStart, chEnd;
+    if (!meshChOverrideGetAt(i, mac, chStart, chEnd)) continue;
+    JsonObject o = arr.createNestedObject();
+    char macStr[18];
+    snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    o["mac"]     = macStr;
+    o["chStart"] = chStart;
+    o["chEnd"]   = chEnd;
+  }
+
+  String out;
+  serializeJson(doc, out);
+  server.send(200, "application/json", out);
+}
+
+static void handleMeshChannelOverridesSet() {
+  if (!server.hasArg("mac") || !server.hasArg("chStart") || !server.hasArg("chEnd")) {
+    server.send(400, "application/json", "{\"ok\":false,\"error\":\"Missing mac/chStart/chEnd\"}");
+    return;
+  }
+  uint8_t mac[6];
+  if (!webMacParse(server.arg("mac"), mac)) {
+    server.send(400, "application/json", "{\"ok\":false,\"error\":\"Bad MAC format\"}");
+    return;
+  }
+  int chStart = server.arg("chStart").toInt();
+  int chEnd   = server.arg("chEnd").toInt();
+  bool ok = meshChOverrideSet(mac, chStart, chEnd);
+
+  DynamicJsonDocument doc(128);
+  doc["ok"] = ok;
+  if (!ok) doc["error"] = "Invalid channel -- must match a supported 2.4/5GHz channel number";
+  String out;
+  serializeJson(doc, out);
+  server.send(ok ? 200 : 400, "application/json", out);
+}
+
+static void handleMeshChannelOverridesClear() {
+  if (!server.hasArg("mac")) { server.send(400, "text/plain", "Missing mac"); return; }
+  uint8_t mac[6];
+  if (!webMacParse(server.arg("mac"), mac)) { server.send(400, "text/plain", "Bad MAC format"); return; }
+  bool ok = meshChOverrideClear(mac);
+  server.send(ok ? 200 : 404, "text/plain", ok ? "OK" : "Not found");
+}
+
 static void startWebServer() {
   server.on("/", handleRoot);
   server.on("/status.json", handleStatus);
@@ -4258,6 +5715,16 @@ static void startWebServer() {
   server.on("/reboot",          HTTP_POST, handleReboot);
   server.on("/cleanup",         HTTP_POST, handleCleanup);
   server.on("/deleteAll",       HTTP_POST, handleDeleteAll);
+  server.on("/mesh/nodes.json", handleMeshNodes);
+  server.on("/mesh/ota/start",  HTTP_POST, handleMeshOtaStart);
+  server.on("/mesh/ota/cancel", HTTP_POST, handleMeshOtaCancel);
+  server.on("/update/status",    handleUpdateStatus);
+  server.on("/update/check",     HTTP_POST, handleUpdateCheck);
+  server.on("/update/install",   HTTP_POST, handleUpdateInstall);
+  server.on("/update/stageNode", HTTP_POST, handleUpdateStageNode);
+  server.on("/mesh/channelOverrides",       HTTP_GET,  handleMeshChannelOverridesGet);
+  server.on("/mesh/channelOverrides",       HTTP_POST, handleMeshChannelOverridesSet);
+  server.on("/mesh/channelOverrides/clear", HTTP_POST, handleMeshChannelOverridesClear);
   server.begin();
   Serial.println("[WEB] Server started");
 }
@@ -4659,6 +6126,12 @@ static void pollButton() {
       else                      wardriveGoBleSuspend();
       Serial.print("[BTN] Double press -> Wardrive Go bridge ");
       Serial.println(cfg.wardriveGoBridge ? "ENABLED" : "DISABLED");
+    } else if (currentPage == 4 && meshCoreActive && coreUpdatePromptStatus().promptActive) {
+      // "Update Nodes through Core?" prompt showing -- a press here confirms
+      // it instead of advancing to the next page, since the prompt itself is
+      // using this page's normal single-press action.
+      coreUpdatePromptConfirm();
+      Serial.println("[BTN] Press -> mesh update prompt confirmed");
     } else {
       // Single (or unrecognised multi) press -> advance page
       advancePage();
@@ -4749,6 +6222,11 @@ void setup() {
     else { sdOk = false; ledRed(); }
   }
 
+  // Mesh Core OTA images: load once now (PSRAM-resident) so that entering
+  // Core mode later via long-press -- with no reboot in between -- already
+  // has whatever /Firmware/*.ota.bin images are on the card ready to push.
+  coreOtaPreload();
+
   // GPS (UART via Qwiic connector)
   // QWIIC pinout: RX = GPIO12 (from GPS TX), TX = GPIO11 (to GPS RX).
   // RX buffer 512 bytes: at 9600 baud the default 256-byte buffer fills in ~267ms.
@@ -4821,6 +6299,12 @@ void setup() {
 
   startWebServer();
   lastStaStatus = WiFi.status();
+
+  // Self-update check: boot-only, separate from the mid-drive "home network
+  // seen" auto-upload path. Silent/non-fatal if offline.
+  if (staOk) {
+    fwCheckForUpdate();
+  }
 
   if (staOk) {
     Serial.print("[WEB] STA IP: "); Serial.println(WiFi.localIP());

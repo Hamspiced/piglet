@@ -88,6 +88,19 @@ struct Config {
   // GPS. Started/stopped from enterNodeMode()/exitNodeMode()/enterCoreMode()/
   // exitCoreMode() in MeshNode.cpp. Default off.
   bool wardriveGoBridge = false;
+
+  // When true: a headless PigletNode (PIGLET_BOARD_NODE, no display/buttons
+  // of its own) that connects to this Core running older firmware is
+  // automatically pushed the staged /Firmware/PigletNode.ota.bin image over
+  // ESP-NOW, with no on-device confirmation (there's no screen to confirm
+  // on). Retried at most once per node per session -- see autoUpdateAttempted
+  // in MeshNode.cpp. XIAO-based nodes (Piglet/TDongleC5_Piglet) are never
+  // auto-pushed; they always get the on-screen "Update Nodes through Core?"
+  // confirm prompt instead. CAUTION: repeated OTA writes are ordinary flash
+  // wear on the node's own partitions, not the Core's SD card -- but a Core
+  // actively pushing updates benefits from a card rated for sustained writes;
+  // 16GB+ is recommended. Default off.
+  bool autoUpdateHeadlessNodes = false;
 };
 
 const PinMap& detectPinsByChip();

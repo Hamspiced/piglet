@@ -4,6 +4,8 @@
 #include "SDUtils.h"
 #include "Display.h"
 #include "WigleUpload.h"
+#include "MeshNode.h"
+#include "FirmwareUpdate.h"
 #include <ArduinoJson.h>
 
 // ---------------- Embedded HTML ----------------
@@ -209,6 +211,15 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
     background:linear-gradient(90deg,var(--accent),color-mix(in srgb,var(--accent) 60%,#fff));
     animation:barPulse 1.5s ease-in-out infinite;
   }
+  #fwBar{
+    height:8px;width:0%;border-radius:8px;
+    background:var(--accent);
+    transition:width .4s ease;
+  }
+  #fwBar.active{
+    background:linear-gradient(90deg,var(--accent),color-mix(in srgb,var(--accent) 60%,#fff));
+    animation:barPulse 1.5s ease-in-out infinite;
+  }
   @keyframes barPulse{0%,100%{opacity:1}50%{opacity:.65}}
 
   /* ---- File list ---- */
@@ -333,6 +344,53 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
     </div>
   </div>
 
+  <!-- ============ FIRMWARE UPDATE ============ -->
+  <div class="card">
+    <h3>Firmware Update</h3>
+    <div class="kv">
+      <div><span class="k">Current Version</span><span class="v" id="vFwCurrent">—</span></div>
+      <div><span class="k">Latest Available</span><span class="v" id="vFwAvailable">—</span></div>
+    </div>
+    <div id="fwNotes" class="muted mt-sm" style="font-size:13px"></div>
+    <div class="barWrap mt-sm"><div id="fwBar"></div></div>
+    <div id="fwMsg" class="muted mt-sm" style="font-size:14px">—</div>
+    <div class="row mt-sm">
+      <button onclick="fwCheck()">Check for Update</button>
+      <button class="btn-primary" id="fwInstallBtn" onclick="fwInstall()" disabled>Install Update</button>
+    </div>
+    <p style="margin-top:12px;font-size:12px;color:var(--muted)">Downloads and verifies over HTTPS from GitHub Releases; only the size is checked before flashing (no code-signing). Requires STA Wi-Fi. The device reboots automatically once the install finishes.</p>
+    <div class="row mt-sm">
+      <button id="fwStageNodeBtn" onclick="fwStageNode()">Store Piglet Node Firmware</button>
+    </div>
+    <div id="fwStageNodeMsg" class="muted mt-sm" style="font-size:13px"></div>
+    <p style="margin-top:8px;font-size:12px;color:var(--muted)">Downloads the latest <code>PigletNode.ota.bin</code> release asset to <code>/Firmware/</code> so this Core can push it to connected headless PigletNode nodes over ESP-NOW &mdash; works even if this board's own firmware is already current.</p>
+  </div>
+
+  <!-- ============ MESH NODES (Core mode only) ============ -->
+  <div class="card" id="meshNodesCard" style="display:none">
+    <h3>Mesh Nodes</h3>
+    <div id="meshNodes" style="font-size:14px">—</div>
+    <div id="meshNodesLoadMsg" class="muted mt-sm" style="font-size:12px"></div>
+    <p style="margin-top:12px;font-size:12px;color:var(--muted)">Pushes a staged <code>/Firmware/&lt;Board&gt;.ota.bin</code> image to the selected node over ESP-NOW. The node verifies a SHA-256 of the whole image before switching boot partition, so a bad transfer leaves it running its old firmware.</p>
+
+    <div class="inner-card">
+      <h4>Channel Overrides</h4>
+      <div id="chOverrides" style="font-size:14px">—</div>
+      <div class="row mt-sm">
+        <input id="chOvrMac" placeholder="Node MAC, e.g. AA:BB:CC:DD:EE:FF" autocomplete="off" autocapitalize="off" spellcheck="false">
+        <div class="row" style="grid-template-columns:1fr 1fr">
+          <input id="chOvrStart" type="number" placeholder="Start ch (e.g. 1)">
+          <input id="chOvrEnd" type="number" placeholder="End ch (e.g. 14)">
+        </div>
+      </div>
+      <div class="row mt-sm">
+        <button class="btn-primary" onclick="chOvrSet()">Set Override</button>
+      </div>
+      <div id="chOvrMsg" class="muted mt-sm" style="font-size:13px"></div>
+      <p style="margin-top:8px;font-size:12px;color:var(--muted)">Pins a node to a fixed channel range instead of the automatic even split -- e.g. a node with a directional antenna aimed at 5GHz only. Channel numbers must be valid Wi-Fi channels (1-14, or 5GHz: 36-177). Persisted to SD and survives a reboot.</p>
+    </div>
+  </div>
+
   <!-- ============ CONFIG ============ -->
   <div class="card">
     <h3>Configuration</h3>
@@ -422,7 +480,16 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
           <option value="true">Enabled &mdash; Advertise to Wardrive Go / WarBLE Go</option>
         </select>
       </div>
+      <div><label>Auto-Update Headless PigletNode Nodes (Core mode)</label>
+        <select id="autoUpdateHeadlessNodes">
+          <option value="false">Disabled (default)</option>
+          <option value="true">Enabled &mdash; Push Staged Firmware Automatically</option>
+        </select>
+      </div>
     </div>
+    <p style="margin-top:8px;font-size:12px;color:var(--muted)">
+      <strong>Auto-Update Headless PigletNode Nodes:</strong> silently pushes the staged <code>/Firmware/PigletNode.ota.bin</code> image over ESP-NOW to any connected headless node running different firmware &mdash; no on-device confirmation, since those nodes have no screen. XIAO-based nodes always use the on-screen confirm prompt instead. Use an SD card rated at least 16GB for sustained-write reliability; use at your own risk.
+    </p>
     <p style="margin-top:8px;font-size:12px;color:var(--muted)">
       <strong>Upload When Home Network Seen</strong> and <strong>Auto-Start Wardriving After Uploads</strong> are mutually exclusive &mdash; enabling Auto-Start always disables Upload When Home Network Seen.
     </p>
@@ -544,7 +611,7 @@ async function loadStatus(){
     setText('vApSsid',j?.config?.wardriverSsid||'\u2014');
 
     // Fill config form — skip masked/secret values
-    for(const k of ['wigleBasicToken','wdgwarsApiKey','wardriftApiKey','deviceName','board','gpsBaud','homeSsid','wardriverSsid','wardriverPsk','scanMode','speedUnits','battPin','batteryTest','maxBootUploads','meshModeOnBoot','rotateScreen180','autoStartAfterUpload','uploadOnNetworkSeen','wardriveGoBridge']){
+    for(const k of ['wigleBasicToken','wdgwarsApiKey','wardriftApiKey','deviceName','board','gpsBaud','homeSsid','wardriverSsid','wardriverPsk','scanMode','speedUnits','battPin','batteryTest','maxBootUploads','meshModeOnBoot','rotateScreen180','autoStartAfterUpload','uploadOnNetworkSeen','wardriveGoBridge','autoUpdateHeadlessNodes']){
       if(j.config&&(k in j.config)){
         const v=String(j.config[k]);
         if(maskedKeys.has(k)&&(v===''||v==='(set)'))continue;
@@ -653,7 +720,7 @@ async function deleteAllLogs(){
 
 /* ---- Shared save logic used by both Save and Save+Reboot ---- */
 async function doSave(){
-  const keys=['board','wigleBasicToken','wdgwarsApiKey','wardriftApiKey','deviceName','gpsBaud','homeSsid','homePsk','wardriverSsid','wardriverPsk','scanMode','speedUnits','battPin','batteryTest','maxBootUploads','meshModeOnBoot','rotateScreen180','autoStartAfterUpload','uploadOnNetworkSeen','wardriveGoBridge'];
+  const keys=['board','wigleBasicToken','wdgwarsApiKey','wardriftApiKey','deviceName','gpsBaud','homeSsid','homePsk','wardriverSsid','wardriverPsk','scanMode','speedUnits','battPin','batteryTest','maxBootUploads','meshModeOnBoot','rotateScreen180','autoStartAfterUpload','uploadOnNetworkSeen','wardriveGoBridge','autoUpdateHeadlessNodes'];
   let body='# Saved from Web UI\n# key=value\n';
   for(const k of keys){
     const el=$(k);
@@ -870,8 +937,181 @@ async function pollUpload(){
     handleApTimer(j);
   }catch(e){/* silent */}
 }
+
+/* ---- Firmware Update (self-update from GitHub Releases) ---- */
+function setFwMsg(t,cls){
+  const el=$('fwMsg');
+  el.textContent=t;
+  el.className=cls||'muted';
+}
+
+async function loadUpdateStatus(){
+  try{
+    const r=await fetch('/update/status');const j=await r.json();
+    setText('vFwCurrent',j.currentVersion);
+    setText('vFwAvailable',j.available?j.availableVersion:'Up to date');
+    $('fwNotes').textContent=j.notes||'';
+    $('fwInstallBtn').disabled=!j.available||j.installing;
+
+    const pct=j.totalBytes>0?Math.round((j.downloadedBytes/j.totalBytes)*100):0;
+    const bar=$('fwBar');
+    bar.style.width=pct+'%';
+    bar.classList.toggle('active',j.installing);
+
+    if(j.installing)setFwMsg((j.stage||'Installing\u2026')+' ('+pct+'%)');
+    else if(j.error)setFwMsg(j.error,'bad-text');
+    else if(j.available)setFwMsg('Update available: '+j.availableVersion);
+    else if(j.checked)setFwMsg('Up to date','ok-text');
+  }catch(e){console.error('loadUpdateStatus',e)}
+}
+
+async function fwCheck(){
+  setFwMsg('Checking\u2026');
+  try{
+    const r=await fetch('/update/check',{method:'POST'});
+    const j=await r.json().catch(()=>null);
+    if(j&&!j.ok)setFwMsg(j.message||'Check failed','bad-text');
+  }catch(e){setFwMsg('Check request failed','bad-text')}
+  await loadUpdateStatus();
+}
+
+async function fwInstall(){
+  if(!confirm('Install the update now? The device will reboot when finished.'))return;
+  setFwMsg('Starting install\u2026');
+  $('fwInstallBtn').disabled=true;
+  try{
+    const r=await fetch('/update/install',{method:'POST'});
+    const j=await r.json().catch(()=>null);
+    if(j&&!j.ok)setFwMsg(j.error||'Install failed','bad-text');
+  }catch(e){
+    // Expected once the device restarts mid-response on success.
+    setFwMsg('Device is rebooting\u2026');
+  }
+  await loadUpdateStatus();
+}
+
+function setFwStageNodeMsg(t,cls){
+  const el=$('fwStageNodeMsg');
+  el.textContent=t;
+  el.className=cls||'muted';
+}
+
+async function fwStageNode(){
+  setFwStageNodeMsg('Downloading PigletNode.ota.bin\u2026');
+  $('fwStageNodeBtn').disabled=true;
+  try{
+    const r=await fetch('/update/stageNode',{method:'POST'});
+    const j=await r.json().catch(()=>null);
+    if(j&&j.ok)setFwStageNodeMsg('Staged OK \u2014 ready to push to connected nodes','ok-text');
+    else setFwStageNodeMsg((j&&j.error)||'Staging failed','bad-text');
+  }catch(e){setFwStageNodeMsg('Request failed','bad-text')}
+  $('fwStageNodeBtn').disabled=false;
+  await loadMeshNodes();
+}
+setInterval(loadUpdateStatus,2000);
+
+/* ---- Mesh Nodes (Core-pushed OTA to connected nodes) ---- */
+function otaPhaseText(p){
+  switch(p){
+    case 1: return 'Starting';
+    case 2: return 'Sending';
+    case 3: return 'Done';
+    case 4: return 'Failed';
+    default: return 'Idle';
+  }
+}
+
+async function loadMeshNodes(){
+  try{
+    const r=await fetch('/mesh/nodes.json');const j=await r.json();
+    const card=$('meshNodesCard');
+    if(!j.coreActive){card.style.display='none';return;}
+    card.style.display='';
+
+    const el=$('meshNodes');
+    const ota=j.ota||{};
+    const busy=ota.phase===1||ota.phase===2;
+    const loadEl=$('meshNodesLoadMsg');
+    if(loadEl)loadEl.textContent=ota.loadMsg?('Staged on SD: '+ota.loadMsg):'';
+    if(!j.nodes||j.nodes.length===0){el.innerHTML='<span class="muted">No nodes connected</span>';return;}
+
+    el.innerHTML=j.nodes.map(n=>{
+      const isBusy=busy&&ota.nodeIdx===n.idx;
+      const pct=ota.totalBytes>0?Math.round((ota.sentBytes/ota.totalBytes)*100):0;
+      let statusTxt=n.board+(n.isPiglet?'':' (non-Piglet)');
+      if(isBusy)statusTxt+=' \u2014 '+otaPhaseText(ota.phase)+' '+pct+'%';
+      else if(ota.nodeIdx===n.idx&&ota.msg)statusTxt+=' \u2014 '+ota.msg;
+      const actionBtn=isBusy
+        ?'<button class="btn-sm btn-danger" onclick="meshOtaCancel()">Cancel</button>'
+        :'<button class="btn-sm" onclick="meshOtaStart('+n.idx+')"'+(busy?' disabled':'')+'>Update</button>';
+      return '<div class="file-row"><span class="file-name">'+n.mac+'</span>'
+        +'<span class="file-size">'+statusTxt+'</span>'
+        +'<span class="file-actions">'+actionBtn+'</span></div>';
+    }).join('');
+  }catch(e){console.error('loadMeshNodes',e)}
+}
+
+async function meshOtaStart(idx){
+  try{
+    const r=await fetch('/mesh/ota/start?idx='+idx,{method:'POST'});
+    const j=await r.json().catch(()=>null);
+    if(j&&!j.ok)alert(j.msg||'Could not start update');
+  }catch(e){alert('Request failed')}
+  await loadMeshNodes();
+}
+
+async function meshOtaCancel(){
+  try{await fetch('/mesh/ota/cancel',{method:'POST'});}catch(e){}
+  await loadMeshNodes();
+}
+setInterval(loadMeshNodes,2000);
+
+/* ---- Manual per-node channel-range overrides ---- */
+function setChOvrMsg(t,cls){
+  const el=$('chOvrMsg');
+  el.textContent=t;
+  el.className=cls||'muted';
+}
+
+async function loadChOverrides(){
+  try{
+    const r=await fetch('/mesh/channelOverrides');const j=await r.json();
+    const el=$('chOverrides');
+    if(!j.overrides||j.overrides.length===0){el.innerHTML='<span class="muted">No overrides set</span>';return;}
+    el.innerHTML=j.overrides.map(o=>
+      '<div class="file-row"><span class="file-name">'+o.mac+'</span>'
+      +'<span class="file-size">ch '+o.chStart+'-'+o.chEnd+'</span>'
+      +'<span class="file-actions"><button class="btn-sm btn-danger" onclick="chOvrClear(\''+o.mac+'\')">Remove</button></span></div>'
+    ).join('');
+  }catch(e){console.error('loadChOverrides',e)}
+}
+
+async function chOvrSet(){
+  const mac=($('chOvrMac').value||'').trim();
+  const chStart=$('chOvrStart').value;
+  const chEnd=$('chOvrEnd').value;
+  if(!mac||chStart===''||chEnd===''){setChOvrMsg('MAC, start channel, and end channel are all required','bad-text');return;}
+  setChOvrMsg('Saving\u2026');
+  try{
+    const body='mac='+encodeURIComponent(mac)+'&chStart='+encodeURIComponent(chStart)+'&chEnd='+encodeURIComponent(chEnd);
+    const r=await fetch('/mesh/channelOverrides',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body});
+    const j=await r.json().catch(()=>null);
+    if(j&&j.ok){setChOvrMsg('Saved','ok-text');$('chOvrMac').value='';$('chOvrStart').value='';$('chOvrEnd').value='';}
+    else setChOvrMsg((j&&j.error)||'Save failed','bad-text');
+  }catch(e){setChOvrMsg('Request failed','bad-text')}
+  await loadChOverrides();
+}
+
+async function chOvrClear(mac){
+  try{
+    await fetch('/mesh/channelOverrides/clear',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'mac='+encodeURIComponent(mac)});
+  }catch(e){}
+  await loadChOverrides();
+}
+setInterval(loadChOverrides,5000);
+
 setInterval(pollUpload,1500);
-loadStatus();loadFiles();
+loadStatus();loadFiles();loadUpdateStatus();loadMeshNodes();loadChOverrides();
 </script>
 </body>
 </html>
@@ -959,6 +1199,7 @@ static void handleStatus() {
   c["autoStartAfterUpload"] = cfg.autoStartAfterUpload;
   c["uploadOnNetworkSeen"] = cfg.uploadOnNetworkSeen;
   c["wardriveGoBridge"] = cfg.wardriveGoBridge;
+  c["autoUpdateHeadlessNodes"] = cfg.autoUpdateHeadlessNodes;
   for (uint8_t i = 0; i < 10; i++) {
     c[String("ssidWhitelist") + String(i + 1)] = cfg.ssidWhitelist[i];
   }
@@ -1381,6 +1622,216 @@ static void handleWigleUploadOne() {
   server.send(ok ? 200 : 500, "application/json", out);
 }
 
+// ---- Mesh Nodes (Core-pushed OTA to connected nodes) ----
+
+static const char* meshBoardTypeLabel(uint8_t bt) {
+  switch (bt) {
+    case PIGLET_BOARD_NODE:    return "PigletNode";
+    case PIGLET_BOARD_XIAO:    return "Piglet";
+    case PIGLET_BOARD_TDONGLE: return "TDongleC5_Piglet";
+    default:                   return "Unknown";
+  }
+}
+
+static void handleMeshNodes() {
+  DynamicJsonDocument doc(2048);
+  doc["coreActive"] = meshCoreActive;
+
+  JsonArray arr = doc.createNestedArray("nodes");
+  if (meshCoreActive) {
+    uint32_t now = millis();
+    for (uint8_t i = 0; i < CORE_MAX_NODES; i++) {
+      if (!coreNodes[i].active) continue;
+      JsonObject o = arr.createNestedObject();
+      char macStr[18];
+      snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
+               coreNodes[i].mac[0], coreNodes[i].mac[1], coreNodes[i].mac[2],
+               coreNodes[i].mac[3], coreNodes[i].mac[4], coreNodes[i].mac[5]);
+      o["idx"]           = i;
+      o["mac"]           = macStr;
+      o["boardType"]     = coreNodes[i].boardType;
+      o["board"]         = meshBoardTypeLabel(coreNodes[i].boardType);
+      o["isPiglet"]      = coreNodes[i].isPiglet;
+      o["isBiscuit"]     = coreNodes[i].isBiscuit;
+      o["recordsRx"]     = coreNodes[i].recordsRx;
+      o["lastSeenMsAgo"] = now - coreNodes[i].lastHbMs;
+    }
+  }
+
+  CoreOtaStatus st = coreOtaStatus();
+  JsonObject ota = doc.createNestedObject("ota");
+  ota["phase"]      = (int)st.phase;
+  ota["nodeIdx"]    = st.nodeIdx;
+  ota["sentBytes"]  = st.sentBytes;
+  ota["totalBytes"] = st.totalBytes;
+  ota["msg"]        = st.msg;
+  ota["loadMsg"]    = st.loadMsg;
+
+  String out;
+  serializeJson(doc, out);
+  server.send(200, "application/json", out);
+}
+
+static void handleMeshOtaStart() {
+  if (!meshCoreActive) { server.send(400, "text/plain", "Not in Core mode"); return; }
+  if (!server.hasArg("idx")) { server.send(400, "text/plain", "Missing idx"); return; }
+
+  uint8_t idx = (uint8_t)server.arg("idx").toInt();
+  bool ok = coreOtaStart(idx);
+  CoreOtaStatus st = coreOtaStatus();
+
+  DynamicJsonDocument doc(256);
+  doc["ok"]  = ok;
+  doc["msg"] = st.msg;
+
+  String out;
+  serializeJson(doc, out);
+  server.send(ok ? 200 : 400, "application/json", out);
+}
+
+static void handleMeshOtaCancel() {
+  coreOtaAbort();
+  server.send(200, "text/plain", "OK");
+}
+
+// ---- Manual per-node channel-range overrides (Web UI) ----
+
+static bool webMacParse(const String& s, uint8_t* macOut) {
+  unsigned int v[6];
+  if (sscanf(s.c_str(), "%x:%x:%x:%x:%x:%x", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) != 6) return false;
+  for (int i = 0; i < 6; i++) macOut[i] = (uint8_t)v[i];
+  return true;
+}
+
+static void handleMeshChannelOverridesGet() {
+  DynamicJsonDocument doc(1024);
+  JsonArray arr = doc.createNestedArray("overrides");
+  uint8_t count = meshChOverrideGetCount();
+  for (uint8_t i = 0; i < count; i++) {
+    uint8_t mac[6]; uint16_t chStart, chEnd;
+    if (!meshChOverrideGetAt(i, mac, chStart, chEnd)) continue;
+    JsonObject o = arr.createNestedObject();
+    char macStr[18];
+    snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    o["mac"]     = macStr;
+    o["chStart"] = chStart;
+    o["chEnd"]   = chEnd;
+  }
+
+  String out;
+  serializeJson(doc, out);
+  server.send(200, "application/json", out);
+}
+
+static void handleMeshChannelOverridesSet() {
+  if (!server.hasArg("mac") || !server.hasArg("chStart") || !server.hasArg("chEnd")) {
+    server.send(400, "application/json", "{\"ok\":false,\"error\":\"Missing mac/chStart/chEnd\"}");
+    return;
+  }
+  uint8_t mac[6];
+  if (!webMacParse(server.arg("mac"), mac)) {
+    server.send(400, "application/json", "{\"ok\":false,\"error\":\"Bad MAC format\"}");
+    return;
+  }
+  int chStart = server.arg("chStart").toInt();
+  int chEnd   = server.arg("chEnd").toInt();
+  bool ok = meshChOverrideSet(mac, chStart, chEnd);
+
+  DynamicJsonDocument doc(128);
+  doc["ok"] = ok;
+  if (!ok) doc["error"] = "Invalid channel -- must match a supported 2.4/5GHz channel number";
+  String out;
+  serializeJson(doc, out);
+  server.send(ok ? 200 : 400, "application/json", out);
+}
+
+static void handleMeshChannelOverridesClear() {
+  if (!server.hasArg("mac")) { server.send(400, "text/plain", "Missing mac"); return; }
+  uint8_t mac[6];
+  if (!webMacParse(server.arg("mac"), mac)) { server.send(400, "text/plain", "Bad MAC format"); return; }
+  bool ok = meshChOverrideClear(mac);
+  server.send(ok ? 200 : 404, "text/plain", ok ? "OK" : "Not found");
+}
+
+// ---- Firmware Update (self-update from GitHub Releases) ----
+
+static void handleUpdateStatus() {
+  DynamicJsonDocument doc(512);
+  doc["checked"]         = fwUpdateChecked;
+  doc["available"]       = fwUpdateAvailable;
+  doc["currentVersion"]  = FIRMWARE_VERSION;
+  doc["availableVersion"] = fwAvailableVersion;
+  doc["notes"]           = fwReleaseNotes;
+  doc["installing"]      = fwInstalling;
+  doc["stage"]           = fwInstallStage;
+  doc["downloadedBytes"] = fwInstallDownloadedBytes;
+  doc["totalBytes"]      = fwInstallTotalBytes;
+  doc["error"]           = fwInstallError;
+  doc["nodeAssetKnown"]  = fwHasNodeAsset();
+  doc["stagingNode"]     = fwStagingNode;
+  doc["stageNodeError"]  = fwStageNodeError;
+
+  String out;
+  serializeJson(doc, out);
+  server.send(200, "application/json", out);
+}
+
+static void handleUpdateCheck() {
+  if (WiFi.status() != WL_CONNECTED) {
+    server.send(400, "application/json",
+                "{\"ok\":false,\"message\":\"STA WiFi not connected\"}");
+    return;
+  }
+
+  fwCheckForUpdate();
+
+  DynamicJsonDocument doc(256);
+  doc["ok"]               = true;
+  doc["available"]        = fwUpdateAvailable;
+  doc["availableVersion"] = fwAvailableVersion;
+
+  String out;
+  serializeJson(doc, out);
+  server.send(200, "application/json", out);
+}
+
+static void handleUpdateInstall() {
+  if (!fwUpdateAvailable) { server.send(400, "text/plain", "No update available"); return; }
+  if (WiFi.status() != WL_CONNECTED) { server.send(400, "text/plain", "STA WiFi not connected"); return; }
+
+  // Blocking, same pattern as the existing upload handlers. On success this
+  // calls ESP.restart() internally and never returns -- a response is only
+  // sent here if it failed before flashing began.
+  bool ok = fwInstallUpdate();
+
+  DynamicJsonDocument doc(256);
+  doc["ok"]    = ok;
+  doc["error"] = fwInstallError;
+
+  String out;
+  serializeJson(doc, out);
+  server.send(ok ? 200 : 500, "application/json", out);
+}
+
+// "Store Piglet Node Firmware": stages /Firmware/PigletNode.ota.bin from the
+// latest GitHub release so headless PigletNode nodes can be pushed updates
+// over ESP-NOW, independent of whether this Core's own firmware is current.
+static void handleUpdateStageNode() {
+  if (WiFi.status() != WL_CONNECTED) { server.send(400, "text/plain", "STA WiFi not connected"); return; }
+
+  bool ok = fwStageNodeFirmware();
+  if (ok) coreOtaPreload();  // reload PSRAM images so the new file is usable without a reboot
+
+  DynamicJsonDocument doc(256);
+  doc["ok"]    = ok;
+  doc["error"] = fwStageNodeError;
+
+  String out;
+  serializeJson(doc, out);
+  server.send(ok ? 200 : 500, "application/json", out);
+}
+
 // Streams all CSVs from /logs and /uploaded merged into one RFC 1952 gzip file,
 // using DEFLATE stored blocks (BTYPE=00 — no compression library required).
 // Non-first files have their 2-line WiGLE header stripped so the merged result
@@ -1521,6 +1972,19 @@ void startWebServer() {
   server.on("/wdgwars/uploadAll", HTTP_POST, handleWdgwarsUploadAll);
   server.on("/wardrift/test",      HTTP_POST, handleWardriftTest);
   server.on("/wardrift/uploadAll", HTTP_POST, handleWardriftUploadAll);
+
+  server.on("/mesh/nodes.json",  handleMeshNodes);
+  server.on("/mesh/ota/start",   HTTP_POST, handleMeshOtaStart);
+  server.on("/mesh/ota/cancel",  HTTP_POST, handleMeshOtaCancel);
+
+  server.on("/mesh/channelOverrides",       HTTP_GET,  handleMeshChannelOverridesGet);
+  server.on("/mesh/channelOverrides",       HTTP_POST, handleMeshChannelOverridesSet);
+  server.on("/mesh/channelOverrides/clear", HTTP_POST, handleMeshChannelOverridesClear);
+
+  server.on("/update/status",    handleUpdateStatus);
+  server.on("/update/check",     HTTP_POST, handleUpdateCheck);
+  server.on("/update/install",   HTTP_POST, handleUpdateInstall);
+  server.on("/update/stageNode", HTTP_POST, handleUpdateStageNode);
 
   server.begin();
   Serial.println("[WEB] Server started");

@@ -132,7 +132,10 @@
       <span class="pill warn"><span class="dot"></span>No port? install CP210x / CH343 driver</span>
     </div>
     <p class="muted" style="font-size:12.5px;margin:10px 0 0">
-      Flashing a whole batch? <a href="batch.html">Flash several boards at once →</a>
+      Flashing a whole batch? <a href="batch.html">Flash several boards at once &rarr;</a>
+    </p>
+    <p class="muted" style="font-size:12.5px;margin:6px 0 0">
+      Only firmware v3.0 and newer is offered here &mdash; earlier releases used an incompatible partition layout.
     </p>
   </div>
 
@@ -259,6 +262,17 @@ function releaseByTag(tag){
   return RELEASES.filter(function(r){ return r.tag === tag; })[0] || null;
 }
 
+// Defense in depth: build-and-deploy.yml already never mirrors/lists a
+// pre-v3.0 release (the huge_app -> default_8MB partition-scheme change
+// means flashing one over an already-v3.0+ board would downgrade its
+// partition table), but guard against a stale cached releases.json too --
+// never add a sub-3.0 tag as a selectable option.
+function majorOf(tag){
+  var m = /^v?(\d+)\./.exec(String(tag || "").trim());
+  return m ? parseInt(m[1], 10) : null;
+}
+var MIN_FLASHABLE_MAJOR = 3;
+
 // Tiny, trusted-content-only Markdown -> HTML for CHANGELOG.md excerpts
 // (### headings, - bullets, **bold**, `code`). Not a general sanitizer --
 // fine here since the source is always our own repo's CHANGELOG.md, never
@@ -329,7 +343,10 @@ render(); // default to the first board, "Latest", before releases.json loads
 fetch("releases.json", {cache:"no-store"})
   .then(function(r){ return r.ok ? r.json() : []; })
   .then(function(list){
-    RELEASES = list || [];
+    RELEASES = (list || []).filter(function(r){
+      var maj = majorOf(r.tag);
+      return maj !== null && maj >= MIN_FLASHABLE_MAJOR;
+    });
     RELEASES.forEach(function(r, i){
       var o = document.createElement("option");
       o.value = r.tag;

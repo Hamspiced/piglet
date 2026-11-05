@@ -43,6 +43,8 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
   .barWrap{height:7px;border-radius:7px;overflow:hidden;margin-top:8px;background:var(--barBg)}
   #wigleBar{height:7px;width:0%;border-radius:7px;background:var(--accent);transition:width .4s}
   #wigleBar.active{animation:pulse 1.5s ease-in-out infinite} @keyframes pulse{0%,100%{opacity:1}50%{opacity:.6}}
+  #fwBar{height:7px;width:0%;border-radius:7px;background:var(--accent);transition:width .4s}
+  #fwBar.active{animation:pulse 1.5s ease-in-out infinite}
   .inner-card{border:1px solid var(--border);border-radius:8px;padding:12px;margin-top:12px;background:var(--input)}
   .cfg-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px} @media(max-width:520px){.cfg-grid{grid-template-columns:1fr}} .cfg-grid>div{display:flex;flex-direction:column}
   .file-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:6px 0;border-bottom:1px solid var(--border)} .file-row:last-child{border-bottom:none}
@@ -104,6 +106,46 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
   </div>
 
   <div class="card">
+    <h3>Firmware Update</h3>
+    <div class="kv">
+      <div><span class="k">Current</span><span class="v" id="vFwCurrent">—</span></div>
+      <div><span class="k">Available</span><span class="v" id="vFwAvailable">—</span></div>
+    </div>
+    <div id="fwNotes" class="muted mt-sm" style="font-size:12px"></div>
+    <div class="barWrap mt-sm"><div id="fwBar"></div></div>
+    <div id="fwMsg" class="muted mt-sm" style="font-size:13px">—</div>
+    <div class="row mt-sm">
+      <button onclick="fwCheck()">Check for Update</button>
+      <button class="btn-primary" id="fwInstallBtn" onclick="fwInstall()" disabled>Install Update</button>
+    </div>
+    <div class="row mt-sm">
+      <button id="fwStageNodeBtn" onclick="fwStageNode()">Store Piglet Node Firmware</button>
+    </div>
+    <div id="fwStageNodeMsg" class="muted mt-sm" style="font-size:12px"></div>
+    <p style="margin-top:6px;font-size:11px;color:var(--muted)">Downloads the latest <code>PigletNode.ota.bin</code> to <code>/Firmware/</code> so this Core can push it to connected headless PigletNode nodes -- works even if this board's own firmware is current.</p>
+  </div>
+
+  <div class="card" id="meshNodesCard" style="display:none">
+    <h3>Mesh Nodes</h3>
+    <div id="meshNodes" style="font-size:13px">—</div>
+    <div id="meshNodesLoadMsg" class="muted mt-sm" style="font-size:11px"></div>
+    <div class="inner-card">
+      <h3 style="margin:0 0 6px 0">Channel Overrides</h3>
+      <div id="chOverrides" style="font-size:13px">—</div>
+      <div class="row mt-sm">
+        <input id="chOvrMac" placeholder="Node MAC, e.g. AA:BB:CC:DD:EE:FF" autocomplete="off" autocapitalize="off" spellcheck="false">
+        <div class="row" style="grid-template-columns:1fr 1fr">
+          <input id="chOvrStart" type="number" placeholder="Start ch">
+          <input id="chOvrEnd" type="number" placeholder="End ch">
+        </div>
+      </div>
+      <div class="row mt-sm"><button class="btn-primary" onclick="chOvrSet()">Set Override</button></div>
+      <div id="chOvrMsg" class="muted mt-sm" style="font-size:12px"></div>
+      <p style="margin-top:6px;font-size:11px;color:var(--muted)">Pins a node to a fixed channel range instead of the automatic even split. Channels must be valid (1-14, or 5GHz: 36-177).</p>
+    </div>
+  </div>
+
+  <div class="card">
     <h3>Configuration</h3>
     <div class="cfg-grid">
       <div><label>WiGLE Basic Token</label><input id="wigleBasicToken" placeholder="Encoded token from wigle.net" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false"><a href="https://wigle.net/account" target="_blank" rel="noopener" style="font-size:11px;margin-top:4px;display:inline-block;color:#2dd4bf">&rarr; Get your API Key here</a></div>
@@ -122,6 +164,7 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
       <div><label>Rotate Screen 180&deg; (requires reboot)</label><select id="rotateScreen180"><option value="false">Normal</option><option value="true">Rotated 180&deg;</option></select></div>
       <div><label>Upload When Home Network Seen</label><select id="uploadOnNetworkSeen"><option value="true">Enabled (default)</option><option value="false">Disabled</option></select></div>
       <div><label>Wardrive Go BLE Bridge (Mesh Node/Core page only)</label><select id="wardriveGoBridge"><option value="false">Disabled (default)</option><option value="true">Enabled</option></select></div>
+      <div><label>Auto-Update Headless PigletNode Nodes (Core mode)</label><select id="autoUpdateHeadlessNodes"><option value="false">Disabled (default)</option><option value="true">Enabled</option></select></div>
     </div>
     <div class="mt-md">
       <label>Network Whitelist &mdash; SSIDs to Scan but Never Log (up to 10, one per line)</label>
@@ -190,7 +233,7 @@ async function loadStatus(){try{
   setText('vApSeen',j.apClientsSeen?'Yes':'No');
   const lu=j.uploadLastResult?j.uploadLastResult+' (HTTP '+(j.wigleLastHttpCode||'\u2014')+')':'\u2014';
   setText('vLastUpload',lu);
-  for(const k of ['wigleBasicToken','wdgwarsApiKey','wardriftApiKey','deviceName','gpsBaud','homeSsid','wardriverSsid','wardriverPsk','scanMode','speedUnits','maxBootUploads','meshModeOnBoot','rotateScreen180','uploadOnNetworkSeen','wardriveGoBridge']){
+  for(const k of ['wigleBasicToken','wdgwarsApiKey','wardriftApiKey','deviceName','gpsBaud','homeSsid','wardriverSsid','wardriverPsk','scanMode','speedUnits','maxBootUploads','meshModeOnBoot','rotateScreen180','uploadOnNetworkSeen','wardriveGoBridge','autoUpdateHeadlessNodes']){
     if(j.config&&(k in j.config)){const v=String(j.config[k]);if(maskedKeys.has(k)&&(v===''||v==='(set)'))continue;const el=$(k);if(el)el.value=v}}
   if(j.config){
     const lines=[];
@@ -244,7 +287,7 @@ async function deleteAllLogs(){
 }
 
 async function doSave(){
-  const keys=['wigleBasicToken','wdgwarsApiKey','wardriftApiKey','deviceName','gpsBaud','homeSsid','homePsk','wardriverSsid','wardriverPsk','scanMode','speedUnits','maxBootUploads','meshModeOnBoot','rotateScreen180','uploadOnNetworkSeen','wardriveGoBridge'];
+  const keys=['wigleBasicToken','wdgwarsApiKey','wardriftApiKey','deviceName','gpsBaud','homeSsid','homePsk','wardriverSsid','wardriverPsk','scanMode','speedUnits','maxBootUploads','meshModeOnBoot','rotateScreen180','uploadOnNetworkSeen','wardriveGoBridge','autoUpdateHeadlessNodes'];
   let body='# Saved from Web UI\n';
   for(const k of keys){const el=$(k);const v=el?(el.value??''):'';if(maskedKeys.has(k)&&v==='')continue;body+=k+'='+String(v).replace(/\r?\n/g,' ')+'\n'}
   const wlEl=$('ssidWhitelist');
@@ -275,7 +318,106 @@ async function apKeepAliveYes(){try{await fetch('/extend',{method:'POST'});}catc
 async function apKeepAliveNo(){hideApKeepAlive();try{await fetch('/start',{method:'POST'});}catch(e){}}
 function handleApTimer(j){if(!j||!j.apActive){hideApKeepAlive();return;}const rem=j.apRemainingMs|0;const lead=j.apExtendPromptLeadMs|30000;if(rem>lead)apModalDismissed=false;if(!apModalDismissed&&rem>0&&rem<=lead)showApKeepAlive(rem);}
 async function pollUpload(){try{const r=await fetch('/status.json');const j=await r.json();const up=!!j.uploading;const done=j.uploadDoneFiles||0;const total=j.uploadTotalFiles||0;const pct=total>0?Math.round((done/total)*100):0;const bar=$('wigleBar');bar.style.width=pct+'%';bar.classList.toggle('active',up);if(up){const fail=j.uploadFailedFiles||0;const failStr=fail>0?' F:'+fail:'';setWigleMsg('Uploading '+done+'/'+total+' ('+pct+'%)'+failStr)}handleApTimer(j);}catch(e){}}
-setInterval(pollUpload,1500);loadStatus();loadFiles();
+
+function setFwMsg(t,cls){const el=$('fwMsg');el.textContent=t;el.className=cls||'muted'}
+async function loadUpdateStatus(){try{
+  const r=await fetch('/update/status');const j=await r.json();
+  setText('vFwCurrent',j.currentVersion);
+  setText('vFwAvailable',j.available?j.availableVersion:'Up to date');
+  $('fwNotes').textContent=j.notes||'';
+  $('fwInstallBtn').disabled=!j.available||j.installing;
+  const pct=j.totalBytes>0?Math.round((j.downloadedBytes/j.totalBytes)*100):0;
+  const bar=$('fwBar');bar.style.width=pct+'%';bar.classList.toggle('active',j.installing);
+  if(j.installing)setFwMsg((j.stage||'Installing...')+' ('+pct+'%)');
+  else if(j.error)setFwMsg(j.error,'bad-text');
+  else if(j.available)setFwMsg('Update available: '+j.availableVersion);
+  else if(j.checked)setFwMsg('Up to date','ok-text');
+}catch(e){console.error(e)}}
+async function fwCheck(){setFwMsg('Checking...');try{const r=await fetch('/update/check',{method:'POST'});const j=await r.json().catch(()=>null);if(j&&!j.ok)setFwMsg(j.message||'Check failed','bad-text')}catch(e){setFwMsg('Check failed','bad-text')}await loadUpdateStatus();}
+async function fwInstall(){
+  if(!confirm('Install the update now? The device will reboot when finished.'))return;
+  setFwMsg('Starting install...');$('fwInstallBtn').disabled=true;
+  try{
+    const r=await fetch('/update/install',{method:'POST'});
+    const j=await r.json().catch(()=>null);
+    if(j&&!j.ok)setFwMsg(j.error||'Install failed','bad-text');
+  }catch(e){setFwMsg('Device is rebooting...');}
+  await loadUpdateStatus();
+}
+setInterval(loadUpdateStatus,2000);
+
+function setFwStageNodeMsg(t,cls){const el=$('fwStageNodeMsg');el.textContent=t;el.className=cls||'muted'}
+async function fwStageNode(){
+  setFwStageNodeMsg('Downloading PigletNode.ota.bin...');$('fwStageNodeBtn').disabled=true;
+  try{
+    const r=await fetch('/update/stageNode',{method:'POST'});
+    const j=await r.json().catch(()=>null);
+    if(j&&j.ok)setFwStageNodeMsg('Staged OK','ok-text');
+    else setFwStageNodeMsg((j&&j.error)||'Staging failed','bad-text');
+  }catch(e){setFwStageNodeMsg('Request failed','bad-text')}
+  $('fwStageNodeBtn').disabled=false;
+  await loadMeshNodes();
+}
+
+function otaPhaseText(p){switch(p){case 1:return'Starting';case 2:return'Sending';case 3:return'Done';case 4:return'Failed';default:return'Idle';}}
+async function loadMeshNodes(){try{
+  const r=await fetch('/mesh/nodes.json');const j=await r.json();
+  const card=$('meshNodesCard');
+  if(!j.coreActive){card.style.display='none';return;}
+  card.style.display='';
+  const el=$('meshNodes');
+  const ota=j.ota||{};
+  const busy=ota.phase===1||ota.phase===2;
+  const loadEl=$('meshNodesLoadMsg');
+  if(loadEl)loadEl.textContent=ota.loadMsg?('Staged on SD: '+ota.loadMsg):'';
+  if(!j.nodes||j.nodes.length===0){el.innerHTML='<span class="muted">No nodes connected</span>';return;}
+  el.innerHTML=j.nodes.map(n=>{
+    const isBusy=busy&&ota.nodeIdx===n.idx;
+    const pct=ota.totalBytes>0?Math.round((ota.sentBytes/ota.totalBytes)*100):0;
+    let statusTxt=n.board+(n.isPiglet?'':' (non-Piglet)');
+    if(isBusy)statusTxt+=' - '+otaPhaseText(ota.phase)+' '+pct+'%';
+    else if(ota.nodeIdx===n.idx&&ota.msg)statusTxt+=' - '+ota.msg;
+    const actionBtn=isBusy
+      ?'<button class="btn-sm btn-danger" onclick="meshOtaCancel()">Cancel</button>'
+      :'<button class="btn-sm" onclick="meshOtaStart('+n.idx+')"'+(busy?' disabled':'')+'>Update</button>';
+    return '<div class="file-row"><span>'+n.mac+'</span><span class="file-size">'+statusTxt+'</span><span class="file-actions">'+actionBtn+'</span></div>';
+  }).join('');
+}catch(e){console.error(e)}}
+async function meshOtaStart(idx){try{const r=await fetch('/mesh/ota/start?idx='+idx,{method:'POST'});const j=await r.json().catch(()=>null);if(j&&!j.ok)alert(j.msg||'Could not start update')}catch(e){alert('Request failed')}await loadMeshNodes();}
+async function meshOtaCancel(){try{await fetch('/mesh/ota/cancel',{method:'POST'});}catch(e){}await loadMeshNodes();}
+setInterval(loadMeshNodes,2000);
+
+function setChOvrMsg(t,cls){const el=$('chOvrMsg');el.textContent=t;el.className=cls||'muted'}
+async function loadChOverrides(){try{
+  const r=await fetch('/mesh/channelOverrides');const j=await r.json();
+  const el=$('chOverrides');
+  if(!j.overrides||j.overrides.length===0){el.innerHTML='<span class="muted">No overrides set</span>';return;}
+  el.innerHTML=j.overrides.map(o=>
+    '<div class="file-row"><span>'+o.mac+'</span><span class="file-size">ch '+o.chStart+'-'+o.chEnd+'</span>'
+    +'<span class="file-actions"><button class="btn-sm btn-danger" onclick="chOvrClear(\''+o.mac+'\')">Remove</button></span></div>'
+  ).join('');
+}catch(e){console.error(e)}}
+async function chOvrSet(){
+  const mac=($('chOvrMac').value||'').trim();
+  const chStart=$('chOvrStart').value, chEnd=$('chOvrEnd').value;
+  if(!mac||chStart===''||chEnd===''){setChOvrMsg('MAC, start, and end channel are required','bad-text');return;}
+  setChOvrMsg('Saving...');
+  try{
+    const body='mac='+encodeURIComponent(mac)+'&chStart='+encodeURIComponent(chStart)+'&chEnd='+encodeURIComponent(chEnd);
+    const r=await fetch('/mesh/channelOverrides',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body});
+    const j=await r.json().catch(()=>null);
+    if(j&&j.ok){setChOvrMsg('Saved','ok-text');$('chOvrMac').value='';$('chOvrStart').value='';$('chOvrEnd').value='';}
+    else setChOvrMsg((j&&j.error)||'Save failed','bad-text');
+  }catch(e){setChOvrMsg('Request failed','bad-text')}
+  await loadChOverrides();
+}
+async function chOvrClear(mac){
+  try{await fetch('/mesh/channelOverrides/clear',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'mac='+encodeURIComponent(mac)});}catch(e){}
+  await loadChOverrides();
+}
+setInterval(loadChOverrides,5000);
+
+setInterval(pollUpload,1500);loadStatus();loadFiles();loadUpdateStatus();loadMeshNodes();loadChOverrides();
 </script>
 </body>
 </html>

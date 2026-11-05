@@ -35,11 +35,18 @@ on:
   workflow_dispatch:
 
 env:
-  # How many of the most recent releases to make flashable from the web UI.
-  # Each mirrored board binary is trimmed to its meaningful prefix (trailing
-  # 0xFF flash padding stripped -- see the mirror step), so this is roughly
-  # RELEASE_HISTORY_LIMIT x 3 boards x ~2 MB in the deployed Pages artifact.
+  # How many of the most recent (v3.0+, see MIN_FLASHABLE_MAJOR below) releases
+  # to make flashable from the web UI. Each mirrored board binary is trimmed to
+  # its meaningful prefix (trailing 0xFF flash padding stripped -- see the
+  # mirror step), so this is roughly RELEASE_HISTORY_LIMIT x 3 boards x ~2 MB
+  # in the deployed Pages artifact.
   RELEASE_HISTORY_LIMIT: "10"
+  # Releases older than this major version introduced the huge_app partition
+  # scheme -> default_8MB breaking change (OTA support) and are never mirrored
+  # or offered by the web flasher -- flashing one of those binaries over an
+  # already-v3.0+ board would silently downgrade its partition table. Anyone
+  # needing a pre-3.0 image must build/flash it manually from source.
+  MIN_FLASHABLE_MAJOR: "3"
 
 permissions:
   contents: read
@@ -96,13 +103,19 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          python3 - "${{ github.repository }}" "${{ env.RELEASE_HISTORY_LIMIT }}" <<'PYEOF'
+          python3 - "${{ github.repository }}" "${{ env.RELEASE_HISTORY_LIMIT }}" "${{ env.MIN_FLASHABLE_MAJOR }}" <<'PYEOF'
           import json, os, re, shutil, subprocess, sys
 
-          repo, limit = sys.argv[1], int(sys.argv[2])
+          repo, limit, min_major = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
 
           def run(cmd):
               return subprocess.run(cmd, capture_output=True, text=True)
+
+          def parse_major(tag):
+              # "v3.0" / "v2.84" / "3.0" -> major int, or None if unparseable
+              # (treated as not-flashable -- never guess a pre-3.0 tag is safe).
+              m = re.match(r"^v?(\d+)\.\d+", tag.strip())
+              return int(m.group(1)) if m else None
 
           def trim_trailing_ff(path):
               # The ESP32 core's merge-bin step pads each merged.bin out to the
@@ -121,14 +134,26 @@ jobs:
               if 0 < end < len(data):
                   open(path, "wb").write(data[:end])
 
+          # Fetch a larger pool than `limit` up front -- release history can
+          # still contain pre-3.0 tags for a while after the v3.0 partition-
+          # scheme change, and those are filtered out below before truncating
+          # to `limit`, so a naive --limit here could starve the final list
+          # down to fewer than `limit` flashable releases even though more
+          # exist further back.
           tags_out = run([
               "gh", "release", "list", "--repo", repo, "--exclude-drafts",
-              "--limit", str(limit), "--json", "tagName", "-q", ".[].tagName",
+              "--limit", str(max(limit * 5, 50)), "--json", "tagName", "-q", ".[].tagName",
           ])
           if tags_out.returncode != 0:
               print(f"gh release list failed: {tags_out.stderr}", file=sys.stderr)
               sys.exit(1)
-          tags = [t for t in tags_out.stdout.splitlines() if t.strip()]
+          all_tags = [t for t in tags_out.stdout.splitlines() if t.strip()]
+
+          skipped = [t for t in all_tags if (parse_major(t) or -1) < min_major]
+          tags = [t for t in all_tags if (parse_major(t) or -1) >= min_major][:limit]
+          if skipped:
+              print(f"Not mirroring {len(skipped)} pre-v{min_major}.0 release(s) "
+                    f"(no OTA partition support): {skipped}")
           print(f"Mirroring {len(tags)} release(s): {tags}")
 
           releases = []

@@ -153,6 +153,10 @@ void cfgAssignKV(const String& k, const String& v) {
     String vv = v; vv.toLowerCase();
     cfg.wardriveGoBridge = (vv == "true" || vv == "1");
   }
+  else if (k == "autoUpdateHeadlessNodes") {
+    String vv = v; vv.toLowerCase();
+    cfg.autoUpdateHeadlessNodes = (vv == "true" || vv == "1");
+  }
 }
 
 void cfgEnforceMutualExclusion() {
@@ -355,6 +359,13 @@ bool saveConfigToSD() {
   f.println("");
   f.println("# Wardrive Go / WarBLE Go BLE bridge -- active only on the Mesh Node/Core page.");
   f.print("wardriveGoBridge="); f.println(cfg.wardriveGoBridge ? "true" : "false");
+
+  f.println("");
+  f.println("# Auto-push firmware to out-of-date headless PigletNode nodes (no on-screen");
+  f.println("# confirm -- they have no display). XIAO nodes always use the on-device");
+  f.println("# confirm prompt instead, regardless of this setting.");
+  f.println("# CAUTION: use an SD card rated at least 16GB for sustained-write reliability.");
+  f.print("autoUpdateHeadlessNodes="); f.println(cfg.autoUpdateHeadlessNodes ? "true" : "false");
 
   f.flush();
   f.close();

@@ -47,6 +47,24 @@ web flasher's install-progress modal, were contributed by Skonsolo.
 
 ---
 
+## Core-Pushed Mesh OTA Updates & Self-Update Design
+
+**Project:** warhog  
+**Author:** olosnoks ([@olosnoks](https://github.com/olosnoks))  
+**Repository:** https://github.com/olosnoks/warhog
+
+Piglet's **v3.0 OTA update system** -- the Core-pushed mesh node firmware update
+engine (`coreOta*`/`nodeOta*` in `MeshNode.cpp` and the TDongleC5_Piglet/PigletNode
+equivalents) and its wire protocol (`OtaProto.h`) -- is ported from the design in
+olosnoks' `warhog` project, which pioneered pushing firmware to ESP-Now mesh nodes
+over the existing link with no USB or Wi-Fi infrastructure needed. The self-update-
+from-GitHub-Releases layer built on top, and the Piglet-specific board-type
+disambiguation needed because every Piglet variant shares the same ESP32-C5
+silicon, are new work for this project. olosnoks is also credited above for the
+Wardrive Go Bridge design this project's own bridge is modeled on.
+
+---
+
 ## Project
 
 **Author:** Midwest Gadgets LLC  

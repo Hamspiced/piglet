@@ -22,7 +22,11 @@ env:
   # prior version of this FQBN had it disabled, which also starved NimBLE
   # of heap badly enough to break the Wardrive Go BLE bridge on release/
   # web-flashed boards.
-  FQBN: "esp32:esp32:XIAO_ESP32C5:CDCOnBoot=cdc,CPUFreq=80,FlashFreq=80,FlashMode=qio,FlashSize=8M,PartitionScheme=huge_app,DebugLevel=none,PSRAM=enabled,EraseFlash=none,JTAGAdapter=default,ZigbeeMode=default"
+  # PartitionScheme=default_8MB (3MB APP / 1.5MB SPIFFS, two OTA app slots)
+  # replaces the old single-app huge_app scheme as of v3.0 -- required for
+  # Update.h-based OTA (both self-update and Core-pushed mesh node updates).
+  # Boards still on huge_app need one more full reflash to gain OTA capability.
+  FQBN: "esp32:esp32:XIAO_ESP32C5:CDCOnBoot=cdc,CPUFreq=80,FlashFreq=80,FlashMode=qio,FlashSize=8M,PartitionScheme=default_8MB,DebugLevel=none,PSRAM=enabled,EraseFlash=none,JTAGAdapter=default,ZigbeeMode=default"
 
 jobs:
   build:
@@ -102,6 +106,12 @@ jobs:
           OUT="dist/${{ matrix.name }}"
           mkdir -p "$OUT"
           cp "$OUT_DIR"/*.bin "$OUT"/
+          # Plain app image, republished under a stable, predictable name --
+          # this is what each board's self-update / Core-pushed mesh OTA
+          # downloader fetches from the release (see FirmwareUpdate.cpp /
+          # MeshNode.cpp's coreOtaPreload()). Must stay in sync with the
+          # FW_OWN_ASSET / coreOtaImages[] filenames in firmware.
+          cp "$OUT_DIR/${{ matrix.name }}.ino.bin" "$OUT/${{ matrix.name }}.ota.bin"
           ( cd dist && zip -j "${{ matrix.name }}.zip" "${{ matrix.name }}"/*.bin )
           ls -la "$OUT" dist/*.zip
 

@@ -34,6 +34,11 @@ Designed for **[Seeed XIAO ESP32-S3](https://wiki.seeedstudio.com/xiao_esp32s3_g
 - **Auto-start wardriving after uploads** — set `autoStartAfterUpload=true` to disconnect from home Wi-Fi immediately after boot uploads complete and begin scanning without delay
 - **PigletNode** — standalone minimal firmware for XIAO ESP32-C5 that boots directly as a mesh node (no display, GPS, or SD required)
 - **Wardrive Go BLE bridge** — while on the Mesh Node/Core page, advertise a RocketGod "iosESP" BLE bridge so the Wardrive Go / WarBLE Go phone app can pair and plot APs live on its map
+- **Self-update from GitHub Releases** — checks for a newer firmware version at boot and, with one click in the Web UI, downloads and flashes it over the air
+- **Core-pushed mesh node OTA updates** — a Piglet acting as Core can push a new firmware image to any connected node (PigletNode, T-Dongle C5, or headless XIAO) over the existing ESP-Now link, no USB required
+- **On-device "Update Nodes through Core?" prompt** — a Core's own screen shows a 30-second confirm prompt when a connected XIAO-based node is running mismatched firmware; a single button press confirms the push
+- **Auto-update for headless PigletNode nodes** — optional toggle lets a Core silently push firmware to out-of-date headless PigletNode nodes with no on-device confirmation
+- **Manual per-node channel-range overrides** — pin a specific mesh node (by MAC) to a fixed channel range from the Web UI instead of the automatic even split
 
 
 ## ESP-Now Mesh Network Node Mode
@@ -458,6 +463,19 @@ ssidWhitelist10=
 # Values: true or false
 
 wardriveGoBridge=false
+
+# ------------------------------------------------------------
+# Auto-Update Headless PigletNode Nodes (Core mode)
+# ------------------------------------------------------------
+# When true, a Core silently pushes staged /Firmware/PigletNode.ota.bin to
+# any connected headless PigletNode running different firmware -- no
+# on-device confirmation, since those nodes have no screen. XIAO-based
+# nodes (Piglet/TDongleC5_Piglet) always use the on-screen confirm prompt
+# instead, regardless of this setting. Recommended: use an SD card rated
+# at least 16GB for sustained-write reliability.
+# Values: true or false
+
+autoUpdateHeadlessNodes=false
 ```
 
 ### Auto-Start Wardriving After Uploads — How to Disable
@@ -527,12 +545,15 @@ Entering **page 5** automatically starts ESP-Now node mode. Leaving it (single p
 
 While on this page, **double-pressing** toggles the Wardrive Go BLE bridge on/off immediately (no reboot or page re-entry needed) and saves the new state to `/wardriver.cfg`, so it stays on for this page on future boots too — the same effect as flipping the Web UI's **Wardrive Go BLE Bridge** toggle and saving. See [Wardrive Go BLE Bridge](#wardrive-go-ble-bridge) above.
 
+When acting as **Core** and a connected XIAO-based node has mismatched firmware, the page instead shows an **"Update Nodes through Core?"** confirm prompt; a single press on that page confirms the push (instead of advancing to the next page) for as long as the prompt is showing. See [Firmware Updates](#firmware-updates-v30) below.
+
 ## Building Firmware
 
 ### Requirements
 
 - **Arduino IDE 2.x** or **PlatformIO**
-- **Arduino-ESP32 core** v3.0.0 or later
+- **Arduino-ESP32 core v3.3.10** — this is the exact version used to build official releases (see `.github/workflows/release-firmware.yml`) and the version this project is tested against. In Arduino IDE's Boards Manager, select version **3.3.10** specifically from the dropdown before installing (it keeps multiple versions installable side by side).
+  > **Known issue:** ESP32 Arduino core **3.3.11 and 3.3.12** introduce a regression on the XIAO ESP32-C5's native USB that breaks the normal auto-reset-into-bootloader sequence — uploads from Arduino IDE will silently fail to connect unless you manually hold **BOOT**, tap **RESET**, then release **BOOT**. If you're hitting this, downgrade to core **3.3.10** via Boards Manager; it resolves the issue with no other changes needed.
 
 ### Required Libraries — XIAO Variant (S3 / C5 / C6)
 
@@ -569,11 +590,33 @@ All networking, SPI, SD, ESP-Now, and ESP-IDF headers are built into the ESP32 c
 1. Select the correct **XIAO ESP32 board** variant (S3, C5, or C6)
 2. **CRITICAL:** Enable **PSRAM** (required for TLS/HTTPS uploads)
    - Tools → PSRAM → **OPI PSRAM** (C5/C6) or **QSPI PSRAM** (S3)
-3. Use a **large app partition scheme** → **Huge APP (3MB No OTA/1MB SPIFFS)**
-4. Upload firmware  
+3. Use the **`8M with spiffs (3MB APP/1.5MB SPIFFS)`** partition scheme — this gives two OTA app slots, required for self-update and Core-pushed mesh node updates (v3.0+). Boards still on the old **Huge APP (3MB No OTA)** scheme need one more reflash with this scheme to gain OTA capability.
+4. Upload firmware (see the **Known issue** note above if the board won't auto-reset into bootloader mode on upload)
 5. Insert **FAT32-formatted SD card**  
 6. Add `/wardriver.cfg` to SD card root with your WiGLE API key and WiFi credentials
 7. Restart device with RST button or power cycle
+
+### Firmware Updates (v3.0+)
+
+Every board can check GitHub Releases for a newer firmware version and install it over the air, and a Piglet acting as mesh Core can push updates out to connected nodes of any board type.
+
+**Self-update (per device):**
+1. At boot, if connected to the home network, the device checks `github.com/Hamspiced/piglet` releases for a newer version and shows the result in the Web UI's **Firmware Update** card.
+2. Click **Install Update** — the device downloads its own firmware image over HTTPS and flashes it via the ESP32's native OTA mechanism, then reboots automatically.
+3. In the same pass, it also downloads the other two boards' images to `/Firmware/` on the SD card, so a Core can immediately push them to connected nodes (see below).
+
+**Core-pushed mesh node updates:**
+- A Piglet acting as Core reads `/Firmware/<Board>.ota.bin` files from its SD card at boot (one file per board type: `Piglet.ota.bin`, `TDongleC5_Piglet.ota.bin`, `PigletNode.ota.bin`).
+- The Web UI's **Mesh Nodes** panel (shown only in Core mode) lists connected nodes with an **Update** button; clicking it streams the matching image to that node over the existing ESP-Now link — no USB needed.
+- Every node reports its firmware version to the Core on each discovery handshake and heartbeat. When a connected **XIAO-based** node (Piglet or TDongleC5_Piglet) is running mismatched firmware, the Core's own screen shows an **"Update Nodes through Core?"** prompt with a 30-second countdown; a single button press on that page confirms the push instead of advancing to the next page, and letting it time out skips that node for the rest of the session. Multiple mismatched nodes queue and are pushed one at a time, with live progress shown on-screen.
+- Headless **PigletNode** nodes have no screen, so they're never prompted. Enable the **Auto-Update Headless PigletNode Nodes** Web UI toggle (`autoUpdateHeadlessNodes`, default off) to have the Core silently push staged firmware to them instead, retried at most once per node per session. Recommended for use with an SD card rated at least 16GB for sustained-write reliability.
+- The **Store Piglet Node Firmware** button (Firmware Update card) downloads the latest `PigletNode.ota.bin` release asset to `/Firmware/` on demand — this works even when the Core's own firmware is already current, unlike the self-update check above which only resolves release assets when a *newer* version is found.
+- The node verifies a SHA-256 of the whole image before switching its boot partition, so an interrupted or corrupted transfer leaves it running its old firmware.
+- A board-type marker prevents accidentally pushing the wrong board's image (e.g. a T-Dongle image to a bare PigletNode) even though every Piglet variant shares the same ESP32-C5 silicon.
+- `/Firmware/` can also be populated manually (copy a release's `.ota.bin` assets onto the SD card) for offline/no-home-network setups.
+- The Web UI's Mesh Nodes card also has a **Channel Overrides** panel: pin a specific node (by MAC) to a fixed channel range instead of the automatic even split — useful for a node with a directional antenna aimed at a specific band. Persisted to `/mesh_channel_overrides.cfg` on the Core's SD card.
+
+**Security note:** image integrity is checked via SHA-256 (corruption/truncation), not a cryptographic signature (authenticity) — this matches the trust model of the rest of Piglet's ESP-Now mesh, which has no built-in authentication either.
 
 ### Where to Order
 

@@ -36,6 +36,7 @@
 #include "WebUI.h"
 #include "MeshNode.h"
 #include "WardriveGoBLE.h"
+#include "FirmwareUpdate.h"
 
 // -------- Battery Test (uncomment to enable) --------
 #include "battery_test.h"
@@ -217,6 +218,12 @@ static void pollButton() {
       else                      wardriveGoBleSuspend();
       Serial.print("[BTN] Double press -> Wardrive Go bridge ");
       Serial.println(cfg.wardriveGoBridge ? "ENABLED" : "DISABLED");
+    } else if (currentPage == 5 && meshCoreActive && coreUpdatePromptStatus().promptActive) {
+      // "Update Nodes through Core?" prompt showing -- a press here confirms
+      // it instead of cycling to the next page, since the prompt itself is
+      // using this page's normal single-press action.
+      coreUpdatePromptConfirm();
+      Serial.println("[BTN] Press -> mesh update prompt confirmed");
     } else {
       // Single press -> cycle page (once, regardless of extra clicks)
       uint8_t oldPage = currentPage;
@@ -356,6 +363,11 @@ void setup() {
     }
   }
 
+  // Mesh Core OTA images: load once now (PSRAM-resident) so that entering
+  // Core mode later via long-press -- with no reboot in between -- already
+  // has whatever /Firmware/*.ota.bin images are on the card ready to push.
+  coreOtaPreload();
+
   // =========================
   // Phase 3: Init Button + OLED + GPS using FINAL pins
   // =========================
@@ -472,6 +484,13 @@ void setup() {
   }
 
   lastStaStatus = WiFi.status();
+
+  // Self-update check: boot-only, separate from the mid-drive "home network
+  // seen" auto-upload path (checkHomeNetworkReturn() in WiFiManager.cpp).
+  // Silent/non-fatal if offline -- never delays the boot-upload block below.
+  if (staOk) {
+    fwCheckForUpdate();
+  }
 
   // Boot upload: WDGoWars first (if key set), then WiGLE (if token set),
   // then move files. Requires STA connection and SD card.
