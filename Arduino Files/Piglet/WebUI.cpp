@@ -1205,6 +1205,7 @@ static void handleStatus() {
   }
 
   String output;
+  output.reserve(measureJson(doc) + 1);
   serializeJson(doc, output);
   server.send(200, "application/json", output);
 }
@@ -1258,6 +1259,7 @@ static void handleFiles() {
   }
 
   String output;
+  output.reserve(measureJson(doc) + 1);
   serializeJson(doc, output);
   server.send(200, "application/json", output);
 }
@@ -1309,7 +1311,7 @@ static void handleDeleteAll() {
   DynamicJsonDocument doc(128);
   doc["ok"] = true;
   doc["deleted"] = deleted;
-  String out; serializeJson(doc, out);
+  String out; out.reserve(measureJson(doc) + 1); serializeJson(doc, out);
   server.send(200, "application/json", out);
 }
 
@@ -1418,6 +1420,7 @@ static void handleWigleTest() {
   doc["message"] = uploadLastResult;
 
   String out;
+  out.reserve(measureJson(doc) + 1);
   serializeJson(doc, out);
   server.send(ok ? 200 : 400, "application/json", out);
 }
@@ -1441,6 +1444,7 @@ static void handleWdgwarsTest() {
   doc["message"] = uploadLastResult;
 
   String out;
+  out.reserve(measureJson(doc) + 1);
   serializeJson(doc, out);
   server.send(ok ? 200 : 400, "application/json", out);
 }
@@ -1460,6 +1464,7 @@ static void handleWdgwarsUploadAll() {
   doc["message"]  = uploadLastResult;
 
   String out;
+  out.reserve(measureJson(doc) + 1);
   serializeJson(doc, out);
   server.send(200, "application/json", out);
 }
@@ -1483,6 +1488,7 @@ static void handleWardriftTest() {
   doc["message"] = uploadLastResult;
 
   String out;
+  out.reserve(measureJson(doc) + 1);
   serializeJson(doc, out);
   server.send(ok ? 200 : 400, "application/json", out);
 }
@@ -1501,6 +1507,7 @@ static void handleWardriftUploadAll() {
   doc["message"]  = uploadLastResult;
 
   String out;
+  out.reserve(measureJson(doc) + 1);
   serializeJson(doc, out);
   server.send(200, "application/json", out);
 }
@@ -1522,6 +1529,7 @@ static void handleWigleUploadAll() {
   doc["message"] = uploadLastResult;
 
   String out;
+  out.reserve(measureJson(doc) + 1);
   serializeJson(doc, out);
   server.send(200, "application/json", out);
 }
@@ -1618,6 +1626,7 @@ static void handleWigleUploadOne() {
   doc["message"] = message;
 
   String out;
+  out.reserve(measureJson(doc) + 1);
   serializeJson(doc, out);
   server.send(ok ? 200 : 500, "application/json", out);
 }
@@ -1668,6 +1677,7 @@ static void handleMeshNodes() {
   ota["loadMsg"]    = st.loadMsg;
 
   String out;
+  out.reserve(measureJson(doc) + 1);
   serializeJson(doc, out);
   server.send(200, "application/json", out);
 }
@@ -1685,6 +1695,7 @@ static void handleMeshOtaStart() {
   doc["msg"] = st.msg;
 
   String out;
+  out.reserve(measureJson(doc) + 1);
   serializeJson(doc, out);
   server.send(ok ? 200 : 400, "application/json", out);
 }
@@ -1720,6 +1731,7 @@ static void handleMeshChannelOverridesGet() {
   }
 
   String out;
+  out.reserve(measureJson(doc) + 1);
   serializeJson(doc, out);
   server.send(200, "application/json", out);
 }
@@ -1742,6 +1754,7 @@ static void handleMeshChannelOverridesSet() {
   doc["ok"] = ok;
   if (!ok) doc["error"] = "Invalid channel -- must match a supported 2.4/5GHz channel number";
   String out;
+  out.reserve(measureJson(doc) + 1);
   serializeJson(doc, out);
   server.send(ok ? 200 : 400, "application/json", out);
 }
@@ -1773,6 +1786,7 @@ static void handleUpdateStatus() {
   doc["stageNodeError"]  = fwStageNodeError;
 
   String out;
+  out.reserve(measureJson(doc) + 1);
   serializeJson(doc, out);
   server.send(200, "application/json", out);
 }
@@ -1792,6 +1806,7 @@ static void handleUpdateCheck() {
   doc["availableVersion"] = fwAvailableVersion;
 
   String out;
+  out.reserve(measureJson(doc) + 1);
   serializeJson(doc, out);
   server.send(200, "application/json", out);
 }
@@ -1810,6 +1825,7 @@ static void handleUpdateInstall() {
   doc["error"] = fwInstallError;
 
   String out;
+  out.reserve(measureJson(doc) + 1);
   serializeJson(doc, out);
   server.send(ok ? 200 : 500, "application/json", out);
 }
@@ -1828,6 +1844,7 @@ static void handleUpdateStageNode() {
   doc["error"] = fwStageNodeError;
 
   String out;
+  out.reserve(measureJson(doc) + 1);
   serializeJson(doc, out);
   server.send(ok ? 200 : 500, "application/json", out);
 }

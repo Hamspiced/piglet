@@ -4755,7 +4755,7 @@ static void handleStatus() {
     c[String("ssidWhitelist") + String(i + 1)] = cfg.ssidWhitelist[i];
   }
 
-  String out; serializeJson(doc, out);
+  String out; out.reserve(measureJson(doc) + 1); serializeJson(doc, out);
   server.send(200, "application/json", out);
 }
 
@@ -4781,7 +4781,7 @@ static void handleFiles() {
   doc["ok"] = sdOk;
   JsonArray arr = doc.createNestedArray("files");
   if (sdOk) { addDirFiles(arr, "/logs"); addDirFiles(arr, "/uploaded"); }
-  String out; serializeJson(doc, out);
+  String out; out.reserve(measureJson(doc) + 1); serializeJson(doc, out);
   server.send(200, "application/json", out);
 }
 
@@ -4836,7 +4836,7 @@ static void handleDeleteAll() {
   DynamicJsonDocument doc(128);
   doc["ok"] = true;
   doc["deleted"] = deleted;
-  String out; serializeJson(doc, out);
+  String out; out.reserve(measureJson(doc) + 1); serializeJson(doc, out);
   server.send(200, "application/json", out);
 }
 
@@ -4878,7 +4878,7 @@ static void handleWigleTest() {
   DynamicJsonDocument doc(384);
   doc["ok"] = ok; doc["tokenStatus"] = wigleTokenStatus;
   doc["httpCode"] = wigleLastHttpCode; doc["message"] = uploadLastResult;
-  String out; serializeJson(doc, out);
+  String out; out.reserve(measureJson(doc) + 1); serializeJson(doc, out);
   server.send(ok ? 200 : 400, "application/json", out);
 }
 
@@ -4888,7 +4888,7 @@ static void handleWdgwarsTest() {
   bool ok = wdgwarsTestKey();
   DynamicJsonDocument doc(256);
   doc["ok"] = ok; doc["message"] = uploadLastResult;
-  String out; serializeJson(doc, out);
+  String out; out.reserve(measureJson(doc) + 1); serializeJson(doc, out);
   server.send(ok ? 200 : 400, "application/json", out);
 }
 
@@ -4899,7 +4899,7 @@ static void handleWdgwarsUploadAll() {
   uint32_t okCount = uploadAllCsvsToWdgwars();
   DynamicJsonDocument doc(256);
   doc["ok"]=(okCount>0); doc["uploaded"]=okCount; doc["total"]=uploadTotalFiles; doc["message"]=uploadLastResult;
-  String out; serializeJson(doc, out);
+  String out; out.reserve(measureJson(doc) + 1); serializeJson(doc, out);
   server.send(200, "application/json", out);
 }
 
@@ -4909,7 +4909,7 @@ static void handleWardriftTest() {
   bool ok = wardriftTestKey();
   DynamicJsonDocument doc(256);
   doc["ok"] = ok; doc["message"] = uploadLastResult;
-  String out; serializeJson(doc, out);
+  String out; out.reserve(measureJson(doc) + 1); serializeJson(doc, out);
   server.send(ok ? 200 : 400, "application/json", out);
 }
 
@@ -4920,7 +4920,7 @@ static void handleWardriftUploadAll() {
   uint32_t okCount = uploadAllCsvsToWardrift();
   DynamicJsonDocument doc(256);
   doc["ok"]=(okCount>0); doc["uploaded"]=okCount; doc["total"]=uploadTotalFiles; doc["message"]=uploadLastResult;
-  String out; serializeJson(doc, out);
+  String out; out.reserve(measureJson(doc) + 1); serializeJson(doc, out);
   server.send(200, "application/json", out);
 }
 
@@ -4970,7 +4970,7 @@ static void handleWigleUploadAll() {
   DynamicJsonDocument doc(384);
   doc["ok"] = (okCount > 0); doc["uploaded"] = okCount;
   doc["total"] = uploadTotalFiles; doc["message"] = uploadLastResult;
-  String out; serializeJson(doc, out);
+  String out; out.reserve(measureJson(doc) + 1); serializeJson(doc, out);
   server.send(200, "application/json", out);
 }
 
@@ -5048,7 +5048,7 @@ static void handleWigleUploadOne() {
 
   DynamicJsonDocument doc(384);
   doc["ok"] = ok; doc["httpCode"] = wigleLastHttpCode; doc["message"] = message;
-  String out; serializeJson(doc, out);
+  String out; out.reserve(measureJson(doc) + 1); serializeJson(doc, out);
   server.send(ok ? 200 : 500, "application/json", out);
 }
 
@@ -5205,6 +5205,7 @@ static void handleMeshNodes() {
   ota["loadMsg"]    = st.loadMsg;
 
   String out;
+  out.reserve(measureJson(doc) + 1);
   serializeJson(doc, out);
   server.send(200, "application/json", out);
 }
@@ -5222,6 +5223,7 @@ static void handleMeshOtaStart() {
   doc["msg"] = st.msg;
 
   String out;
+  out.reserve(measureJson(doc) + 1);
   serializeJson(doc, out);
   server.send(ok ? 200 : 400, "application/json", out);
 }
@@ -5314,7 +5316,19 @@ static void fwCheckForUpdate() {
 
   int code = http.GET();
   if (code != HTTP_CODE_OK) {
-    Serial.printf("[FWUPD] GitHub API returned HTTP %d\n", code);
+    // A negative code (e.g. -1 = HTTPC_ERROR_CONNECTION_REFUSED) means the
+    // TLS/TCP connection itself never completed -- no HTTP response was
+    // ever received, so this is NOT the firmware concluding "no update
+    // available". client.lastError() surfaces the actual mbedTLS/socket
+    // failure (DNS, handshake, timeout, etc.) instead of just the bare,
+    // uninformative HTTPClient error code.
+    if (code < 0) {
+      char errBuf[100];
+      int sslErr = client.lastError(errBuf, sizeof(errBuf));
+      Serial.printf("[FWUPD] GitHub API returned HTTP %d (TLS error %d: %s)\n", code, sslErr, errBuf);
+    } else {
+      Serial.printf("[FWUPD] GitHub API returned HTTP %d\n", code);
+    }
     http.end();
     fwUpdateChecked = true;
     return;
@@ -5583,6 +5597,7 @@ static void handleUpdateStatus() {
   doc["stageNodeError"]   = fwStageNodeError;
 
   String out;
+  out.reserve(measureJson(doc) + 1);
   serializeJson(doc, out);
   server.send(200, "application/json", out);
 }
@@ -5600,6 +5615,7 @@ static void handleUpdateCheck() {
   doc["availableVersion"] = fwAvailableVersion;
 
   String out;
+  out.reserve(measureJson(doc) + 1);
   serializeJson(doc, out);
   server.send(200, "application/json", out);
 }
@@ -5615,6 +5631,7 @@ static void handleUpdateInstall() {
   doc["error"] = fwInstallError;
 
   String out;
+  out.reserve(measureJson(doc) + 1);
   serializeJson(doc, out);
   server.send(ok ? 200 : 500, "application/json", out);
 }
@@ -5630,6 +5647,7 @@ static void handleUpdateStageNode() {
   doc["error"] = fwStageNodeError;
 
   String out;
+  out.reserve(measureJson(doc) + 1);
   serializeJson(doc, out);
   server.send(ok ? 200 : 500, "application/json", out);
 }
@@ -5659,6 +5677,7 @@ static void handleMeshChannelOverridesGet() {
   }
 
   String out;
+  out.reserve(measureJson(doc) + 1);
   serializeJson(doc, out);
   server.send(200, "application/json", out);
 }
@@ -5681,6 +5700,7 @@ static void handleMeshChannelOverridesSet() {
   doc["ok"] = ok;
   if (!ok) doc["error"] = "Invalid channel -- must match a supported 2.4/5GHz channel number";
   String out;
+  out.reserve(measureJson(doc) + 1);
   serializeJson(doc, out);
   server.send(ok ? 200 : 400, "application/json", out);
 }

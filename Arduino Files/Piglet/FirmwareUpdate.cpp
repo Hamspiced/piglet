@@ -91,7 +91,19 @@ void fwCheckForUpdate() {
 
   int code = http.GET();
   if (code != HTTP_CODE_OK) {
-    Serial.printf("[FWUPD] GitHub API returned HTTP %d\n", code);
+    // A negative code (e.g. -1 = HTTPC_ERROR_CONNECTION_REFUSED) means the
+    // TLS/TCP connection itself never completed -- no HTTP response was
+    // ever received, so this is NOT the firmware concluding "no update
+    // available". client.lastError() surfaces the actual mbedTLS/socket
+    // failure (DNS, handshake, timeout, etc.) instead of just the bare,
+    // uninformative HTTPClient error code.
+    if (code < 0) {
+      char errBuf[100];
+      int sslErr = client.lastError(errBuf, sizeof(errBuf));
+      Serial.printf("[FWUPD] GitHub API returned HTTP %d (TLS error %d: %s)\n", code, sslErr, errBuf);
+    } else {
+      Serial.printf("[FWUPD] GitHub API returned HTTP %d\n", code);
+    }
     http.end();
     fwUpdateChecked = true;
     return;
