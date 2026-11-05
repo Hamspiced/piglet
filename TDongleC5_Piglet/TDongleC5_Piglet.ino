@@ -89,7 +89,7 @@ struct CoreUpdatePromptStatus {
 };
 
 // Firmware version
-#define FIRMWARE_VERSION "v3.01"
+#define FIRMWARE_VERSION "v3.02"
 
 // ---------------- Pins (T-DONGLE C5) ----------------
 struct PinMap {
