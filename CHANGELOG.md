@@ -1,5 +1,12 @@
 # Changelog
 
+## v3.03 (2026-11-05)
+
+### Bug Fixes
+- **Firmware self-update check could fragment the heap enough to break the install that followed it** -- `fwCheckForUpdate()` buffered GitHub's entire API response via `http.getString()`. GitHub serves that response with chunked transfer-encoding (no `Content-Length`), and in that case `getString()` skips pre-reserving its internal buffer and grows it incrementally as chunks arrive -- the same unreserved-`String` fragmentation pattern fixed in the Web UI's JSON handlers in v3.02, just in a different, less-frequently-exercised code path. This response can run several KB (full release notes + asset list) and runs immediately before `fwInstallUpdate()`'s own sequence of TLS downloads, so the fragmentation it left behind directly caused those downloads to fail with `SSL - Memory allocation failed`, even though total free heap looked fine. The response is now buffered into a pre-reserved `StreamString` (single allocation) instead. Applied to both the main Piglet firmware and the T-Dongle C5 standalone firmware.
+
+---
+
 ## v3.02 (2026-11-05)
 
 ### New Features

@@ -23,7 +23,7 @@
 #include "mbedtls/sha256.h"
 #include "OtaProto.h"
 
-#define FIRMWARE_VERSION "v3.02"
+#define FIRMWARE_VERSION "v3.03"
 
 // ================================================================
 //  Board — XIAO ESP32-C5

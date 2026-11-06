@@ -5,6 +5,7 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <Update.h>
+#include <StreamString.h>
 
 // This board's own release asset, plus the other two boards' assets staged
 // into /Firmware/ for the mesh Core-push engine (MeshNode.cpp's
@@ -123,10 +124,23 @@ void fwCheckForUpdate() {
   // readers (getString()/writeToStream()) -- reading the raw connection via
   // getStream() exposes those framing bytes directly to the JSON parser,
   // corrupting the parse (and was leaving the TLS connection in a state
-  // that could crash a later check). Buffering via getString() first avoids
-  // this; the filtered DynamicJsonDocument below still keeps actual parsed
-  // memory use small regardless of the raw body size.
-  String payload = http.getString();
+  // that could crash a later check). Buffering first avoids this; the
+  // filtered DynamicJsonDocument below still keeps actual parsed memory use
+  // small regardless of the raw body size.
+  //
+  // NOT using http.getString() here: for a chunked response (no
+  // Content-Length, _size == -1) it skips reserving its internal String up
+  // front and grows it one write() at a time as de-chunked bytes arrive --
+  // the same unreserved-String fragmentation pattern already fixed in the
+  // Web UI's JSON handlers. This response can run several KB (full release
+  // notes + asset list) and runs immediately before fwInstallUpdate()'s own
+  // sequence of TLS downloads, so that fragmentation directly raises the
+  // odds of those failing with "SSL - Memory allocation failed". Driving
+  // the same de-chunking logic (writeToStream()) into a pre-reserved
+  // StreamString keeps this to a single allocation instead.
+  StreamString payload;
+  payload.reserve(8192);
+  http.writeToStream(&payload);
   http.end();
 
   if (payload.length() == 0) {
@@ -136,8 +150,12 @@ void fwCheckForUpdate() {
   }
 
   DynamicJsonDocument doc(6144);
+  // StreamString publicly inherits both Stream and String, which makes
+  // deserializeJson(doc, payload, ...) ambiguous (ArduinoJson has Reader
+  // specializations for both bases) -- disambiguate by binding to the
+  // String overload explicitly, since the data is already fully buffered.
   DeserializationError err =
-    deserializeJson(doc, payload, DeserializationOption::Filter(filter));
+    deserializeJson(doc, static_cast<const String&>(payload), DeserializationOption::Filter(filter));
 
   if (err) {
     Serial.printf("[FWUPD] JSON parse failed: %s\n", err.c_str());
