@@ -45,7 +45,7 @@ and reliable-record extensions described below.
 ## ESP32-C5-BSP (board hardware support) — MIT
 
 - Upstream: https://github.com/slickrick773/ESP32-C5-BSP
-- Pinned revision: `920a619` (`v0.4.0-6-g920a619`)
+- Pinned revision: `47c32ca` (`v0.5.0`)
 - License: **MIT** — `Copyright (c) 2026 slickrick773`.
 - Consumed as a pinned library dependency (`https://github.com/slickrick773/ESP32-C5-BSP.git` at the full
   commit pinned in `platformio.ini`). In addition, the following proven build artifacts are

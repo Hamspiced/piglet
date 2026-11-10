@@ -10,7 +10,7 @@
 //   * Colours: the sketch's COLOR_*/BLACK/WHITE macros remapped to TFT_eSPI's
 //     RGB565 names.
 //   * Board power/reset/touch/GPS come from the BSP (WsC5_35::*), pinned to the
-//     ESP32-C5-BSP Git dependency @ 920a619.
+//     ESP32-C5-BSP Git dependency @ 47c32ca (v0.5.0).
 //
 // Upstream Piglet is CC BY-NC-SA 4.0; the BSP is MIT. This adapter is part of
 // the Piglet derivative port.

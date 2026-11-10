@@ -4955,7 +4955,9 @@ void setup() {
   // The CH32V006 expander (0x24) powers the panel rail and releases the ST7796
   // and FT6336 resets; it MUST run before tft.init(). It also probes touch.
   // Reset and backlight are on the expander — there are no GPIOs for them.
-  bool exioUp = WsC5_35::begin();
+  // begin(0): backlight stays off until the first frame is drawn. Lit earlier, the
+  // panel shows its own memory (static after power-on, the old picture after reset).
+  bool exioUp = WsC5_35::begin(0);
   Serial.printf("[BOARD] expander %s, touch %s\n",
                 exioUp ? "up" : "MISSING",
                 WsC5_35::Touch::present() ? "present" : "missing");
@@ -4967,6 +4969,7 @@ void setup() {
   tft.setRotation(0);                                 // portrait 320x480 native
   tft.fillScreen(BLACK);
   tft.setTextColor(WHITE, BLACK);
+  delay(150);                                         // glass lags panel memory by a few frames
   WsC5_35::Expander::backlight(200);                  // ~78% (expander PWM; no BL GPIO)
 
   // ---- SD: shares the display SPI bus (SCLK6/MOSI7/MISO2, CS9) ----

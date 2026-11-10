@@ -49,11 +49,16 @@ from the preceding development builds, not a new bench run after packaging.
 | Missing driver callback | Injected callback loss caused a restart at about three seconds, followed by pairing and acknowledged delivery. |
 | Forced re-search | Re-pairing and record delivery recovered. |
 | Final normal build | A 60-second capture contained 295 consecutive unique record ACKs, with no expiry, restart, queue drop, or injected fault. |
+| Clean startup | With the BSP at v0.5.0 the board starts with the backlight off, draws the first frame, waits 150 ms, then lights. 240 fps video of a reset and a cold boot showed dark, then the first frame, with no static or stale picture. |
 
 Power-loss evidence is one card and manually timed cuts, not a guarantee for all
 cards or interruption points. The physical power-cut test was not repeated after
 the final node/parser stabilization; the checked storage policy was unchanged.
 Raw serial captures, receipts, and CSV files are intentionally not distributed.
+
+Every result above except Clean startup was recorded with the earlier BSP
+revision (`920a619`). After the move to v0.5.0 the build, boot, SD mount and
+screen start-up were re-checked; the mesh, GPS and BLE results were not re-run.
 
 ## Host and build checks
 
