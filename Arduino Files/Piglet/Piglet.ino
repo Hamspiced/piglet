@@ -20,6 +20,7 @@
 #include <Wire.h>
 #include <sys/time.h>
 #include <esp_sleep.h>
+#include "esp_heap_caps.h"
 
 #if defined(CONFIG_IDF_TARGET_ESP32S3)
   #include <driver/rtc_io.h>
@@ -33,6 +34,7 @@
 #include "WiFiManager.h"
 #include "Scanner.h"
 #include "WigleUpload.h"
+#include "UploadState.h"
 #include "WebUI.h"
 #include "MeshNode.h"
 #include "WardriveGoBLE.h"
@@ -207,6 +209,21 @@ static void pollButton() {
       statusPagePaused = !statusPagePaused;
       Serial.print("[BTN] Double press -> status page scan ");
       Serial.println(statusPagePaused ? "PAUSED" : "RESUMED");
+    } else if (currentPage == 0 && fwDownloaded && !fwDownloading && !fwInstalling) {
+      // Download finished, status page is showing "Restart to install" --
+      // a single press restarts now. The actual install runs automatically
+      // at next boot (see setup()), not here, so it never competes with
+      // anything else for memory.
+      Serial.println("[BTN] Press -> restarting to install firmware update");
+      ESP.restart();
+    } else if (currentPage == 0 && fwUpdateAvailable && !fwDownloading && !fwDownloaded && !fwInstalling) {
+      // Status page is showing the "Firmware update available" banner --
+      // a single press starts the on-device download instead of cycling
+      // pages. Driven entirely from the OLED/button, no Web UI involved, so
+      // there's no browser polling traffic competing with the download's
+      // TLS session for the same narrow DMA-capable heap pool.
+      Serial.println("[BTN] Press -> starting on-device firmware download");
+      fwDownloadStart();
     } else if (clickCount >= 2 && currentPage == 5) {
       // Double press on Mesh Node/Core page -> toggle the Wardrive Go BLE
       // bridge immediately (mesh mode is already active on this page) and
@@ -405,6 +422,39 @@ void setup() {
     Serial.println("[LCD] SSD1306 init FAIL at 0x3C and 0x3D");
   }
 
+  // Resume an on-device firmware update staged by a previous session: the
+  // "Download & Install" on-device flow (status page button press) writes
+  // this board's own release asset to /Firmware/ and asks the user to
+  // restart rather than installing immediately, so the install itself never
+  // competes with anything else for memory -- see drawPageStatus()/
+  // pollButton() for the download/restart side of this flow. fwInstallFromSD()
+  // normally requires fwDownloaded to already be true (set by this session's
+  // own download); after a fresh boot that in-RAM flag is gone, so set it
+  // here once the file's presence on SD is confirmed. A failed install
+  // (corrupt/partial file) deletes it so a bad image can't block every boot.
+  if (sdOk && SD.exists(fwOwnAssetPath())) {
+    Serial.println("[BOOT] Staged firmware update found -- installing...");
+    if (lcdOk) {
+      display.clearDisplay();
+      display.setTextColor(SSD1306_WHITE);
+      display.setTextSize(1);
+      display.setCursor(0, 20);
+      display.println("Installing firmware");
+      display.println("update...");
+      display.println();
+      display.println("Do not power off.");
+      display.display();
+    }
+    fwDownloaded = true;
+    if (!fwInstallFromSD()) {
+      // fwInstallFromSD() only returns on failure -- success calls
+      // ESP.restart() internally and never comes back here.
+      Serial.printf("[BOOT] Staged firmware install failed: %s -- removing file\n", fwInstallError.c_str());
+      SD.remove(fwOwnAssetPath());
+      fwDownloaded = false;
+    }
+  }
+
   // GPS UART (final pins)
   Serial.println("[GPS] Initializing UART...");
   Serial.print("[GPS] Pins RX=");
@@ -490,6 +540,19 @@ void setup() {
   // Silent/non-fatal if offline -- never delays the boot-upload block below.
   if (staOk) {
     fwCheckForUpdate();
+    // Measures the heap state left behind once fwCheckForUpdate()'s locals
+    // (its TLS session + response buffer) have fully destructed -- this is
+    // exactly the state the first subsequent web request will contend with,
+    // so it directly tests whether that check is what starves it. Also
+    // tracks the MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT pool specifically --
+    // this is the exact capability set FreeRTOS's own allocator (pvPortMalloc,
+    // which backs xQueueCreateMutex) requires, and a prior crash happened
+    // with a large MALLOC_CAP_INTERNAL-only largest-block still reported
+    // available, suggesting the two pools may diverge on this chip.
+    Serial.printf("[FWUPD] Post-check heap: free=%u largestBlock=%u largestBlock8bit=%u\n",
+                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
   }
 
   // Boot upload: WDGoWars first (if key set), then WiGLE (if token set),
@@ -513,8 +576,12 @@ void setup() {
         else
           Serial.printf("[UPLOAD] Auto-uploading CSVs (max %d)...\n", limit);
 
-        uint32_t uploaded = uploadAllCsvsToWigle(limit);
+      uint32_t uploaded = uploadAllPending(limit);
         Serial.printf("[UPLOAD] Done: %d files moved\n", uploaded);
+        Serial.printf("[UPLOAD] Post-upload heap: free=%u largestBlock=%u largestBlock8bit=%u\n",
+                      (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                      (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+                      (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
 
       } else {
         Serial.println("[UPLOAD] Auto-upload disabled (maxBootUploads=0). Use web UI.");
@@ -559,10 +626,12 @@ void setup() {
     Serial.println("[WEB] AP UI: http://192.168.4.1/");
   }
 
-  // Purge any header-only CSVs left over from previous sessions
+  // Purge any header-only CSVs left over from previous sessions, and drop
+  // any per-file upload-ledger entries for files no longer in /logs.
   if (sdOk) {
     Serial.println("[SD] Cleaning up empty CSVs...");
     deleteEmptyCsvs();
+    pruneUploadState();
   }
 
   // Create a fresh log for this run
@@ -665,7 +734,7 @@ void loop() {
   if (gpsHasFix) {
     float hdop = gps.hdop.isValid()       ? gps.hdop.hdop()           : 99.0f;
     int   sats = gps.satellites.isValid() ? (int)gps.satellites.value() : 0;
-    if (hdop <= 10.0f && sats >= 3) {
+    if (hdop <= 10.0f && sats >= 3 && gpsCoordIsValid(gps.location.lat(), gps.location.lng())) {
       lastLat        = gps.location.lat();
       lastLon        = gps.location.lng();
       lastAlt        = gps.altitude.isValid() ? gps.altitude.meters() : 0.0;
@@ -675,8 +744,13 @@ void loop() {
     }
   }
 
-  // GPS health log every 10 s until fix acquired
-  if (!gpsHasFix) {
+  // GPS health log every 10 s until fix acquired. Skipped during a firmware
+  // download: each burst of Serial.printf() over the native USB-Serial/JTAG
+  // CDC interface measurably dipped MALLOC_CAP_DMA largest-free-block in
+  // field testing (the USB peripheral's own internal buffers compete for
+  // the same DMA-capable heap pool TLS needs), right when that pool is
+  // already under the most pressure.
+  if (!gpsHasFix && !fwDownloading) {
     static uint32_t lastGpsDiagMs = 0;
     if (millis() - lastGpsDiagMs >= 10000) {
       lastGpsDiagMs = millis();
@@ -757,8 +831,16 @@ void loop() {
 
   // Check on any WDGoWars jobs queued during the last upload batch. This is
   // rate-limited internally to at most one short network round-trip per
-  // call, so it never blocks scanning, GPS, or the display.
-  wdgwarsServicePendingJobs();
+  // call, so it never blocks scanning, GPS, or the display. Skipped while a
+  // firmware download is in flight -- its own HTTPS connection would
+  // otherwise compete with the download's TLS session for the same narrow
+  // DMA-capable heap pool.
+  if (!fwDownloading) wdgwarsServicePendingJobs();
+
+  // Drive an in-progress firmware download one bounded step at a time. A
+  // no-op unless the Web UI's "Download & Install Firmware" modal has
+  // started a transfer.
+  fwDownloadTick();
 
   // Scanning – page-aware logic
   // Mesh node page handles its own scan via nodeModeTick(); skip normal path.
@@ -771,7 +853,14 @@ void loop() {
     bool apActive = (m == WIFI_AP || m == WIFI_AP_STA);
 
     bool allowScan;
-    if (currentPage == 3) {
+    if (fwDownloading) {
+      // A firmware download is actively holding a TLS session open --
+      // fully stop scanning (overriding even a user scan override) rather
+      // than just throttling it, so the radio and heap aren't also
+      // servicing scan traffic while the download's TLS session needs
+      // every spare byte of the DMA-capable heap pool.
+      allowScan = false;
+    } else if (currentPage == 3) {
       // Pause page: always stop scanning
       allowScan = false;
     } else if (currentPage == 0) {

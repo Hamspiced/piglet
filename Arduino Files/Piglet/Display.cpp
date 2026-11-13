@@ -4,6 +4,7 @@
 #include "Config.h"
 #include "SDUtils.h"
 #include "MeshNode.h"
+#include "FirmwareUpdate.h"
 #include <math.h>
 
 // ---- Splash slogans ----
@@ -453,6 +454,75 @@ void pigAnimTick() {
 static void drawPageStatus(float speedValue) {
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
+
+  // ---- On-device firmware update flow -- full-screen takeover, same idiom
+  // as the "uploading" overlay below. Entirely OLED/button driven: no
+  // browser needs to be open for any of this, which matters here since the
+  // download's TLS session is already fighting for a very narrow slice of
+  // DMA-capable heap -- Web UI polling traffic would otherwise compete for
+  // the same shared WiFi buffer pool at exactly the wrong moment.
+  if (fwDownloading || fwInstalling) {
+    display.setTextSize(2);
+    display.setCursor(0, 0);
+    display.print(fwInstalling ? "Installing" : "Updating");
+    display.setTextSize(1);
+    display.drawFastHLine(0, OLED_YELLOW_H - 1, OLED_W, SSD1306_WHITE);
+
+    int y = OLED_YELLOW_H + 2;
+    display.setCursor(0, y);
+    String stage = fwDownloadStage;
+    if (stage.length() > 21) {
+      display.println(stage.substring(0, 21));
+      y += 10;
+      display.setCursor(0, y);
+      display.println(stage.substring(21, (size_t)stage.length() > 42 ? 42 : stage.length()));
+    } else {
+      display.println(stage);
+    }
+    y += 12;
+
+    if (fwDownloadTotalBytes > 0) {
+      float pct = (float)fwDownloadedBytes / (float)fwDownloadTotalBytes;
+      oledProgressBar(0, y, 128, 10, pct);
+      y += 12;
+      display.setCursor(0, y);
+      display.print((int)(pct * 100));
+      display.print("%");
+    }
+    display.display();
+    return;
+  }
+
+  if (fwDownloaded) {
+    display.setTextSize(2);
+    display.setCursor(0, 0);
+    display.print("Update");
+    display.setTextSize(1);
+    display.drawFastHLine(0, OLED_YELLOW_H - 1, OLED_W, SSD1306_WHITE);
+    display.setCursor(0, OLED_YELLOW_H + 2);
+    display.println("Download complete!");
+    display.println();
+    display.println("Press button to");
+    display.println("restart & install.");
+    display.display();
+    return;
+  }
+
+  if (fwUpdateAvailable) {
+    display.setTextSize(2);
+    display.setCursor(0, 0);
+    display.print("Update!");
+    display.setTextSize(1);
+    display.drawFastHLine(0, OLED_YELLOW_H - 1, OLED_W, SSD1306_WHITE);
+    display.setCursor(0, OLED_YELLOW_H + 2);
+    display.print("New version: ");
+    display.println(fwAvailableVersion);
+    display.println();
+    display.println("Press button to");
+    display.println("download.");
+    display.display();
+    return;
+  }
 
   // ----- Yellow band header (0..15) -----
   display.setTextSize(2);

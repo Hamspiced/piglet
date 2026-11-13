@@ -34,6 +34,7 @@
 #include <stdint.h>
 #include "esp_netif.h"
 #include <vector>
+#include <functional>
 #include <time.h>
 #include <math.h>
 #include <esp_now.h>
@@ -46,7 +47,7 @@
 #include <Update.h>
 #include "mbedtls/sha256.h"
 #include "esp_heap_caps.h"
-#include <StreamString.h>
+#include <stdarg.h>
 
 // ---- Core-side OTA engine types ----
 // Defined here, at the very top of the file, rather than alongside the
@@ -87,6 +88,18 @@ struct CoreUpdatePromptStatus {
   uint8_t  pendingCount;       // nodes queued for update (including the one currently pushing)
   bool     pushActive;         // a coreOta transfer for this queue is in flight
   uint8_t  pushNodeIdx;        // coreNodes[] index being pushed, valid when pushActive
+};
+
+// Per-file, per-service upload status (see UploadService/FileUploadState
+// usage further down) -- defined here for the same top-of-file-prototype
+// reason as CoreOtaStatus above: loadUploadState()/markServiceDone()/
+// allConfiguredServicesDone() use these types in their signatures, and
+// Arduino's auto-generated prototypes are inserted above this point.
+enum class UploadService { Wigle, Wdgw, Wardrift };
+struct FileUploadState {
+  bool wigleDone    = false;
+  bool wdgwDone     = false;
+  bool wardriftDone = false;
 };
 
 // Firmware version
@@ -222,6 +235,16 @@ struct Config {
   // "Update Nodes through Core?" confirm prompt instead. Use an SD card
   // rated at least 16GB for sustained-write reliability. Default off.
   bool autoUpdateHeadlessNodes = false;
+  // When true (default): CSVs are gzip-compressed before upload to WiGLE
+  // (one combined/merged archive per batch) and WDGoWars (each file
+  // individually compressed, since it cannot accept a multi-file archive).
+  // Wardrift uploads are ALWAYS sent uncompressed regardless of this
+  // setting -- its /v1/ingest/signals endpoint does not honor
+  // Content-Encoding: gzip (confirmed in the field: a gzip body comes back
+  // HTTP 400 "file did not contain supported signal rows"). Escape hatch in
+  // case WiGLE/WDGoWars ever reject the gzip framing too -- flip off to
+  // fall back to plain uncompressed uploads for those without a rebuild.
+  bool gzipUploads = true;
 };
 
 Config cfg;
@@ -294,11 +317,46 @@ static String   uploadTargetName  = "";  // shown on TFT during upload
 static int      wigleTokenStatus  = 0;
 static int      wigleLastHttpCode = 0;
 
+// ---------------- Firmware Update State ----------------
+// Declared here (well before the Firmware Update implementation section
+// further down) because updateTFT()/pollButton() need to reference these to
+// drive the on-device "Press button to download/install" flow, and -- unlike
+// function signatures -- Arduino's auto-prototype generator does not forward-
+// declare plain global variables, so they must physically precede any use.
+static bool     fwUpdateChecked = false;
+static bool     fwUpdateAvailable = false;
+static String   fwAvailableVersion = "";
+static String   fwReleaseNotes = "";
+static String   fwCheckError = "";
+
+static bool     fwDownloading = false;
+static bool     fwDownloaded = false;
+static String   fwDownloadStage = "";
+static uint32_t fwDownloadedBytes = 0;
+static uint32_t fwDownloadTotalBytes = 0;
+static String   fwDownloadError = "";
+
+static bool     fwInstalling = false;
+static String   fwInstallError = "";
+
 static const char* WDGWARS_HOST = "wdgwars.pl";
 static const uint16_t WDGWARS_PORT = 443;
 
 static const char* WARDRIFT_HOST = "wardrift.net";
 static const uint16_t WARDRIFT_PORT = 443;
+
+// Logs free/largest-contiguous MALLOC_CAP_DMA heap -- the narrower pool the
+// hardware AES/DMA driver allocates its (small) per-operation descriptors
+// from, separate from general MALLOC_CAP_INTERNAL free heap. A failed
+// client.connect() with plenty of MALLOC_CAP_INTERNAL free but a tight or
+// zero MALLOC_CAP_DMA pool is the "esp-aes: Failed to allocate memory"
+// signature; called on every failed TLS connect attempt below so the next
+// occurrence has concrete numbers instead of a guess.
+static void logDmaHeap(const char* tag) {
+  Serial.printf("[HEAP] %s: dmaFree=%u dmaLargest=%u\n", tag,
+                (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
+                (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
+}
 
 // A 202 response only means the CSV was received and queued for import —
 // it does NOT mean the server has finished processing it. Blocking the
@@ -312,9 +370,18 @@ struct WdgwarsPendingJob {
   String   filename;
   uint32_t queuedAtMs;
   uint32_t lastCheckMs;
+  // Exponential backoff per job -- starts at the base interval and doubles
+  // (capped) each inconclusive check, instead of hammering a fresh TLS
+  // connection every 4s for up to 5 minutes straight. That steady
+  // background TLS churn was a prime suspect for the AES/DMA-pool
+  // exhaustion behind repeated, sustained (not just momentary) "esp-aes:
+  // Failed to allocate memory" failures on foreground Test Token/Key TLS
+  // attempts during the same window.
+  uint32_t nextDelayMs;
 };
 static std::vector<WdgwarsPendingJob> wdgwarsPendingJobs;
-static const uint32_t WDGWARS_JOB_CHECK_INTERVAL_MS = 4000;            // min gap between checks
+static const uint32_t WDGWARS_JOB_CHECK_INTERVAL_MS = 4000;            // base/min gap between checks
+static const uint32_t WDGWARS_JOB_CHECK_MAX_MS      = 60000;           // backoff ceiling per job
 static const uint32_t WDGWARS_JOB_MAX_AGE_MS        = 5UL * 60UL * 1000UL; // give up after 5 min
 
 static const char* WIGLE_HOST = "api.wigle.net";
@@ -409,10 +476,63 @@ static void ledTick() {
 }
 
 // ---------------- Helpers ----------------
+
+// Routes ArduinoJson's JsonDocument allocations to PSRAM (MALLOC_CAP_SPIRAM)
+// instead of the library's default malloc()-backed internal heap. On this
+// chip, plain malloc() (and therefore every un-annotated JsonDocument used
+// across the Web UI's status/files/mesh/update JSON handlers) pulls from the
+// same general internal RAM pool that MALLOC_CAP_DMA is carved from -- the
+// narrow region the WiFi/crypto hardware needs for TLS handshakes. Every one
+// of those JSON buffers competed with and fragmented that pool, even though
+// none of them actually need DMA capability. Moving them to PSRAM frees that
+// headroom for TLS instead. Defined here, near the top of the file, since
+// Arduino's auto-prototype generator needs the class fully defined before
+// any of the many handlers further down that use it.
+class PsramJsonAllocator : public ArduinoJson::Allocator {
+ public:
+  void* allocate(size_t size) override {
+    return heap_caps_malloc(size, MALLOC_CAP_SPIRAM);
+  }
+  void deallocate(void* ptr) override {
+    heap_caps_free(ptr);
+  }
+  void* reallocate(void* ptr, size_t new_size) override {
+    return heap_caps_realloc(ptr, new_size, MALLOC_CAP_SPIRAM);
+  }
+};
+static ArduinoJson::Allocator* psramJsonAllocator() {
+  static PsramJsonAllocator instance;
+  return &instance;
+}
+
 static String pathBasename(const String& p) {
   int slash = p.lastIndexOf('/');
   if (slash < 0) return p;
   return p.substring(slash + 1);
+}
+
+// True for dot-prefixed entries (the .gzscratch gzip scratch directory, the
+// .upload_state.cfg per-file upload ledger) -- internal housekeeping, never
+// user wardriving data. Used by both the upload path (collectEligibleCsvs())
+// and "Delete All" (handleDeleteAll()) so neither ever reads, uploads, or
+// deletes these, regardless of what extension (if any) a future
+// housekeeping file ends up using.
+static bool isHiddenSdEntry(const String& basename) {
+  return basename.length() > 0 && basename[0] == '.';
+}
+
+// Rejects exact Null Island (0,0 -- a real location in the Gulf of Guinea,
+// virtually certain to be a GPS-less sentinel rather than a genuine fix for
+// a wardriving device), any coordinate outside the physically possible
+// range for latitude/longitude, and non-finite values from corrupted GPS
+// data. Used everywhere a position is about to be cached or logged so a
+// bad value can never end up in a CSV row.
+static bool gpsCoordIsValid(double lat, double lon) {
+  if (!isfinite(lat) || !isfinite(lon)) return false;
+  if (lat < -90.0 || lat > 90.0) return false;
+  if (lon < -180.0 || lon > 180.0) return false;
+  if (lat == 0.0 && lon == 0.0) return false;  // Null Island / no-fix sentinel
+  return true;
 }
 
 static String authModeToString(wifi_auth_mode_t m) {
@@ -508,6 +628,10 @@ static void cfgAssignKV(const String& k, const String& v) {
     String vv = v; vv.toLowerCase();
     cfg.autoUpdateHeadlessNodes = (vv == "true" || vv == "1");
   }
+  else if (k == "gzipUploads") {
+    String vv = v; vv.toLowerCase();
+    cfg.gzipUploads = (vv == "true" || vv == "1");
+  }
 }
 
 static bool saveConfigToSD() {
@@ -555,6 +679,10 @@ static bool saveConfigToSD() {
   f.println("# confirm -- they have no display). XIAO nodes always use the on-device");
   f.println("# confirm prompt instead. Use an SD card rated at least 16GB.");
   f.print("autoUpdateHeadlessNodes="); f.println(cfg.autoUpdateHeadlessNodes ? "true" : "false");
+
+  f.println("# Gzip-compress CSVs before upload (WiGLE: one merged archive per batch;");
+  f.println("# WDGoWars/Wardrift: each file individually). Default true.");
+  f.print("gzipUploads="); f.println(cfg.gzipUploads ? "true" : "false");
 
   f.flush(); f.close();
   Serial.println("[CFG] Saved OK");
@@ -709,6 +837,17 @@ static bool appendWigleRow(const String& mac, const String& ssid, const String& 
                            double lat, double lon, double altM, double accM) {
   if (!sdOk || !logFile) return false;
 
+  // Final backstop: never persist Null Island (0,0), an out-of-range
+  // coordinate, or a non-finite value from corrupted GPS data -- regardless
+  // of what any caller already thinks it validated. See gpsCoordIsValid()
+  // above. processScanResults() is expected to already skip calling this at
+  // all when it has no trustworthy position, so this firing is itself a
+  // signal something upstream needs a look.
+  if (!gpsCoordIsValid(lat, lon)) {
+    Serial.printf("[SD] appendWigleRow: rejected invalid coordinate (%.6f, %.6f) -- row not written\n", lat, lon);
+    return false;
+  }
+
   // Skip logging for any SSID present in the whitelist (exact, case-sensitive match)
   for (int i = 0; i < 10; i++) {
     if (cfg.ssidWhitelist[i].length() > 0 && cfg.ssidWhitelist[i] == ssid) return false;
@@ -804,6 +943,411 @@ static void wdgwarsDrainPendingJobs(uint32_t budgetMs);
 static bool initSD_SharedSPI();
 static bool sdTryRecover();
 
+// ================================================================
+//  Real gzip compression (RFC 1952) via the ESP32 ROM's built-in miniz
+//  DEFLATE compressor (tdefl_compress/tdefl_init) -- these symbols live in
+//  the chip's boot ROM (confirmed present at fixed addresses in the linked
+//  build) and cost zero flash/IRAM; the only overhead is a one-time ~160KB
+//  tdefl_compressor allocation from PSRAM while compressing. Used to shrink
+//  CSVs before they go out over the air to WiGLE/WDGoWars/Wardrift. This is
+//  real compression, unlike the zero-ratio "stored block" gzip framing used
+//  by the /downloadAll-style browser-download helpers on other boards.
+//
+//  Arduino-ESP32 doesn't bundle ESP-IDF's esp_rom/include/miniz.h, so the
+//  exact struct layout/prototypes below are ported from that header
+//  (trimmed to just the low-level tdefl_init()/tdefl_compress() pieces
+//  actually used here) -- this layout MUST match the ROM's compiled
+//  version exactly, since we're calling directly into ROM code that
+//  reads/writes these fields.
+// ================================================================
+extern "C" {
+
+typedef unsigned char  gz_mz_uint8;
+typedef unsigned short gz_mz_uint16;
+typedef unsigned int   gz_mz_uint32;
+typedef unsigned int   gz_mz_uint;
+typedef int            gz_mz_bool;
+
+enum {
+  GZ_TDEFL_LZ_DICT_SIZE = 32768, GZ_TDEFL_MAX_MATCH_LEN = 258,
+  GZ_TDEFL_MAX_HUFF_TABLES = 3, GZ_TDEFL_MAX_HUFF_SYMBOLS = 288,
+  GZ_TDEFL_LZ_CODE_BUF_SIZE = 24 * 1024,
+  GZ_TDEFL_OUT_BUF_SIZE = (GZ_TDEFL_LZ_CODE_BUF_SIZE * 13) / 10,
+  GZ_TDEFL_LZ_HASH_BITS = 12, GZ_TDEFL_LZ_HASH_SIZE = 1 << GZ_TDEFL_LZ_HASH_BITS
+};
+
+typedef gz_mz_bool (*gz_tdefl_put_buf_func_ptr)(const void* pBuf, int len, void* pUser);
+
+typedef enum {
+  GZ_TDEFL_STATUS_BAD_PARAM = -2, GZ_TDEFL_STATUS_PUT_BUF_FAILED = -1,
+  GZ_TDEFL_STATUS_OKAY = 0, GZ_TDEFL_STATUS_DONE = 1
+} gz_tdefl_status;
+
+typedef enum {
+  GZ_TDEFL_NO_FLUSH = 0, GZ_TDEFL_SYNC_FLUSH = 2, GZ_TDEFL_FULL_FLUSH = 3, GZ_TDEFL_FINISH = 4
+} gz_tdefl_flush;
+
+typedef struct {
+  gz_tdefl_put_buf_func_ptr m_pPut_buf_func;
+  void* m_pPut_buf_user;
+  gz_mz_uint m_flags, m_max_probes[2];
+  int m_greedy_parsing;
+  gz_mz_uint m_adler32, m_lookahead_pos, m_lookahead_size, m_dict_size;
+  gz_mz_uint8 *m_pLZ_code_buf, *m_pLZ_flags, *m_pOutput_buf, *m_pOutput_buf_end;
+  gz_mz_uint m_num_flags_left, m_total_lz_bytes, m_lz_code_buf_dict_pos, m_bits_in, m_bit_buffer;
+  gz_mz_uint m_saved_match_dist, m_saved_match_len, m_saved_lit, m_output_flush_ofs, m_output_flush_remaining,
+             m_finished, m_block_index, m_wants_to_finish;
+  gz_tdefl_status m_prev_return_status;
+  const void* m_pIn_buf;
+  void* m_pOut_buf;
+  size_t *m_pIn_buf_size, *m_pOut_buf_size;
+  gz_tdefl_flush m_flush;
+  const gz_mz_uint8* m_pSrc;
+  size_t m_src_buf_left, m_out_buf_ofs;
+  gz_mz_uint8 m_dict[GZ_TDEFL_LZ_DICT_SIZE + GZ_TDEFL_MAX_MATCH_LEN - 1];
+  gz_mz_uint16 m_huff_count[GZ_TDEFL_MAX_HUFF_TABLES][GZ_TDEFL_MAX_HUFF_SYMBOLS];
+  gz_mz_uint16 m_huff_codes[GZ_TDEFL_MAX_HUFF_TABLES][GZ_TDEFL_MAX_HUFF_SYMBOLS];
+  gz_mz_uint8 m_huff_code_sizes[GZ_TDEFL_MAX_HUFF_TABLES][GZ_TDEFL_MAX_HUFF_SYMBOLS];
+  gz_mz_uint8 m_lz_code_buf[GZ_TDEFL_LZ_CODE_BUF_SIZE];
+  gz_mz_uint16 m_next[GZ_TDEFL_LZ_DICT_SIZE];
+  gz_mz_uint16 m_hash[GZ_TDEFL_LZ_HASH_SIZE];
+  gz_mz_uint8 m_output_buf[GZ_TDEFL_OUT_BUF_SIZE];
+} gz_tdefl_compressor;
+
+// Low 12 bits = max dictionary-search probes. No zlib-header flag -- gzip
+// wraps a RAW deflate stream with its own header/trailer, not a zlib one.
+static const int GZ_TDEFL_DEFAULT_MAX_PROBES = 128;
+
+gz_tdefl_status tdefl_init(gz_tdefl_compressor* d, gz_tdefl_put_buf_func_ptr pPut_buf_func, void* pPut_buf_user, int flags);
+gz_tdefl_status tdefl_compress(gz_tdefl_compressor* d, const void* pIn_buf, size_t* pIn_buf_size,
+                                void* pOut_buf, size_t* pOut_buf_size, gz_tdefl_flush flush);
+
+}  // extern "C"
+
+// Shared CRC32 (gzip/PNG polynomial, reflected).
+static uint32_t gzipCrc32Update(uint32_t crc, const uint8_t* data, size_t len) {
+  static const uint32_t T[16] = {
+    0x00000000, 0x1DB71064, 0x3B6E20C8, 0x26D930AC,
+    0x76DC4190, 0x6B6B51F4, 0x4DB26158, 0x5005713C,
+    0xEDB88320, 0xF00F9344, 0xD6D6A3E8, 0xCB61B38C,
+    0x9B64C2B0, 0x86D3D2D4, 0xA00AE278, 0xBDBDF21C
+  };
+  crc = ~crc;
+  for (size_t i = 0; i < len; i++) {
+    crc = (crc >> 4) ^ T[(crc ^ data[i]) & 0xF];
+    crc = (crc >> 4) ^ T[(crc ^ (data[i] >> 4)) & 0xF];
+  }
+  return ~crc;
+}
+
+namespace {
+
+struct GzipSink {
+  File out;
+  uint32_t crc = 0;
+  uint32_t isize = 0;
+
+  bool writeHeader() {
+    static const uint8_t hdr[10] = { 0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0, 0xff };
+    return out.write(hdr, 10) == 10;
+  }
+  bool writeCompressed(const uint8_t* buf, size_t n) {
+    if (!n) return true;
+    return out.write(buf, n) == n;
+  }
+  void updateCrc(const uint8_t* raw, size_t n) {
+    crc = gzipCrc32Update(crc, raw, n);
+    isize += (uint32_t)n;
+  }
+  bool writeTrailer() {
+    uint8_t t[8] = {
+      (uint8_t)crc, (uint8_t)(crc >> 8), (uint8_t)(crc >> 16), (uint8_t)(crc >> 24),
+      (uint8_t)isize, (uint8_t)(isize >> 8), (uint8_t)(isize >> 16), (uint8_t)(isize >> 24)
+    };
+    return out.write(t, 8) == 8;
+  }
+};
+
+// Drives the ROM compressor: repeatedly calls readChunk(buf, cap) to pull
+// raw bytes (returns 0 when done), feeds them through tdefl_compress(), and
+// writes compressed output + CRC32/ISIZE via sink. Allocates the (~160KB)
+// gz_tdefl_compressor from PSRAM for the duration of the call.
+bool gzCompressStream(GzipSink& sink, const std::function<int(uint8_t*, size_t)>& readChunk) {
+  gz_tdefl_compressor* comp = (gz_tdefl_compressor*)heap_caps_malloc(sizeof(gz_tdefl_compressor), MALLOC_CAP_SPIRAM);
+  if (!comp) {
+    Serial.println("[GZIP] Failed to allocate tdefl_compressor from PSRAM");
+    return false;
+  }
+
+  // inBuf/outBuf used to be plain stack locals (2048 + 4096 = 6KB). This
+  // function runs deep inside the boot-time call chain (setup() ->
+  // uploadAllPending() -> gzip*ToFile() -> here), and the cumulative stack
+  // usage already built up by that point, plus these 6KB, plus whatever the
+  // ROM tdefl_compress() itself uses internally, was enough to overflow the
+  // default 8KB loopTask stack -- observed in the field as a RISC-V "Stack
+  // protection fault" (stack pointer ended up ~5KB below the task's
+  // allocated stack region). Heap/PSRAM-allocating them instead, right next
+  // to the compressor, keeps this function's own stack frame tiny.
+  uint8_t* inBuf  = (uint8_t*)heap_caps_malloc(2048, MALLOC_CAP_SPIRAM);
+  uint8_t* outBuf = (uint8_t*)heap_caps_malloc(4096, MALLOC_CAP_SPIRAM);
+  if (!inBuf || !outBuf) {
+    Serial.println("[GZIP] Failed to allocate scratch buffers from PSRAM");
+    if (inBuf)  heap_caps_free(inBuf);
+    if (outBuf) heap_caps_free(outBuf);
+    heap_caps_free(comp);
+    return false;
+  }
+
+  if (tdefl_init(comp, nullptr, nullptr, GZ_TDEFL_DEFAULT_MAX_PROBES) != GZ_TDEFL_STATUS_OKAY) {
+    Serial.println("[GZIP] tdefl_init failed");
+    heap_caps_free(inBuf);
+    heap_caps_free(outBuf);
+    heap_caps_free(comp);
+    return false;
+  }
+  if (!sink.writeHeader()) {
+    heap_caps_free(inBuf);
+    heap_caps_free(outBuf);
+    heap_caps_free(comp);
+    return false;
+  }
+
+  bool ok = true;
+  int n;
+  while (ok && (n = readChunk(inBuf, 2048)) > 0) {
+    sink.updateCrc(inBuf, (size_t)n);
+    const uint8_t* inPtr = inBuf;
+    size_t inLeft = (size_t)n;
+    while (ok && inLeft > 0) {
+      size_t inSz = inLeft;
+      size_t outSz = 4096;
+      gz_tdefl_status st = tdefl_compress(comp, inPtr, &inSz, outBuf, &outSz, GZ_TDEFL_NO_FLUSH);
+      if (st != GZ_TDEFL_STATUS_OKAY) { ok = false; break; }
+      if (outSz > 0 && !sink.writeCompressed(outBuf, outSz)) { ok = false; break; }
+      inPtr += inSz;
+      inLeft -= inSz;
+      yield();
+    }
+  }
+
+  if (ok) {
+    gz_tdefl_status st;
+    do {
+      size_t inSz = 0;
+      size_t outSz = 4096;
+      st = tdefl_compress(comp, nullptr, &inSz, outBuf, &outSz, GZ_TDEFL_FINISH);
+      if (outSz > 0 && !sink.writeCompressed(outBuf, outSz)) { ok = false; break; }
+      yield();
+    } while (st == GZ_TDEFL_STATUS_OKAY);
+    if (ok && st != GZ_TDEFL_STATUS_DONE) ok = false;
+  }
+
+  heap_caps_free(inBuf);
+  heap_caps_free(outBuf);
+  heap_caps_free(comp);
+  if (!ok) return false;
+  return sink.writeTrailer();
+}
+
+}  // namespace
+
+// Compresses srcPath into a valid gzip file at dstPath. Returns false on
+// any allocation/SD/compression failure; dstPath is removed in that case.
+static bool gzipCompressFileToFile(const String& srcPath, const String& dstPath) {
+  File in = SD.open(srcPath, FILE_READ);
+  if (!in) { Serial.printf("[GZIP] Cannot open source %s\n", srcPath.c_str()); return false; }
+  if (SD.exists(dstPath)) SD.remove(dstPath);
+  File out = SD.open(dstPath, FILE_WRITE);
+  if (!out) { Serial.printf("[GZIP] Cannot create %s\n", dstPath.c_str()); in.close(); return false; }
+
+  GzipSink sink;
+  sink.out = out;
+  bool ok = gzCompressStream(sink, [&](uint8_t* buf, size_t cap) -> int { return in.read(buf, cap); });
+  in.close();
+  out.close();
+  if (!ok) SD.remove(dstPath);
+  return ok;
+}
+
+// Merges multiple WiGLE CSVs into one gzip-compressed archive: the first
+// successfully-opened file's two WiGLE header lines are kept verbatim, the
+// same two lines are stripped from every subsequent file. Files that fail
+// to open are skipped.
+static bool gzipCompressMergedFilesToFile(const std::vector<String>& srcPaths, const String& dstPath) {
+  if (srcPaths.empty()) return false;
+  if (SD.exists(dstPath)) SD.remove(dstPath);
+  File out = SD.open(dstPath, FILE_WRITE);
+  if (!out) { Serial.printf("[GZIP] Cannot create %s\n", dstPath.c_str()); return false; }
+
+  GzipSink sink;
+  sink.out = out;
+
+  size_t nextIdx = 0;
+  File cur;
+  bool headerWritten = false;  // set once the merged output has its first byte
+
+  bool ok = gzCompressStream(sink, [&](uint8_t* buf, size_t cap) -> int {
+    for (;;) {
+      if (cur) {
+        int n = cur.read(buf, cap);
+        if (n > 0) { headerWritten = true; return n; }
+        cur.close();
+      }
+      if (nextIdx >= srcPaths.size()) return 0;
+      cur = SD.open(srcPaths[nextIdx], FILE_READ);
+      nextIdx++;
+      if (!cur) continue;
+      if (headerWritten) {
+        if (cur.available()) cur.readStringUntil('\n');
+        if (cur.available()) cur.readStringUntil('\n');
+      }
+    }
+  });
+
+  if (cur) cur.close();
+  out.close();
+  if (!ok) SD.remove(dstPath);
+  return ok;
+}
+
+// ================================================================
+//  Per-file, per-service upload status ledger
+//  Tracks which upload services each CSV has already succeeded against, so
+//  a failure against one service (e.g. WDGoWars) never blocks or
+//  re-triggers the others (WiGLE/Wardrift) for that same file. Persisted
+//  in a small plain-text ledger at /logs/.upload_state.cfg (one line per
+//  filename: "name|wigle|wdgw|wardrift", each field 1=done or 0=pending).
+//  UploadService/FileUploadState themselves are defined near the top of
+//  the file -- see the comment there for why.
+// ================================================================
+namespace {
+
+struct UploadLedgerEntry {
+  String filename;
+  bool   wigle;
+  bool   wdgw;
+  bool   wardrift;
+};
+
+const char* UPLOAD_STATE_PATH = "/logs/.upload_state.cfg";
+
+bool readUploadLedger(std::vector<UploadLedgerEntry>& out) {
+  if (!sdOk || !SD.exists(UPLOAD_STATE_PATH)) return false;
+  File f = SD.open(UPLOAD_STATE_PATH, FILE_READ);
+  if (!f) return false;
+  while (f.available()) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0) continue;
+    int p1 = line.indexOf('|'); if (p1 < 0) continue;
+    int p2 = line.indexOf('|', p1 + 1); if (p2 < 0) continue;
+    int p3 = line.indexOf('|', p2 + 1); if (p3 < 0) continue;
+    UploadLedgerEntry e;
+    e.filename = line.substring(0, p1);
+    e.wigle    = line.substring(p1 + 1, p2) == "1";
+    e.wdgw     = line.substring(p2 + 1, p3) == "1";
+    e.wardrift = line.substring(p3 + 1) == "1";
+    out.push_back(e);
+  }
+  f.close();
+  return true;
+}
+
+bool writeUploadLedger(const std::vector<UploadLedgerEntry>& entries) {
+  if (!sdOk) return false;
+  if (SD.exists(UPLOAD_STATE_PATH)) SD.remove(UPLOAD_STATE_PATH);
+  if (entries.empty()) return true;
+  File f = SD.open(UPLOAD_STATE_PATH, FILE_WRITE);
+  if (!f) { Serial.println("[UPLOADSTATE] Failed to open ledger for write"); return false; }
+  for (const auto& e : entries) {
+    f.print(e.filename); f.print('|');
+    f.print(e.wigle ? '1' : '0'); f.print('|');
+    f.print(e.wdgw ? '1' : '0'); f.print('|');
+    f.println(e.wardrift ? '1' : '0');
+  }
+  f.flush(); f.close();
+  return true;
+}
+
+}  // namespace
+
+static FileUploadState loadUploadState(const String& filename) {
+  FileUploadState st;
+  st.wigleDone    = cfg.wigleBasicToken.length() < 8;
+  st.wdgwDone     = cfg.wdgwarsApiKey.length()   < 8;
+  st.wardriftDone = cfg.wardriftApiKey.length()  < 8;
+
+  std::vector<UploadLedgerEntry> entries;
+  if (!readUploadLedger(entries)) return st;
+  for (const auto& e : entries) {
+    if (e.filename != filename) continue;
+    if (e.wigle)    st.wigleDone    = true;
+    if (e.wdgw)     st.wdgwDone     = true;
+    if (e.wardrift) st.wardriftDone = true;
+    break;
+  }
+  return st;
+}
+
+static void markServiceDone(const String& filename, UploadService svc) {
+  std::vector<UploadLedgerEntry> entries;
+  readUploadLedger(entries);
+  bool found = false;
+  for (auto& e : entries) {
+    if (e.filename != filename) continue;
+    found = true;
+    if (svc == UploadService::Wigle)    e.wigle    = true;
+    if (svc == UploadService::Wdgw)     e.wdgw     = true;
+    if (svc == UploadService::Wardrift) e.wardrift = true;
+    break;
+  }
+  if (!found) {
+    UploadLedgerEntry e;
+    e.filename = filename;
+    e.wigle    = (svc == UploadService::Wigle);
+    e.wdgw     = (svc == UploadService::Wdgw);
+    e.wardrift = (svc == UploadService::Wardrift);
+    entries.push_back(e);
+  }
+  writeUploadLedger(entries);
+}
+
+static void clearUploadState(const String& filename) {
+  std::vector<UploadLedgerEntry> entries;
+  if (!readUploadLedger(entries)) return;
+  for (size_t i = 0; i < entries.size(); i++) {
+    if (entries[i].filename == filename) {
+      entries.erase(entries.begin() + i);
+      writeUploadLedger(entries);
+      return;
+    }
+  }
+}
+
+static bool allConfiguredServicesDone(const FileUploadState& st) {
+  return st.wigleDone && st.wdgwDone && st.wardriftDone;
+}
+
+static void pruneUploadState() {
+  std::vector<UploadLedgerEntry> entries;
+  if (!readUploadLedger(entries)) return;
+  std::vector<UploadLedgerEntry> kept;
+  kept.reserve(entries.size());
+  for (const auto& e : entries) {
+    if (SD.exists(String("/logs/") + e.filename)) kept.push_back(e);
+  }
+  if (kept.size() != entries.size()) writeUploadLedger(kept);
+}
+
+// Scratch directory for gzip-compressed uploads.
+static const char* GZ_SCRATCH_DIR = "/logs/.gzscratch";
+static void ensureGzScratchDir() {
+  if (!SD.exists(GZ_SCRATCH_DIR)) SD.mkdir(GZ_SCRATCH_DIR);
+}
+static String gzScratchPathFor(const String& basename) {
+  return String(GZ_SCRATCH_DIR) + "/" + basename + ".gz";
+}
+
 // ---- WDGoWars API key test — GET /api/me ----
 static bool wdgwarsTestKey() {
   uploadLastResult = "";
@@ -812,7 +1356,21 @@ static bool wdgwarsTestKey() {
 
   WiFiClientSecure client;
   client.setInsecure(); client.setTimeout(15000);
-  if (!client.connect(WDGWARS_HOST, WDGWARS_PORT)) { uploadLastResult = "TLS connect fail"; return false; }
+  // Retry TLS connect -- transient esp-aes/DMA-descriptor allocation
+  // failures (logged as "esp-aes: Failed to allocate memory") can make a
+  // single connect() attempt fail even though overall free heap looks
+  // fine; the AES driver needs a small allocation from the separate
+  // MALLOC_CAP_DMA pool, which a short retry gives a chance to free up.
+  bool wdgConnected = false;
+  for (int attempt = 1; attempt <= 3; attempt++) {
+    if (client.connect(WDGWARS_HOST, WDGWARS_PORT)) { wdgConnected = true; break; }
+    char errBuf[100];
+    int sslErr = client.lastError(errBuf, sizeof(errBuf));
+    Serial.printf("[WDGWars] Test key TLS connect failed (attempt %d/3): error %d: %s\n", attempt, sslErr, errBuf);
+    logDmaHeap("WDGWars test key connect fail");
+    client.stop(); delay(500); yield();
+  }
+  if (!wdgConnected) { uploadLastResult = "TLS connect fail"; return false; }
 
   client.print("GET /api/me HTTP/1.0\r\n");
   client.print(String("Host: ") + WDGWARS_HOST + "\r\n");
@@ -895,10 +1453,15 @@ static bool uploadFileToWdgwars(const String& path) {
   }
   if (!connected) { uploadLastResult = "WDGW: TLS connect fail"; Serial.println("[WDGWars] TLS connect failed after 3 attempts"); f.close(); return false; }
 
+  // A `.gz`-suffixed path means this is a scratch file already
+  // gzip-compressed above -- signal that with the standard Content-Encoding
+  // header (the multipart part's own Content-Type stays text/csv).
+  bool isGzip = path.endsWith(".gz");
   client.print("POST /api/v2/upload-csv HTTP/1.0\r\n");
   client.print(String("Host: ")+WDGWARS_HOST+"\r\n");
   client.print(String("X-API-Key: ")+cfg.wdgwarsApiKey+"\r\n");
   client.print(String("Content-Type: multipart/form-data; boundary=")+boundary+"\r\n");
+  if (isGzip) client.print("Content-Encoding: gzip\r\n");
   client.print(String("Content-Length: ")+String(contentLen)+"\r\nConnection: close\r\n\r\n");
   client.print(pre);
   uint32_t fileSent = 0; bool wErr = false;
@@ -952,7 +1515,7 @@ static bool uploadFileToWdgwars(const String& path) {
     if (jobId <= 0) { uploadLastResult = "WDGW: no job_id"; return false; }
 
     uint32_t nowMs = millis();
-    wdgwarsPendingJobs.push_back({ jobId, filename, nowMs, nowMs });
+    wdgwarsPendingJobs.push_back({ jobId, filename, nowMs, nowMs, WDGWARS_JOB_CHECK_INTERVAL_MS });
     uploadLastResult = "WDGW: queued (job " + String(jobId) + ")";
     Serial.printf("[WDGWars] Job %d submitted for %s — result will be checked in background\n",
                   jobId, filename.c_str());
@@ -984,7 +1547,18 @@ static bool wardriftTestKey() {
 
   WiFiClientSecure client;
   client.setInsecure(); client.setTimeout(15000);
-  if (!client.connect(WARDRIFT_HOST, WARDRIFT_PORT)) { uploadLastResult = "TLS connect fail"; return false; }
+  // Retry TLS connect -- see the matching comment in wdgwarsTestKey() for
+  // why a single connect() attempt here can fail transiently.
+  bool wrConnected = false;
+  for (int attempt = 1; attempt <= 3; attempt++) {
+    if (client.connect(WARDRIFT_HOST, WARDRIFT_PORT)) { wrConnected = true; break; }
+    char errBuf[100];
+    int sslErr = client.lastError(errBuf, sizeof(errBuf));
+    Serial.printf("[Wardrift] Test key TLS connect failed (attempt %d/3): error %d: %s\n", attempt, sslErr, errBuf);
+    logDmaHeap("Wardrift test key connect fail");
+    client.stop(); delay(500); yield();
+  }
+  if (!wrConnected) { uploadLastResult = "TLS connect fail"; return false; }
 
   client.print("POST /v1/ingest/signals HTTP/1.0\r\n");
   client.print(String("Host: ") + WARDRIFT_HOST + "\r\n");
@@ -1083,10 +1657,15 @@ static bool uploadFileToWardrift(const String& path) {
   }
   if (!connected) { uploadLastResult = "TLS connect fail"; Serial.println("[Wardrift] TLS connect failed after 3 attempts"); f.close(); return false; }
 
+  // A `.gz`-suffixed path means this is a scratch file already
+  // gzip-compressed above -- signal that with the standard Content-Encoding
+  // header, same rationale as uploadFileToWdgwars() above.
+  bool isGzip = path.endsWith(".gz");
   client.print("POST /v1/ingest/signals HTTP/1.0\r\n");
   client.print(String("Host: ")+WARDRIFT_HOST+"\r\n");
   client.print(String("X-API-Key: ")+cfg.wardriftApiKey+"\r\n");
   client.print("Content-Type: text/csv\r\n");
+  if (isGzip) client.print("Content-Encoding: gzip\r\n");
   client.print(String("X-File-Name: ")+filename+"\r\n");
   client.print(String("Content-Length: ")+String(fileSize)+"\r\nConnection: close\r\n\r\n");
 
@@ -1171,9 +1750,11 @@ static bool wdgwarsCheckOnePendingJob() {
 
   uint32_t nowMs = millis();
 
+  // Find the least-recently-checked job that's due for a check, using each
+  // job's own (growing) backoff interval rather than a fixed one.
   int idx = -1;
   for (size_t i = 0; i < wdgwarsPendingJobs.size(); i++) {
-    if (nowMs - wdgwarsPendingJobs[i].lastCheckMs >= WDGWARS_JOB_CHECK_INTERVAL_MS) {
+    if (nowMs - wdgwarsPendingJobs[i].lastCheckMs >= wdgwarsPendingJobs[i].nextDelayMs) {
       idx = (int)i;
       break;
     }
@@ -1191,11 +1772,20 @@ static bool wdgwarsCheckOnePendingJob() {
   }
 
   wdgwarsPendingJobs[idx].lastCheckMs = nowMs;
+  // Double the wait before the next check on this job (capped), whether
+  // this attempt connects or not -- a resolving check erases the entry
+  // anyway, so only the "still processing"/connect-fail paths ever see the
+  // larger gap take effect.
+  wdgwarsPendingJobs[idx].nextDelayMs =
+    (job.nextDelayMs > WDGWARS_JOB_CHECK_MAX_MS / 2) ? WDGWARS_JOB_CHECK_MAX_MS : job.nextDelayMs * 2;
 
   WiFiClientSecure pc;
   pc.setInsecure();
   pc.setTimeout(8000);
-  if (!pc.connect(WDGWARS_HOST, WDGWARS_PORT)) return true;
+  if (!pc.connect(WDGWARS_HOST, WDGWARS_PORT)) {
+    logDmaHeap("WDGWars job-poll connect fail");
+    return true;
+  }
 
   String jobPath = String("/api/v2/upload-job/") + String(job.jobId);
   pc.print("GET " + jobPath + " HTTP/1.0\r\n");
@@ -1313,7 +1903,134 @@ static bool csvHasDataRows(const String& path, uint32_t* outSize = nullptr) {
   return hasData;
 }
 
+// ---- No-GPS-fix guard ----
+// Returns true only if the file has at least one data row AND every one of
+// those rows has lat=lon=0.000000 -- "null island", the exact placeholder
+// appendWigleRow()-equivalent logging writes when GPS has never had a fix
+// this session. A file like this is either a bench/indoor test capture or a
+// session where GPS never locked, and is exactly the shape Wardrift's "no
+// supported signal rows" validator rejects (it treats 0,0 as no-fix, not a
+// real location) -- confirmed against real uploads where every row sent was
+// rejected this way. Scans only as far as the first non-zero coordinate
+// before stopping, so a large real-data file is cheap to clear.
+//
+// Relies on the row format this file's log writer uses: field 0 is the
+// unquoted MAC, field 1 is the double-quoted SSID (the only quoted field in
+// a WiGLE data row, per RFC4180), and everything after it --
+// AuthMode,FirstSeen,Channel,Frequency,RSSI,Lat,Lon,... -- is plain,
+// unquoted CSV. Lat/Lon are always formatted with exactly 6 decimal places
+// ("%.6f"), so a genuine no-fix row is always the literal string
+// "0.000000", not just numerically close to zero.
+static bool csvAllRowsZeroGps(const String& path) {
+  File f = SD.open(path, FILE_READ);
+  if (!f) return false;  // can't verify -- never delete on an unknown
+
+  for (int i = 0; i < 2; i++) {
+    if (!f.available()) { f.close(); return false; }  // no data rows -- csvHasDataRows() handles this
+    f.readStringUntil('\n');
+  }
+
+  bool sawAnyRow = false;
+  while (f.available()) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0) continue;
+
+    int c1 = line.indexOf(',');
+    if (c1 < 0) continue;
+    int i = c1 + 1;
+    int n = line.length();
+    if (i >= n || line[i] != '"') continue;
+
+    i++;
+    while (i < n) {
+      if (line[i] == '"') {
+        if (i + 1 < n && line[i + 1] == '"') { i += 2; continue; }
+        i++;
+        break;
+      }
+      i++;
+    }
+    if (i >= n || line[i] != ',') continue;
+
+    String rest = line.substring(i + 1);
+    int pos = 0, field = 0;
+    String lat, lon;
+    while (field <= 6) {
+      int comma = rest.indexOf(',', pos);
+      String val = (comma < 0) ? rest.substring(pos) : rest.substring(pos, comma);
+      if (field == 5) lat = val;
+      if (field == 6) lon = val;
+      if (comma < 0) break;
+      pos = comma + 1;
+      field++;
+    }
+
+    sawAnyRow = true;
+    if (lat != "0.000000" || lon != "0.000000") {
+      f.close();
+      return false;
+    }
+  }
+  f.close();
+
+  return sawAnyRow;
+}
+
+// ---- Shared file collection for batch uploads ----
+// Enumerates /logs/*.csv (excluding the active log file), deleting
+// header-only files along the way. Returns the remaining eligible paths,
+// capped to maxFiles if positive.
+static std::vector<String> collectEligibleCsvs(int maxFiles) {
+  std::vector<String> all;
+  digitalWrite(PINS.tft_cs, HIGH);
+  File root = SD.open("/logs");
+  if (root) {
+    File f = root.openNextFile();
+    while (f) {
+      f.setBufferSize(64);
+      String name = normalizeSdPath("/logs", f.name());
+      // Explicitly skip dot-prefixed housekeeping entries (the .gzscratch
+      // scratch directory, the .upload_state.cfg ledger) -- redundant with
+      // the .csv suffix check below today, but makes the exclusion explicit
+      // and keeps it safe if either ever changes shape.
+      bool isHidden = isHiddenSdEntry(pathBasename(name));
+      bool isCsv = name.endsWith(".csv");
+      bool isCurrent = (currentCsvPath.length() && name == currentCsvPath);
+      f.close();
+      if (isCsv && !isHidden && !isCurrent) all.push_back(name);
+      f = root.openNextFile();
+    }
+    root.close();
+  }
+
+  std::vector<String> eligible;
+  eligible.reserve(all.size());
+  for (const String& p : all) {
+    uint32_t emptySz = 0;
+    if (!csvHasDataRows(p, &emptySz)) {
+      Serial.printf("[UPLOAD] Empty CSV (%u bytes), deleting: %s\n", (unsigned)emptySz, pathBasename(p).c_str());
+      if (!SD.remove(p)) Serial.printf("[UPLOAD] WARNING: SD.remove failed for %s -- file left in place\n", pathBasename(p).c_str());
+      clearUploadState(pathBasename(p));
+      continue;
+    }
+    if (csvAllRowsZeroGps(p)) {
+      Serial.printf("[UPLOAD] No GPS fix in any row -- deleting bench-test/no-lock capture: %s\n", pathBasename(p).c_str());
+      if (!SD.remove(p)) Serial.printf("[UPLOAD] WARNING: SD.remove failed for %s -- file left in place\n", pathBasename(p).c_str());
+      clearUploadState(pathBasename(p));
+      continue;
+    }
+    eligible.push_back(p);
+  }
+
+  if (maxFiles > 0 && (uint32_t)maxFiles < eligible.size()) eligible.resize((size_t)maxFiles);
+  return eligible;
+}
+
 // ---- WDGoWars-only batch upload (web UI button) ----
+// Uploads every file still pending for WDGoWars (gzip per file), then
+// moves any file that now has every *configured* service done -- not just
+// WDGoWars -- to /uploaded/.
 static uint32_t uploadAllCsvsToWdgwars() {
   if (!sdOk) { uploadLastResult="SD not OK"; return 0; }
   if (cfg.wdgwarsApiKey.length()<8) { uploadLastResult="No API key"; return 0; }
@@ -1323,37 +2040,43 @@ static uint32_t uploadAllCsvsToWdgwars() {
   uploadDoneFiles=0; uploadFailedFiles=0; uploadTotalFiles=0; uploadCurrentFile="";
   ledBlue();
 
-  digitalWrite(PINS.tft_cs, HIGH);
-  File root=SD.open("/logs");
-  if (root){File f=root.openNextFile();while(f){String name=normalizeSdPath("/logs",f.name());
-    if(name.endsWith(".csv")&&!(currentCsvPath.length()&&name==currentCsvPath)) uploadTotalFiles++;
-    f.close();f=root.openNextFile();}root.close();}
+  std::vector<String> paths = collectEligibleCsvs(-1);
+  uploadTotalFiles = (uint32_t)paths.size();
+  if (paths.empty()) { uploading=false; uploadTargetName=""; scanningEnabled=uploadPausedScanWasEnabled; uploadLastResult="No CSVs to upload"; ledOff(); return 0; }
 
-  if (uploadTotalFiles==0){uploading=false;uploadTargetName="";scanningEnabled=uploadPausedScanWasEnabled;uploadLastResult="No CSVs to upload";ledOff();return 0;}
-
-  std::vector<String> paths; paths.reserve(uploadTotalFiles+2);
-  root=SD.open("/logs");
-  if(root){File f=root.openNextFile();while(f){
-    String path=normalizeSdPath("/logs",f.name()); f.close();
-    if(path.endsWith(".csv")&&!(currentCsvPath.length()&&path==currentCsvPath)) paths.push_back(path);
-    f=root.openNextFile();}root.close();}
+  ensureGzScratchDir();
 
   uint32_t okCount=0;
   for(size_t i=0;i<paths.size();i++){
     uploadCurrentFile=paths[i];
     tftWigleUploadScreen(uploadDoneFiles,uploadTotalFiles,pathBasename(uploadCurrentFile));
-    Serial.printf("[UPLOAD] File %u/%u: %s (heap free: %u bytes)\n",
-                  (unsigned)(i + 1), (unsigned)paths.size(),
-                  pathBasename(paths[i]).c_str(), (unsigned)ESP.getFreeHeap());
-    { uint32_t emptySz = 0;
-      if(!csvHasDataRows(paths[i], &emptySz)){
-        Serial.printf("[UPLOAD] Empty CSV (%u bytes), deleting: %s\n", (unsigned)emptySz, pathBasename(paths[i]).c_str());
-        if (!SD.remove(paths[i])) Serial.printf("[UPLOAD] WARNING: SD.remove failed for %s -- file left in place\n", pathBasename(paths[i]).c_str());
-        uploadDoneFiles++;continue;
+
+    String basename = pathBasename(paths[i]);
+    FileUploadState st = loadUploadState(basename);
+    if (!st.wdgwDone) {
+      Serial.printf("[UPLOAD] File %u/%u: %s (heap free: %u bytes)\n",
+                    (unsigned)(i + 1), (unsigned)paths.size(), basename.c_str(), (unsigned)ESP.getFreeHeap());
+      bool ok;
+      if (cfg.gzipUploads) {
+        String scratch = gzScratchPathFor(basename);
+        ok = gzipCompressFileToFile(paths[i], scratch) && uploadFileToWdgwars(scratch);
+        SD.remove(scratch);
+      } else {
+        ok = uploadFileToWdgwars(paths[i]);
       }
+      if (ok) { markServiceDone(basename, UploadService::Wdgw); st.wdgwDone = true; }
+      else uploadFailedFiles++;
     }
-    bool ok=uploadFileToWdgwars(paths[i]);
-    if(ok){okCount++;moveToUploaded(paths[i]);}else{uploadFailedFiles++;}
+
+    if (allConfiguredServicesDone(st)) {
+      okCount++;
+      // See the matching comment in uploadAllPending()'s finalize loop --
+      // only clear the ledger once the move actually succeeds, so a
+      // transient SD hiccup can't make an already-uploaded file look unsent
+      // again on the next run.
+      if (moveToUploaded(paths[i])) clearUploadState(basename);
+      else Serial.printf("[UPLOAD] WARNING: moveToUploaded failed for %s -- file stays in /logs, ledger kept\n", basename.c_str());
+    }
     uploadDoneFiles++;
     tftWigleUploadScreen(uploadDoneFiles,uploadTotalFiles,pathBasename(uploadCurrentFile));
     if(i<paths.size()-1) delay(1500);
@@ -1365,6 +2088,7 @@ static uint32_t uploadAllCsvsToWdgwars() {
 }
 
 // ---- Wardrift-only batch upload (web UI button) ----
+// Same shape as uploadAllCsvsToWdgwars() above, for Wardrift.
 static uint32_t uploadAllCsvsToWardrift() {
   if (!sdOk) { uploadLastResult="SD not OK"; return 0; }
   if (cfg.wardriftApiKey.length()<8) { uploadLastResult="No token set"; return 0; }
@@ -1374,37 +2098,37 @@ static uint32_t uploadAllCsvsToWardrift() {
   uploadDoneFiles=0; uploadFailedFiles=0; uploadTotalFiles=0; uploadCurrentFile="";
   ledBlue();
 
-  digitalWrite(PINS.tft_cs, HIGH);
-  File root=SD.open("/logs");
-  if (root){File f=root.openNextFile();while(f){String name=normalizeSdPath("/logs",f.name());
-    if(name.endsWith(".csv")&&!(currentCsvPath.length()&&name==currentCsvPath)) uploadTotalFiles++;
-    f.close();f=root.openNextFile();}root.close();}
+  std::vector<String> paths = collectEligibleCsvs(-1);
+  uploadTotalFiles = (uint32_t)paths.size();
+  if (paths.empty()) { uploading=false; uploadTargetName=""; scanningEnabled=uploadPausedScanWasEnabled; uploadLastResult="No CSVs to upload"; ledOff(); return 0; }
 
-  if (uploadTotalFiles==0){uploading=false;uploadTargetName="";scanningEnabled=uploadPausedScanWasEnabled;uploadLastResult="No CSVs to upload";ledOff();return 0;}
-
-  std::vector<String> paths; paths.reserve(uploadTotalFiles+2);
-  root=SD.open("/logs");
-  if(root){File f=root.openNextFile();while(f){
-    String path=normalizeSdPath("/logs",f.name()); f.close();
-    if(path.endsWith(".csv")&&!(currentCsvPath.length()&&path==currentCsvPath)) paths.push_back(path);
-    f=root.openNextFile();}root.close();}
+  ensureGzScratchDir();
 
   uint32_t okCount=0;
   for(size_t i=0;i<paths.size();i++){
     uploadCurrentFile=paths[i];
     tftWigleUploadScreen(uploadDoneFiles,uploadTotalFiles,pathBasename(uploadCurrentFile));
-    Serial.printf("[UPLOAD] File %u/%u: %s (heap free: %u bytes)\n",
-                  (unsigned)(i + 1), (unsigned)paths.size(),
-                  pathBasename(paths[i]).c_str(), (unsigned)ESP.getFreeHeap());
-    { uint32_t emptySz = 0;
-      if(!csvHasDataRows(paths[i], &emptySz)){
-        Serial.printf("[UPLOAD] Empty CSV (%u bytes), deleting: %s\n", (unsigned)emptySz, pathBasename(paths[i]).c_str());
-        if (!SD.remove(paths[i])) Serial.printf("[UPLOAD] WARNING: SD.remove failed for %s -- file left in place\n", pathBasename(paths[i]).c_str());
-        uploadDoneFiles++;continue;
-      }
+
+    String basename = pathBasename(paths[i]);
+    FileUploadState st = loadUploadState(basename);
+    if (!st.wardriftDone) {
+      Serial.printf("[UPLOAD] File %u/%u: %s (heap free: %u bytes)\n",
+                    (unsigned)(i + 1), (unsigned)paths.size(), basename.c_str(), (unsigned)ESP.getFreeHeap());
+      // Always sent uncompressed -- see the matching comment in
+      // uploadAllPending()'s Phase 3 for why (Wardrift doesn't honor
+      // Content-Encoding: gzip on this endpoint).
+      bool ok = uploadFileToWardrift(paths[i]);
+      if (ok) { markServiceDone(basename, UploadService::Wardrift); st.wardriftDone = true; }
+      else uploadFailedFiles++;
     }
-    bool ok=uploadFileToWardrift(paths[i]);
-    if(ok){okCount++;moveToUploaded(paths[i]);}else{uploadFailedFiles++;}
+
+    if (allConfiguredServicesDone(st)) {
+      okCount++;
+      // See the matching comment in uploadAllPending()'s finalize loop --
+      // only clear the ledger once the move actually succeeds.
+      if (moveToUploaded(paths[i])) clearUploadState(basename);
+      else Serial.printf("[UPLOAD] WARNING: moveToUploaded failed for %s -- file stays in /logs, ledger kept\n", basename.c_str());
+    }
     uploadDoneFiles++;
     tftWigleUploadScreen(uploadDoneFiles,uploadTotalFiles,pathBasename(uploadCurrentFile));
     if(i<paths.size()-1) delay(1500);
@@ -1459,7 +2183,18 @@ static bool wigleTestToken() {
   client.setTimeout(15000);
 
   for (size_t i = 0; i < sizeof(pathsToTry)/sizeof(pathsToTry[0]); i++) {
-    if (!client.connect(WIGLE_HOST, WIGLE_PORT)) { uploadLastResult = "TLS connect fail"; wigleTokenStatus = -1; return false; }
+    // Retry TLS connect -- see the matching comment in wdgwarsTestKey() for
+    // why a single connect() attempt here can fail transiently.
+    bool wigleConnected = false;
+    for (int attempt = 1; attempt <= 3; attempt++) {
+      if (client.connect(WIGLE_HOST, WIGLE_PORT)) { wigleConnected = true; break; }
+      char errBuf[100];
+      int sslErr = client.lastError(errBuf, sizeof(errBuf));
+      Serial.printf("[WiGLE] Test token TLS connect failed (attempt %d/3): error %d: %s\n", attempt, sslErr, errBuf);
+      logDmaHeap("WiGLE test token connect fail");
+      client.stop(); delay(500); yield();
+    }
+    if (!wigleConnected) { uploadLastResult = "TLS connect fail"; wigleTokenStatus = -1; return false; }
     String req = String("GET ") + pathsToTry[i] + " HTTP/1.1\r\nHost: " + WIGLE_HOST +
                  "\r\nAuthorization: Basic " + cfg.wigleBasicToken + "\r\nConnection: close\r\n\r\n";
     client.print(req);
@@ -1564,8 +2299,14 @@ static bool uploadFileToWigle(const String& path) {
   return false;
 }
 
-// uploadAllCsvsToWigle:
-static uint32_t uploadAllCsvsToWigle(int maxFiles = -1) {
+// ---- Combined batch upload (service-major, with per-file/per-service retry tracking) ----
+// Uploads every pending file to WiGLE first (as one merged, gzip-compressed
+// archive when more than one file is pending), then every file still
+// pending to WDGoWars (gzip per file), then every file still pending to
+// Wardrift (gzip per file). A file only moves to /uploaded/ once every
+// *configured* service has succeeded for it; a failure against one service
+// never blocks or re-triggers the others for that file.
+static uint32_t uploadAllPending(int maxFiles = -1) {
   if (!sdOk) { uploadLastResult = "SD not OK"; return 0; }
 
   uploadPausedScanWasEnabled = scanningEnabled;
@@ -1577,105 +2318,152 @@ static uint32_t uploadAllCsvsToWigle(int maxFiles = -1) {
   uploadCurrentFile = "";
   ledBlue();
 
-  digitalWrite(PINS.tft_cs, HIGH);
-  File root = SD.open("/logs");
-  if (root) {
-    File f = root.openNextFile();
-    while (f) {
-      String name = normalizeSdPath("/logs", f.name());
-      if (name.endsWith(".csv") && !(currentCsvPath.length() && name == currentCsvPath)) uploadTotalFiles++;
-      f.close(); f = root.openNextFile();
-    }
-    root.close();
-  }
-
-  if (uploadTotalFiles == 0) {
+  std::vector<String> paths = collectEligibleCsvs(maxFiles);
+  if (paths.empty()) {
     uploading = false; scanningEnabled = uploadPausedScanWasEnabled;
     uploadLastResult = "No CSVs to upload"; ledOff(); return 0;
   }
 
-  uint32_t filesToUpload = uploadTotalFiles;
-  if (maxFiles > 0 && (uint32_t)maxFiles < uploadTotalFiles) filesToUpload = (uint32_t)maxFiles;
+  ensureGzScratchDir();
 
-  std::vector<String> paths;
-  paths.reserve(filesToUpload + 4);
-  root = SD.open("/logs");
-  if (root) {
-    File f = root.openNextFile();
-    while (f) {
-      String path = normalizeSdPath("/logs", f.name());
-      bool isCsv = path.endsWith(".csv");
-      bool isCurrent = (currentCsvPath.length() && path == currentCsvPath);
-      f.close();
-      if (isCsv && !isCurrent) {
-        paths.push_back(path);
-        if (maxFiles > 0 && paths.size() >= filesToUpload) break;
-      }
-      f = root.openNextFile();
-    }
-    root.close();
+  std::vector<FileUploadState> states(paths.size());
+  for (size_t i = 0; i < paths.size(); i++) {
+    states[i] = loadUploadState(pathBasename(paths[i]));
   }
 
-  uint32_t okCount = 0;
+  // Progress (TFT/web UI) tracks individual upload ATTEMPTS across all three
+  // service phases, not "every configured service done for this file" -- a
+  // file can succeed WiGLE but still be mid-flight on WDGoWars/Wardrift, and
+  // the operator should see the bar/counter visibly tick forward on every
+  // attempt (success or fail), matching what the serial log shows, instead
+  // of sitting still until a file clears every service.
   for (size_t i = 0; i < paths.size(); i++) {
-    uploadCurrentFile = paths[i];
-    Serial.printf("[UPLOAD] File %u/%u: %s (heap free: %u bytes)\n",
-                  (unsigned)(i + 1), (unsigned)paths.size(),
-                  pathBasename(paths[i]).c_str(), (unsigned)ESP.getFreeHeap());
+    if (!states[i].wigleDone)    uploadTotalFiles++;
+    if (!states[i].wdgwDone)     uploadTotalFiles++;
+    if (!states[i].wardriftDone) uploadTotalFiles++;
+  }
+  auto touchFile = [&](size_t /*idx*/) { uploadDoneFiles++; };
 
-    // Skip and delete header-only files
-    {
-      uint32_t emptySz = 0;
-      if (!csvHasDataRows(paths[i], &emptySz)) {
-        Serial.printf("[UPLOAD] Empty CSV (%u bytes), deleting: %s\n", (unsigned)emptySz, pathBasename(paths[i]).c_str());
-        if (!SD.remove(paths[i])) {
-          Serial.printf("[UPLOAD] WARNING: SD.remove failed for %s -- file left in place\n", pathBasename(paths[i]).c_str());
+  // ---- Phase 1: WiGLE ----
+  if (cfg.wigleBasicToken.length() >= 8) {
+    std::vector<size_t> pendingIdx;
+    for (size_t i = 0; i < paths.size(); i++) if (!states[i].wigleDone) pendingIdx.push_back(i);
+
+    if (!pendingIdx.empty()) {
+      uploadTargetName = "WiGLE UL";
+      if (cfg.gzipUploads && pendingIdx.size() > 1) {
+        uploadCurrentFile = "(" + String(pendingIdx.size()) + " files)";
+        tftWigleUploadScreen(uploadDoneFiles, uploadTotalFiles, uploadCurrentFile);
+        std::vector<String> srcPaths;
+        for (size_t idx : pendingIdx) srcPaths.push_back(paths[idx]);
+        String scratch = gzScratchPathFor("wigle_batch");
+        bool ok = gzipCompressMergedFilesToFile(srcPaths, scratch) && uploadFileToWigle(scratch);
+        SD.remove(scratch);
+        if (ok) Serial.printf("[WiGLE] Merged archive OK -- %u file(s) marked done\n", (unsigned)pendingIdx.size());
+        else { Serial.printf("[WiGLE] Merged archive FAILED -- %u file(s) remain pending\n", (unsigned)pendingIdx.size()); uploadFailedFiles++; }
+        for (size_t idx : pendingIdx) {
+          if (ok) { markServiceDone(pathBasename(paths[idx]), UploadService::Wigle); states[idx].wigleDone = true; }
+          touchFile(idx);
         }
-        uploadDoneFiles++;
-        continue;
+      } else {
+        for (size_t n = 0; n < pendingIdx.size(); n++) {
+          size_t idx = pendingIdx[n];
+          uploadCurrentFile = paths[idx];
+          tftWigleUploadScreen(uploadDoneFiles, uploadTotalFiles, pathBasename(uploadCurrentFile));
+          bool ok;
+          if (cfg.gzipUploads) {
+            String scratch = gzScratchPathFor(pathBasename(paths[idx]));
+            ok = gzipCompressFileToFile(paths[idx], scratch) && uploadFileToWigle(scratch);
+            SD.remove(scratch);
+          } else {
+            ok = uploadFileToWigle(paths[idx]);
+          }
+          if (ok) { markServiceDone(pathBasename(paths[idx]), UploadService::Wigle); states[idx].wigleDone = true; }
+          else uploadFailedFiles++;
+          touchFile(idx);
+          if (n + 1 < pendingIdx.size()) delay(1500);
+        }
       }
     }
+  }
 
-    // Step 1: WDGoWars first (if configured)
-    bool wdgOk = false;
-    if (cfg.wdgwarsApiKey.length() >= 8) {
+  // ---- Phase 2: WDGoWars (per file) ----
+  if (cfg.wdgwarsApiKey.length() >= 8) {
+    for (size_t i = 0; i < paths.size(); i++) {
+      if (states[i].wdgwDone) continue;
       uploadTargetName = "WDGW UL";
-      tftWigleUploadScreen(uploadDoneFiles, uploadTotalFiles, pathBasename(paths[i]));
-      wdgOk = uploadFileToWdgwars(paths[i]);
-      if (!wdgOk) uploadFailedFiles++;
-      if (i < paths.size()-1 || cfg.wardriftApiKey.length() >= 8 || cfg.wigleBasicToken.length() >= 8) delay(1500);
-    }
+      uploadCurrentFile = paths[i];
+      tftWigleUploadScreen(uploadDoneFiles, uploadTotalFiles, pathBasename(uploadCurrentFile));
+      Serial.printf("[WDGWars] %s (heap free: %u bytes)\n", pathBasename(paths[i]).c_str(), (unsigned)ESP.getFreeHeap());
 
-    // Step 2: Wardrift (if configured)
-    bool wardriftOk = false;
-    if (cfg.wardriftApiKey.length() >= 8) {
+      bool ok;
+      if (cfg.gzipUploads) {
+        String scratch = gzScratchPathFor(pathBasename(paths[i]));
+        ok = gzipCompressFileToFile(paths[i], scratch) && uploadFileToWdgwars(scratch);
+        SD.remove(scratch);
+      } else {
+        ok = uploadFileToWdgwars(paths[i]);
+      }
+      if (ok) { markServiceDone(pathBasename(paths[i]), UploadService::Wdgw); states[i].wdgwDone = true; }
+      else uploadFailedFiles++;
+      touchFile(i);
+      if (i + 1 < paths.size()) delay(1500);
+    }
+  }
+
+  // ---- Phase 3: Wardrift (per file) ----
+  if (cfg.wardriftApiKey.length() >= 8) {
+    for (size_t i = 0; i < paths.size(); i++) {
+      if (states[i].wardriftDone) continue;
       uploadTargetName = "Wardrift UL";
-      tftWigleUploadScreen(uploadDoneFiles, uploadTotalFiles, pathBasename(paths[i]));
-      wardriftOk = uploadFileToWardrift(paths[i]);
-      if (!wardriftOk) uploadFailedFiles++;
-      if (i < paths.size()-1 || cfg.wigleBasicToken.length() >= 8) delay(1500);
-    }
+      uploadCurrentFile = paths[i];
+      tftWigleUploadScreen(uploadDoneFiles, uploadTotalFiles, pathBasename(uploadCurrentFile));
+      Serial.printf("[Wardrift] %s (heap free: %u bytes)\n", pathBasename(paths[i]).c_str(), (unsigned)ESP.getFreeHeap());
 
-    // Step 3: WiGLE (if configured)
-    bool wigleOk = false;
-    if (cfg.wigleBasicToken.length() >= 8) {
-      uploadTargetName = "WiGLE UL";
-      tftWigleUploadScreen(uploadDoneFiles, uploadTotalFiles, pathBasename(paths[i]));
-      wigleOk = uploadFileToWigle(paths[i]);
-      if (!wigleOk) uploadFailedFiles++;
+      // Always sent uncompressed -- Wardrift's /v1/ingest/signals endpoint
+      // does not honor Content-Encoding: gzip (confirmed in the field: every
+      // gzip-compressed upload came back HTTP 400 "file did not contain
+      // supported signal rows" -- it was trying to parse the raw gzip bytes
+      // as CSV text -- even though the identical file succeeded against
+      // WDGoWars, which does support gzip). Ignore cfg.gzipUploads here.
+      bool ok = uploadFileToWardrift(paths[i]);
+      if (ok) { markServiceDone(pathBasename(paths[i]), UploadService::Wardrift); states[i].wardriftDone = true; }
+      else uploadFailedFiles++;
+      touchFile(i);
+      if (i + 1 < paths.size()) delay(1500);
     }
+  }
 
-    if (wigleOk || wdgOk || wardriftOk) { okCount++; moveToUploaded(paths[i]); }
-    uploadDoneFiles++;
-    tftWigleUploadScreen(uploadDoneFiles, uploadTotalFiles, pathBasename(uploadCurrentFile));
-    if (i < paths.size()-1) delay(2000);
+  // ---- Finalize: move fully-done files to /uploaded/ ----
+  uint32_t okCount = 0;
+  for (size_t i = 0; i < paths.size(); i++) {
+    if (allConfiguredServicesDone(states[i])) {
+      okCount++;
+      // Only clear the ledger entry once the move actually succeeds. Every
+      // configured service already succeeded for this file at this point --
+      // clearing the ledger unconditionally here (even when moveToUploaded()
+      // itself failed, e.g. a transient SD hiccup) made that look identical
+      // to "never uploaded" on the next run, which re-sent it to every
+      // service all over again. Leaving the entry intact just retries the
+      // move next time, with no re-upload.
+      if (moveToUploaded(paths[i])) {
+        clearUploadState(pathBasename(paths[i]));
+      } else {
+        Serial.printf("[UPLOAD] WARNING: moveToUploaded failed for %s -- file stays in /logs, ledger kept so it won't be re-uploaded\n",
+                      pathBasename(paths[i]).c_str());
+      }
+    }
   }
 
   uploading = false;
   uploadTargetName = "";
   scanningEnabled = uploadPausedScanWasEnabled;
   uploadCurrentFile = "";
-  uploadLastResult = "Uploaded " + String(okCount) + "/" + String(uploadTotalFiles);
+  uploadDoneFiles = uploadTotalFiles;
+  // uploadTotalFiles is the attempts-based progress denominator above, not
+  // the distinct file count -- use paths.size() here so this summary reads
+  // naturally ("Uploaded 23/25" rather than counting every per-service try).
+  uploadLastResult = "Uploaded " + String(okCount) + "/" + String(paths.size());
   ledOff();
   forceStatusFullRedraw();
   return okCount;
@@ -1844,6 +2632,49 @@ static const char* headingToDir8(float deg) {
 // Main status display (80x160 portrait)
 static void updateTFT(float speedValue) {
   int W = tft.width();
+
+  // ---- On-device firmware update flow -- full-screen takeover, same idiom
+  // as the OLED Piglet's drawPageStatus(). Entirely TFT/button driven: no
+  // browser needs to be open for any of this, which matters here since the
+  // download's TLS session is already fighting for a very narrow slice of
+  // DMA-capable heap -- Web UI polling traffic would otherwise compete for
+  // the same shared WiFi buffer pool at exactly the wrong moment.
+  if (fwDownloading || fwInstalling || fwDownloaded || fwUpdateAvailable) {
+    tft.fillScreen(BLACK);
+    tft.setTextColor(WHITE, BLACK);
+    tftDrawCentered(10, fwInstalling ? "Installing" : (fwDownloading ? "Updating" : "Update!"), 2);
+
+    int y = 40;
+    if (fwDownloading || fwInstalling) {
+      String stage = fwDownloadStage;
+      if (stage.length() > 13) stage = stage.substring(0, 13);
+      tftDrawCentered(y, stage.c_str(), 1);
+      y += 16;
+      if (fwDownloadTotalBytes > 0) {
+        float pct = (float)fwDownloadedBytes / (float)fwDownloadTotalBytes;
+        int barW = W - 16;
+        tft.drawRect(8, y, barW, 10, WHITE);
+        int fill = (int)((barW - 2) * pct);
+        if (fill > 0) tft.fillRect(9, y + 1, fill, 8, WHITE);
+        y += 16;
+        char pctBuf[8];
+        snprintf(pctBuf, sizeof(pctBuf), "%d%%", (int)(pct * 100));
+        tftDrawCentered(y, pctBuf, 1);
+      }
+    } else if (fwDownloaded) {
+      tftDrawCentered(y, "Download", 1); y += 12;
+      tftDrawCentered(y, "complete!", 1); y += 20;
+      tftDrawCentered(y, "Press button to", 1); y += 12;
+      tftDrawCentered(y, "restart & install", 1);
+    } else {  // fwUpdateAvailable
+      tftDrawCentered(y, fwAvailableVersion.c_str(), 1); y += 20;
+      tftDrawCentered(y, "Press button to", 1); y += 12;
+      tftDrawCentered(y, "download", 1);
+    }
+
+    uiFirstDraw = true;  // force a clean full redraw once this state clears
+    return;
+  }
 
   // Capture and clear the full-redraw flag first.
   // IMPORTANT: do NOT use uiFirstDraw as the repaint condition after this point —
@@ -4697,7 +5528,7 @@ static bool initSD_SharedSPI() {
 static void handleRoot() { server.sendHeader("Cache-Control", "no-store"); server.send_P(200, "text/html", INDEX_HTML); }
 
 static void handleStatus() {
-  DynamicJsonDocument doc(3072);  // heap, not stack — avoids task stack overflow; bumped for ssidWhitelist1..10
+  JsonDocument doc(psramJsonAllocator());  // heap, not stack — avoids task stack overflow; bumped for ssidWhitelist1..10
   bool allowScan = scanningEnabled && sdOk && (userScanOverride || !autoPaused);
   doc["scanningEnabled"] = scanningEnabled;
   doc["allowScan"] = allowScan;
@@ -4760,28 +5591,99 @@ static void handleStatus() {
   server.send(200, "application/json", out);
 }
 
-static void addDirFiles(JsonArray arr, const char* dir) {
-  digitalWrite(PINS.tft_cs, HIGH);
-  File root = SD.open(dir);
-  if (!root) return;
-  File f = root.openNextFile();
-  while (f) {
-    String fullPath = normalizeSdPath(dir, f.name());
-    if (fullPath.length() > 0) {
-      JsonObject o = arr.createNestedObject();
-      o["name"] = fullPath;
-      o["size"] = (uint32_t)f.size();
+// Minimum internal free heap to keep in reserve while walking a directory.
+// Each fopen()/fclose() cycle here (via SD.open()'s underlying VFS layer)
+// permanently loses roughly 100-130 bytes of internal heap with no recovery
+// -- unaffected by shrinking the file's stdio buffer via setBufferSize(), so
+// the loss isn't that buffer; it's deeper in the Arduino core's newlib/VFS
+// fopen() plumbing, outside this codebase's control. The Web UI now only
+// ever requests one page (default 50 files) at a time via offset/limit,
+// which keeps a normal page far under this floor; it remains as a safety
+// net for a worst-case jump to a very large offset on a directory with many
+// thousands of files.
+static const uint32_t DIR_LISTING_HEAP_FLOOR = 24576;
+
+// Walks /logs then /uploaded as one continuous, stably-ordered sequence,
+// skipping the first `offset` entries and collecting up to `limit` of them
+// into `arr`. Peeking one entry past the page sets `hasMore` without
+// including it, so the Web UI's "Load More" button only appears when there
+// really is another page. Returns true if the heap-floor circuit breaker
+// had to stop the walk early.
+static bool collectFilesPage(JsonArray arr, uint32_t offset, uint32_t limit, bool& hasMore) {
+  hasMore = false;
+  uint32_t index = 0;
+  bool floorHit = false;
+  const char* dirs[] = { "/logs", "/uploaded" };
+
+  for (const char* dir : dirs) {
+    if (floorHit) break;
+    digitalWrite(PINS.tft_cs, HIGH);
+    File root = SD.open(dir);
+    if (!root) continue;
+
+    File f = root.openNextFile();
+    while (f) {
+      if (heap_caps_get_free_size(MALLOC_CAP_INTERNAL) < DIR_LISTING_HEAP_FLOOR) {
+        f.close();
+        floorHit = true;
+        break;
+      }
+
+      if (index < offset) {
+        // Still skipping toward the requested page -- nothing to build yet.
+        f.close();
+        index++;
+        f = root.openNextFile();
+        continue;
+      }
+
+      if ((uint32_t)arr.size() >= limit) {
+        // Page is already full; this file's mere existence means there's
+        // another page, so stop without doing any more work on it.
+        f.close();
+        hasMore = true;
+        break;
+      }
+
+      // Every fopen() in the Arduino core's VFS layer unconditionally allocates
+      // a 4096-byte stdio buffer via setvbuf() (DEFAULT_FILE_BUFFER_SIZE in
+      // vfs_api.cpp), even though this loop never reads file content -- .size()
+      // below is served from the fstat() already cached in the File's
+      // constructor. Shrinking the buffer immediately after open (must be the
+      // very next call per the library's own doc comment) reduces peak
+      // per-file memory pressure/fragmentation.
+      f.setBufferSize(64);
+
+      String fullPath = normalizeSdPath(dir, f.name());
+      if (fullPath.length() > 0) {
+        JsonObject o = arr.createNestedObject();
+        o["name"] = fullPath;
+        o["size"] = (uint32_t)f.size();
+      }
+      f.close();
+      index++;
+      f = root.openNextFile();
     }
-    f.close(); f = root.openNextFile();
+    root.close();
   }
-  root.close();
+
+  return floorHit;
 }
 
 static void handleFiles() {
-  DynamicJsonDocument doc(4096);  // heap, not stack — 4KB static would overflow 8KB task stack
+  JsonDocument doc(psramJsonAllocator());  // heap, not stack — 4KB static would overflow 8KB task stack
   doc["ok"] = sdOk;
   JsonArray arr = doc.createNestedArray("files");
-  if (sdOk) { addDirFiles(arr, "/logs"); addDirFiles(arr, "/uploaded"); }
+  bool hasMore   = false;
+  bool truncated = false;
+  if (sdOk) {
+    uint32_t offset = server.hasArg("offset") ? (uint32_t)server.arg("offset").toInt() : 0;
+    uint32_t limit  = server.hasArg("limit")  ? (uint32_t)server.arg("limit").toInt()  : 50;
+    if (limit == 0 || limit > 200) limit = 50;  // sane bounds -- Web UI always asks for 50
+    truncated = collectFilesPage(arr, offset, limit, hasMore);
+  }
+  doc["hasMore"]   = hasMore;
+  doc["truncated"] = truncated;
   String out; out.reserve(measureJson(doc) + 1); serializeJson(doc, out);
   server.send(200, "application/json", out);
 }
@@ -4813,6 +5715,7 @@ static void handleDeleteAll() {
   if (!sdOk) { server.send(500, "application/json", "{\"ok\":false,\"error\":\"SD not available\"}"); return; }
 
   uint32_t deleted = 0;
+  bool truncated = false;
   const char* dirs[] = { "/logs", "/uploaded" };
   for (const char* dir : dirs) {
     digitalWrite(PINS.tft_cs, HIGH);
@@ -4821,9 +5724,29 @@ static void handleDeleteAll() {
     std::vector<String> paths;
     File f = root.openNextFile();
     while (f) {
+      f.setBufferSize(64);  // avoid the 4KB default stdio buffer -- see addDirFiles()
       String p = normalizeSdPath(dir, f.name());
       f.close();
-      if (p.length() > 0) paths.push_back(p);
+      // Skip dot-prefixed housekeeping entries (the .gzscratch gzip scratch
+      // directory, the .upload_state.cfg per-file upload ledger) -- "Delete
+      // All" should only ever touch user wardriving data. Wiping the ledger
+      // here used to be harmless only because every CSV it referenced was
+      // also being deleted in the same pass; the heap-floor circuit breaker
+      // below can stop that pass early, which left any not-yet-deleted CSVs
+      // looking "never uploaded" on the next upload round.
+      if (p.length() > 0 && !isHiddenSdEntry(pathBasename(p))) paths.push_back(p);
+
+      // Same heap-floor circuit breaker as addDirFiles() -- a directory with
+      // enough accumulated files can drain internal heap via this same
+      // listing loop before the delete pass below even starts. Stopping
+      // early here still deletes everything collected so far; the operator
+      // can click "Delete All" again afterward to finish the rest.
+      if (heap_caps_get_free_size(MALLOC_CAP_INTERNAL) < DIR_LISTING_HEAP_FLOOR) {
+        Serial.printf("[WEB] handleDeleteAll(%s): stopping listing early (heap floor reached)\n", dir);
+        truncated = true;
+        break;
+      }
+
       f = root.openNextFile();
     }
     root.close();
@@ -4834,9 +5757,10 @@ static void handleDeleteAll() {
     }
   }
 
-  DynamicJsonDocument doc(128);
+  JsonDocument doc(psramJsonAllocator());
   doc["ok"] = true;
   doc["deleted"] = deleted;
+  doc["truncated"] = truncated;
   String out; out.reserve(measureJson(doc) + 1); serializeJson(doc, out);
   server.send(200, "application/json", out);
 }
@@ -4876,7 +5800,7 @@ static void handleSaveConfig() {
 
 static void handleWigleTest() {
   bool ok = wigleTestToken();
-  DynamicJsonDocument doc(384);
+  JsonDocument doc(psramJsonAllocator());
   doc["ok"] = ok; doc["tokenStatus"] = wigleTokenStatus;
   doc["httpCode"] = wigleLastHttpCode; doc["message"] = uploadLastResult;
   String out; out.reserve(measureJson(doc) + 1); serializeJson(doc, out);
@@ -4887,7 +5811,7 @@ static void handleWdgwarsTest() {
   if (WiFi.status() != WL_CONNECTED) { server.send(400,"application/json","{\"ok\":false,\"message\":\"STA WiFi not connected\"}"); return; }
   if (cfg.wdgwarsApiKey.length() < 8)  { server.send(400,"application/json","{\"ok\":false,\"message\":\"No API key configured\"}"); return; }
   bool ok = wdgwarsTestKey();
-  DynamicJsonDocument doc(256);
+  JsonDocument doc(psramJsonAllocator());
   doc["ok"] = ok; doc["message"] = uploadLastResult;
   String out; out.reserve(measureJson(doc) + 1); serializeJson(doc, out);
   server.send(ok ? 200 : 400, "application/json", out);
@@ -4898,7 +5822,7 @@ static void handleWdgwarsUploadAll() {
   if (WiFi.status() != WL_CONNECTED) { server.send(400,"text/plain","Not connected"); return; }
   if (cfg.wdgwarsApiKey.length() < 8)  { server.send(400,"text/plain","No API key configured"); return; }
   uint32_t okCount = uploadAllCsvsToWdgwars();
-  DynamicJsonDocument doc(256);
+  JsonDocument doc(psramJsonAllocator());
   doc["ok"]=(okCount>0); doc["uploaded"]=okCount; doc["total"]=uploadTotalFiles; doc["message"]=uploadLastResult;
   String out; out.reserve(measureJson(doc) + 1); serializeJson(doc, out);
   server.send(200, "application/json", out);
@@ -4908,7 +5832,7 @@ static void handleWardriftTest() {
   if (WiFi.status() != WL_CONNECTED) { server.send(400,"application/json","{\"ok\":false,\"message\":\"STA WiFi not connected\"}"); return; }
   if (cfg.wardriftApiKey.length() < 8)  { server.send(400,"application/json","{\"ok\":false,\"message\":\"No API key configured\"}"); return; }
   bool ok = wardriftTestKey();
-  DynamicJsonDocument doc(256);
+  JsonDocument doc(psramJsonAllocator());
   doc["ok"] = ok; doc["message"] = uploadLastResult;
   String out; out.reserve(measureJson(doc) + 1); serializeJson(doc, out);
   server.send(ok ? 200 : 400, "application/json", out);
@@ -4919,7 +5843,7 @@ static void handleWardriftUploadAll() {
   if (WiFi.status() != WL_CONNECTED) { server.send(400,"text/plain","Not connected"); return; }
   if (cfg.wardriftApiKey.length() < 8)  { server.send(400,"text/plain","No API key configured"); return; }
   uint32_t okCount = uploadAllCsvsToWardrift();
-  DynamicJsonDocument doc(256);
+  JsonDocument doc(psramJsonAllocator());
   doc["ok"]=(okCount>0); doc["uploaded"]=okCount; doc["total"]=uploadTotalFiles; doc["message"]=uploadLastResult;
   String out; out.reserve(measureJson(doc) + 1); serializeJson(doc, out);
   server.send(200, "application/json", out);
@@ -4934,6 +5858,7 @@ static void handleCleanup() {
     if (root) {
       File f = root.openNextFile();
       while (f) {
+        f.setBufferSize(64);  // avoid the 4KB default stdio buffer -- see addDirFiles()
         String path = normalizeSdPath("/logs", f.name());
         bool isCsv     = path.endsWith(".csv");
         bool isCurrent = (currentCsvPath.length() && path == currentCsvPath);
@@ -4967,12 +5892,17 @@ static void handleReboot() {
 static void handleWigleUploadAll() {
   if (!sdOk) { server.send(500, "text/plain", "SD not available"); return; }
   if (WiFi.status() != WL_CONNECTED) { server.send(400, "text/plain", "Not connected"); return; }
-  uint32_t okCount = uploadAllCsvsToWigle(-1);  // web always uploads all
-  DynamicJsonDocument doc(384);
+  uint32_t okCount = uploadAllPending(-1);  // web always uploads all
+  JsonDocument doc(psramJsonAllocator());
   doc["ok"] = (okCount > 0); doc["uploaded"] = okCount;
   doc["total"] = uploadTotalFiles; doc["message"] = uploadLastResult;
   String out; out.reserve(measureJson(doc) + 1); serializeJson(doc, out);
   server.send(200, "application/json", out);
+}
+
+static String gzScratchPathForOne(const String& basename) {
+  ensureGzScratchDir();
+  return gzScratchPathFor(basename);
 }
 
 static void handleWigleUploadOne() {
@@ -4991,63 +5921,97 @@ static void handleWigleUploadOne() {
     return;
   }
 
+  String basename = pathBasename(path);
+  FileUploadState st = loadUploadState(basename);
+
   uploading = true; uploadPausedScanWasEnabled = scanningEnabled; scanningEnabled = false;
   uploadTotalFiles = 1; uploadDoneFiles = 0; uploadCurrentFile = path;
   ledBlue();
 
-  // Mirrors the batch upload flow (uploadAllCsvsToWigle): try WDGoWars, then
-  // Wardrift, then WiGLE (whichever are configured), and move the file to
-  // /uploaded if ANY succeed. Previously this only ever attempted WiGLE, so
-  // a file uploaded via this per-file button never moved out of /logs when
-  // only a WDGoWars API key was configured (no WiGLE token).
+  // Mirrors the combined orchestrator's per-file gzip path (uploadAllPending()):
+  // try whichever services are still pending for this file -- WDGoWars, then
+  // Wardrift, then WiGLE -- skipping any already marked done, and only move
+  // the file to /uploaded/ once every configured service is done.
   wigleLastHttpCode = 0;  // avoid reporting a stale code if WiGLE isn't attempted below
-  bool wdgOk = false;
-  if (hasWdg) {
+  String wdgResult = "Already done", wardriftResult = "Already done", wigleResult = "Already done";
+
+  if (hasWdg && !st.wdgwDone) {
     uploadTargetName = "WDGW UL";
     tftWigleUploadScreen(uploadDoneFiles, uploadTotalFiles, pathBasename(path));
-    wdgOk = uploadFileToWdgwars(path);
+    bool ok;
+    if (cfg.gzipUploads) {
+      String scratch = gzScratchPathForOne(basename);
+      ok = gzipCompressFileToFile(path, scratch) && uploadFileToWdgwars(scratch);
+      SD.remove(scratch);
+    } else {
+      ok = uploadFileToWdgwars(path);
+    }
+    if (ok) { markServiceDone(basename, UploadService::Wdgw); st.wdgwDone = true; }
+    wdgResult = uploadLastResult;
     if (hasWardrift || hasWigle) delay(1500);  // brief settle between TLS sessions
   }
-  String wdgResult = uploadLastResult;  // preserve before the next call overwrites it
 
-  bool wardriftOk = false;
-  if (hasWardrift) {
+  if (hasWardrift && !st.wardriftDone) {
     uploadTargetName = "Wardrift UL";
     tftWigleUploadScreen(uploadDoneFiles, uploadTotalFiles, pathBasename(path));
-    wardriftOk = uploadFileToWardrift(path);
+    // Always sent uncompressed -- Wardrift's /v1/ingest/signals endpoint
+    // does not honor Content-Encoding: gzip (confirmed in the field: a
+    // gzip-compressed body comes back HTTP 400 "file did not contain
+    // supported signal rows", even though the same file succeeds against
+    // WDGoWars, which does support gzip). Ignore cfg.gzipUploads here.
+    bool ok = uploadFileToWardrift(path);
+    if (ok) { markServiceDone(basename, UploadService::Wardrift); st.wardriftDone = true; }
+    wardriftResult = uploadLastResult;
     if (hasWigle) delay(1500);  // brief settle between TLS sessions
   }
-  String wardriftResult = uploadLastResult;  // preserve before uploadFileToWigle overwrites it
 
-  bool wigleOk = false;
-  if (hasWigle) {
+  if (hasWigle && !st.wigleDone) {
     uploadTargetName = "WiGLE UL";
     tftWigleUploadScreen(uploadDoneFiles, uploadTotalFiles, pathBasename(path));
-    wigleOk = uploadFileToWigle(path);
+    bool ok;
+    if (cfg.gzipUploads) {
+      String scratch = gzScratchPathForOne(basename);
+      ok = gzipCompressFileToFile(path, scratch) && uploadFileToWigle(scratch);
+      SD.remove(scratch);
+    } else {
+      ok = uploadFileToWigle(path);
+    }
+    if (ok) { markServiceDone(basename, UploadService::Wigle); st.wigleDone = true; }
+    wigleResult = uploadLastResult;
   }
 
   uploadDoneFiles = 1; uploading = false;
   scanningEnabled = uploadPausedScanWasEnabled; uploadCurrentFile = ""; uploadTargetName = "";
   ledOff(); forceStatusFullRedraw();
 
-  bool ok = wigleOk || wdgOk || wardriftOk;
-  if (ok) moveToUploaded(path);
+  bool ok = allConfiguredServicesDone(st);
+  if (ok) {
+    // See the matching comment in uploadAllPending()'s finalize loop --
+    // only clear the ledger once the move actually succeeds.
+    if (moveToUploaded(path)) clearUploadState(basename);
+    else Serial.printf("[UPLOAD] WARNING: moveToUploaded failed for %s -- file stays in /logs, ledger kept\n", basename.c_str());
+  }
 
   int attempted = (hasWdg ? 1 : 0) + (hasWardrift ? 1 : 0) + (hasWigle ? 1 : 0);
-  String message = uploadLastResult;
+  String message;
   if (attempted > 1) {
     std::vector<String> parts;
     if (hasWdg)      parts.push_back("WDGW: " + wdgResult);
     if (hasWardrift) parts.push_back("Wardrift: " + wardriftResult);
-    if (hasWigle)    parts.push_back("WiGLE: " + uploadLastResult);
-    message = "";
+    if (hasWigle)    parts.push_back("WiGLE: " + wigleResult);
     for (size_t i = 0; i < parts.size(); i++) {
       if (i) message += " | ";
       message += parts[i];
     }
+  } else if (hasWdg) {
+    message = wdgResult;
+  } else if (hasWardrift) {
+    message = wardriftResult;
+  } else {
+    message = wigleResult;
   }
 
-  DynamicJsonDocument doc(384);
+  JsonDocument doc(psramJsonAllocator());
   doc["ok"] = ok; doc["httpCode"] = wigleLastHttpCode; doc["message"] = message;
   String out; out.reserve(measureJson(doc) + 1); serializeJson(doc, out);
   server.send(ok ? 200 : 500, "application/json", out);
@@ -5067,6 +6031,7 @@ static void handleDownloadAll() {
     File root = SD.open(d); if (!root) continue;
     File f = root.openNextFile();
     while (f) {
+      f.setBufferSize(64);  // avoid the 4KB default stdio buffer -- see addDirFiles()
       // Skip subdirectories and non-CSV files
       if (!f.isDirectory()) {
         String p = normalizeSdPath(d, f.name());
@@ -5094,20 +6059,9 @@ static void handleDownloadAll() {
     cl.write((const uint8_t*)"\r\n", 2);
   };
 
-  auto crc32Up = [](uint32_t crc, const uint8_t* b, size_t n) -> uint32_t {
-    static const uint32_t T[16] = {
-      0x00000000,0x1DB71064,0x3B6E20C8,0x26D930AC,
-      0x76DC4190,0x6B6B51F4,0x4DB26158,0x5005713C,
-      0xEDB88320,0xF00F9344,0xD6D6A3E8,0xCB61B38C,
-      0x9B64C2B0,0x86D3D2D4,0xA00AE278,0xBDBDF21C
-    };
-    crc = ~crc;
-    for (size_t i = 0; i < n; i++) {
-      crc = (crc >> 4) ^ T[(crc ^ b[i]) & 0xF];
-      crc = (crc >> 4) ^ T[(crc ^ (b[i] >> 4)) & 0xF];
-    }
-    return ~crc;
-  };
+  // CRC32 (ISO 3309 / gzip polynomial 0xEDB88320) -- shared implementation
+  // defined above, also used by the real-compression upload path.
+  auto crc32Up = gzipCrc32Update;
 
   const uint8_t gzHdr[10] = {
     0x1f, 0x8b, 0x08, 0x00,
@@ -5172,7 +6126,7 @@ static const char* meshBoardTypeLabel(uint8_t bt) {
 }
 
 static void handleMeshNodes() {
-  DynamicJsonDocument doc(2048);
+  JsonDocument doc(psramJsonAllocator());
   doc["coreActive"] = meshCoreActive;
 
   JsonArray arr = doc.createNestedArray("nodes");
@@ -5219,7 +6173,7 @@ static void handleMeshOtaStart() {
   bool ok = coreOtaStart(idx);
   CoreOtaStatus st = coreOtaStatus();
 
-  DynamicJsonDocument doc(256);
+  JsonDocument doc(psramJsonAllocator());
   doc["ok"]  = ok;
   doc["msg"] = st.msg;
 
@@ -5243,6 +6197,129 @@ static void handleMeshOtaCancel() {
 //  pass, so the mesh Core-push OTA engine above can push them to connected
 //  nodes without the operator ever touching an SD card.
 // ================================================================
+// Minimal pull-based de-chunking Stream wrapper for HTTP chunked
+// transfer-encoding. GitHub's release API response (currently 34KB+ for
+// this repo, and only growing as more assets/changelog accumulate) is
+// served chunked (no Content-Length). http.getStream()/getStreamPtr()
+// exposes the RAW connection -- chunk-size framing bytes are only
+// stripped by HTTPClient's own body readers (getString()/writeToStream()),
+// so parsing the raw stream directly would corrupt the JSON. Buffering the
+// de-chunked body into one String first (via writeToStream()) was tried,
+// but a single-digit-KB reserve() guess was hugely undersized against the
+// real 34KB+ response -- String's grow-by-doubling then needs several large
+// reallocations (8KB->16KB->32KB->~34KB+), each momentarily holding both
+// the old and new buffer alive at once, on top of the TLS session's own
+// buffers, against this device's much smaller (~80KB) free-heap budget.
+// That was fragmenting/exhausting the heap badly enough to crash shortly
+// afterward, regardless of how large the reserve() guess was bumped to.
+// This wrapper performs the same de-chunking HTTPClient::writeToStream()
+// does internally, but pull-based so ArduinoJson parses the response as it
+// arrives -- peak memory stays a few hundred bytes (ArduinoJson's own
+// parsing state) no matter how large the raw response is.
+class ChunkedReader : public Stream {
+public:
+  explicit ChunkedReader(WiFiClient* client) : _client(client) {}
+
+  int available() override {
+    fillChunk();
+    return (int)_remaining;
+  }
+  int read() override {
+    fillChunk();
+    if (_remaining == 0) return -1;
+    // ArduinoJson's Stream reader explicitly avoids calling read() directly
+    // because the bare, non-blocking _client->read() can return -1 the
+    // instant a TLS record hasn't finished arriving/decrypting yet. Called
+    // from Stream::timedRead()'s own retry loop (which has no yield()), a
+    // bare read() here busy-spins and can starve the WiFi/lwIP task on this
+    // single-core chip until the 1 s default Stream timeout gives up mid-
+    // document -- producing a spurious "IncompleteInput" parse failure well
+    // before the real end of a 34KB+ response. readBytes() uses the
+    // underlying client's own proven blocking-with-timeout implementation
+    // (the same one used successfully everywhere else in this codebase),
+    // so it waits for a byte instead of giving up immediately.
+    uint8_t b;
+    if (_client->readBytes(&b, 1) != 1) return -1;
+    _remaining--;
+    _totalRead++;
+    return b;
+  }
+  int peek() override {
+    fillChunk();
+    if (_remaining == 0) return -1;
+    return _client->peek();
+  }
+  void flush() override {}
+  size_t write(uint8_t) override { return 0; }  // write side unused
+
+private:
+  WiFiClient* _client;
+  size_t      _remaining = 0;
+  bool        _done      = false;
+  bool        _first     = true;
+  size_t      _totalRead = 0;  // bytes delivered via read() so far -- diagnostics only
+
+  void fillChunk() {
+    while (_remaining == 0 && !_done) {
+      if (!_first) {
+        // Consume the trailing CRLF after the previous chunk's data.
+        char trail[2];
+        int n = _client->readBytes(trail, 2);
+        if (n != 2) {
+          // A genuine end-of-stream is always a "0" chunk-size line (handled
+          // below), never a short/aborted trailing-CRLF read. If this ever
+          // fires, the underlying TLS/TCP read stalled or the connection
+          // was cut mid-stream -- surfaced here (byte offset + bytes
+          // actually read) since this exact spot is suspected of causing
+          // the recurring "IncompleteInput" parse failures on GitHub's
+          // 34KB+ chunked release-API response.
+          Serial.printf("[FWUPD] ChunkedReader: short trailing-CRLF read (%d/2 bytes) after %u bytes -- ending stream early\n",
+                        n, (unsigned)_totalRead);
+          _done = true;
+          return;
+        }
+      }
+      _first = false;
+      String line = _client->readStringUntil('\n');
+      line.trim();
+      long sz = strtol(line.c_str(), nullptr, 16);
+      if (sz <= 0) { _done = true; return; }
+      _remaining = (size_t)sz;
+    }
+  }
+};
+
+// Same blocking-read rationale as ChunkedReader above, for the other response
+// shape this endpoint can return: a plain Content-Length body instead of
+// chunked transfer-encoding (confirmed seen in practice -- getSize() > 0).
+// Without this, deserializeJson(doc, *http.getStreamPtr(), ...) falls back to
+// ArduinoJson's default Stream handling, which calls the bare, non-blocking
+// read() directly and can hit the same spurious IncompleteInput failure
+// ChunkedReader was built to avoid.
+class SizedReader : public Stream {
+public:
+  SizedReader(WiFiClient* client, size_t totalLen) : _client(client), _remaining(totalLen) {}
+
+  int available() override { return (int)_remaining; }
+  int read() override {
+    if (_remaining == 0) return -1;
+    uint8_t b;
+    if (_client->readBytes(&b, 1) != 1) return -1;
+    _remaining--;
+    return b;
+  }
+  int peek() override {
+    if (_remaining == 0) return -1;
+    return _client->peek();
+  }
+  void flush() override {}
+  size_t write(uint8_t) override { return 0; }
+
+private:
+  WiFiClient* _client;
+  size_t      _remaining;
+};
+
 static const char* FW_OWN_ASSET = "TDongleC5_Piglet.ota.bin";
 static const char* FW_OTHER_ASSETS[] = { "Piglet.ota.bin", "PigletNode.ota.bin" };
 static const int   FW_OTHER_ASSET_COUNT = 2;
@@ -5251,21 +6328,47 @@ static const int   FW_NODE_ASSET_IDX = 1;  // index of "PigletNode.ota.bin" with
 static const char* GITHUB_API_HOST = "api.github.com";
 static const char* GITHUB_API_PATH = "/repos/Hamspiced/piglet/releases/latest";
 
-static bool     fwUpdateChecked = false;
-static bool     fwUpdateAvailable = false;
-static String   fwAvailableVersion = "";
-static String   fwReleaseNotes = "";
-static bool     fwInstalling = false;
-static String   fwInstallStage = "";
-static uint32_t fwInstallDownloadedBytes = 0;
-static uint32_t fwInstallTotalBytes = 0;
-static String   fwInstallError = "";
+// fwUpdateChecked/fwUpdateAvailable/fwAvailableVersion/fwReleaseNotes/
+// fwCheckError/fwDownloading/fwDownloaded/fwDownloadStage/fwDownloadedBytes/
+// fwDownloadTotalBytes/fwDownloadError/fwInstalling/fwInstallError are
+// declared earlier in the file (Firmware Update State section, near the
+// other top-level status globals) so updateTFT()/pollButton() can reference
+// them -- see the comment there for why.
+// fwCheckError in particular: deliberately left populated (not blanked) on
+// a failed recheck -- fwUpdateAvailable/fwAvailableVersion stay at their
+// last known-good values on failure, so a transient failed recheck can't
+// make a previously-detected update disappear from the Web UI.
+
+static String fwLog = "";
+static const size_t FW_LOG_MAX = 2048;  // capped buffer -- oldest whole lines trimmed from the front
 
 static bool     fwStagingNode = false;
 static String   fwStageNodeError = "";
 
 static String fwOwnAssetUrl;
 static String fwOtherAssetUrls[FW_OTHER_ASSET_COUNT];
+
+// printf-style: both Serial.printf()s and appends an elapsed-seconds-
+// prefixed line to the capped fwLog buffer the Web UI's download/install
+// modal polls. Oldest whole lines are dropped once the buffer exceeds
+// FW_LOG_MAX, so a long-running transfer can't grow this unbounded.
+static void fwLogAppend(const char* fmt, ...) {
+  char msg[160];
+  va_list args;
+  va_start(args, fmt);
+  vsnprintf(msg, sizeof(msg), fmt, args);
+  va_end(args);
+  Serial.printf("[FWUPD] %s\n", msg);
+
+  char line[180];
+  snprintf(line, sizeof(line), "[%lus] %s\n", (unsigned long)(millis() / 1000), msg);
+  fwLog += line;
+  if (fwLog.length() > FW_LOG_MAX) {
+    int cut = (int)(fwLog.length() - FW_LOG_MAX);
+    int nl = fwLog.indexOf('\n', cut);
+    fwLog = (nl >= 0) ? fwLog.substring(nl + 1) : "";
+  }
+}
 
 // Parses "vMAJOR.MINOR" (or "MAJOR.MINOR", with/without a leading 'v') into
 // a comparable (major, minor) pair -- numeric, not lexical, so e.g. "v2.9"
@@ -5287,118 +6390,194 @@ static bool fwIsNewer(const String& latest, const String& current) {
   return lMin > cMin;
 }
 
-static void fwCheckForUpdate() {
-  fwUpdateChecked    = false;
-  fwUpdateAvailable  = false;
-  fwAvailableVersion = "";
-  fwReleaseNotes     = "";
-  fwOwnAssetUrl      = "";
-  for (int i = 0; i < FW_OTHER_ASSET_COUNT; i++) fwOtherAssetUrls[i] = "";
+// Logs free/largest-contiguous MALLOC_CAP_DMA heap -- the narrow pool the
+// hardware AES/DMA driver allocates its (small) per-TLS-session descriptors
+// from, separate from (and a subset of) general MALLOC_CAP_INTERNAL free
+// heap. General free heap/largest-block can look perfectly healthy while
+// this specific pool is exhausted/fragmented -- that mismatch is exactly
+// the "esp-aes: Failed to allocate memory" / "SSL - Memory allocation
+// failed" signature seen on Web UI-triggered Check-for-Update calls after a
+// long uptime with a lot of prior TLS churn (boot upload storm, other
+// button clicks). Same pattern as logDmaHeap() used elsewhere in this file.
+static void fwLogDmaHeap(const char* tag) {
+  Serial.printf("[FWUPD] %s: dmaFree=%u dmaLargest=%u\n", tag,
+                (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
+                (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
+}
 
+// Note: deliberately does NOT reset fwUpdateAvailable/fwAvailableVersion/
+// fwReleaseNotes/fwOwnAssetUrl/fwOtherAssetUrls up front. A Web UI-triggered
+// recheck can fail (e.g. transient DMA-pool exhaustion, see fwLogDmaHeap()
+// below) after a prior check -- boot-time or manual -- already found a real
+// update; blanking those fields before knowing whether this attempt will
+// succeed made a failed recheck erase a previously-detected update from the
+// Web UI, which read as "GitHub not reporting the correct version". Those
+// fields are now only overwritten once a complete, valid GitHub response is
+// in hand (see the bottom of this function). Every failure path below just
+// records fwCheckError and returns, leaving prior state untouched.
+static void fwCheckForUpdate() {
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("[FWUPD] Skipped check (no STA WiFi)");
+    fwCheckError    = "STA WiFi not connected";
     fwUpdateChecked = true;
     return;
   }
 
   Serial.println("[FWUPD] Checking GitHub for a newer release...");
+  fwLogDmaHeap("Pre-check");
+  fwCheckError = "";
 
-  WiFiClientSecure client;
-  client.setInsecure();
-  HTTPClient http;
-  http.setTimeout(10000);
-  if (!http.begin(client, String("https://") + GITHUB_API_HOST + GITHUB_API_PATH)) {
-    Serial.println("[FWUPD] HTTP begin failed");
-    fwUpdateChecked = true;
-    return;
-  }
-  http.addHeader("User-Agent", "Piglet-Firmware");
-  http.addHeader("Accept", "application/vnd.github+json");
+  // Web UI-triggered calls can follow a long run of other TLS-heavy activity
+  // (boot upload storm, other Check-for-Update/test-key clicks) that left
+  // the narrow AES/DMA-descriptor pool fragmented. Closing a TLS session's
+  // sockets/buffers doesn't always return them to that pool synchronously --
+  // some of that cleanup is posted to and processed by the WiFi/lwIP task.
+  // A short yield()+delay() here can't defragment the heap (this platform's
+  // allocator has no compaction), but it does give that deferred cleanup a
+  // chance to actually run and release blocks back to the pool before this
+  // attempt races a measurement/allocation against it.
+  yield();
+  delay(100);
 
-  int code = http.GET();
-  if (code != HTTP_CODE_OK) {
-    // A negative code (e.g. -1 = HTTPC_ERROR_CONNECTION_REFUSED) means the
-    // TLS/TCP connection itself never completed -- no HTTP response was
-    // ever received, so this is NOT the firmware concluding "no update
-    // available". client.lastError() surfaces the actual mbedTLS/socket
-    // failure (DNS, handshake, timeout, etc.) instead of just the bare,
-    // uninformative HTTPClient error code.
-    if (code < 0) {
-      char errBuf[100];
-      int sslErr = client.lastError(errBuf, sizeof(errBuf));
-      Serial.printf("[FWUPD] GitHub API returned HTTP %d (TLS error %d: %s)\n", code, sslErr, errBuf);
-    } else {
-      Serial.printf("[FWUPD] GitHub API returned HTTP %d\n", code);
-    }
-    http.end();
-    fwUpdateChecked = true;
-    return;
-  }
-
-  DynamicJsonDocument filter(256);
+  JsonDocument filter(psramJsonAllocator());
   filter["tag_name"] = true;
   filter["body"]     = true;
   JsonObject assetFilter = filter["assets"].add<JsonObject>();
   assetFilter["name"] = true;
   assetFilter["browser_download_url"] = true;
 
-  // GitHub's API serves this response with chunked transfer-encoding. The
-  // chunk-size framing bytes are only stripped by HTTPClient's own body
-  // readers (getString()/writeToStream()) -- reading the raw connection via
-  // getStream() exposes those framing bytes directly to the JSON parser,
-  // corrupting the parse (and was leaving the TLS connection in a state
-  // that could crash a later check). Buffering first avoids this; the
-  // filtered DynamicJsonDocument below still keeps actual parsed memory use
-  // small regardless of the raw body size.
-  //
-  // NOT using http.getString() here: for a chunked response (no
-  // Content-Length, _size == -1) it skips reserving its internal String up
-  // front and grows it one write() at a time as de-chunked bytes arrive --
-  // the same unreserved-String fragmentation pattern already fixed in the
-  // Web UI's JSON handlers. This response can run several KB (full release
-  // notes + asset list) and runs immediately before fwInstallUpdate()'s own
-  // sequence of TLS downloads, so that fragmentation directly raises the
-  // odds of those failing with "SSL - Memory allocation failed". Driving
-  // the same de-chunking logic (writeToStream()) into a pre-reserved
-  // StreamString keeps this to a single allocation instead.
-  StreamString payload;
-  payload.reserve(8192);
-  http.writeToStream(&payload);
-  http.end();
+  // Retry the WHOLE connect+GET+parse sequence, not just the connect --
+  // unlike the upload paths' connect-only retries, this response is held
+  // open over a multi-second TLS session (34KB+), so it's also vulnerable
+  // to a transient esp-aes/DMA-pool hiccup mid-transfer rather than just at
+  // connect time: a clean 200 response that then truncates partway through
+  // the body (IncompleteInput), not a parsing bug. This is most likely to
+  // bite via the Web UI's "Check for Update" button (as opposed to the
+  // identical call at boot, the very first TLS operation since reset with a
+  // fully rested DMA pool) because by then the page's own recurring status-
+  // poll fetches (status.json/update/status/mesh endpoints) have been
+  // competing for the same narrow pool -- confirmed by instrumented testing:
+  // dmaLargest sat at an identical, depressed value across all 3 attempts of
+  // a failing check, then recovered within a few seconds once loop() (and
+  // therefore server.handleClient()) ran freely again. See the dmaFailure
+  // fail-fast branch below for why retrying a DMA allocation failure
+  // in-place doesn't help and is handled differently from other failures.
+  JsonDocument doc(psramJsonAllocator());
+  bool gotValidDoc = false;
 
-  if (payload.length() == 0) {
-    Serial.println("[FWUPD] Empty response body");
-    fwUpdateChecked = true;
-    return;
-  }
+  for (int attempt = 1; attempt <= 3 && !gotValidDoc; attempt++) {
+    WiFiClientSecure client;
+    client.setInsecure();
+    // HTTPClient::setTimeout() only forwards to the underlying client if
+    // already connected() -- harmless here since it's called pre-connect,
+    // but means it never actually reaches `client`. Set it directly too,
+    // since ChunkedReader's per-byte reads below rely on this client's own
+    // configured timeout to wait properly instead of giving up too soon.
+    client.setTimeout(10000);
+    HTTPClient http;
+    http.setTimeout(10000);
+    if (!http.begin(client, String("https://") + GITHUB_API_HOST + GITHUB_API_PATH)) {
+      Serial.printf("[FWUPD] HTTP begin failed (attempt %d/3)\n", attempt);
+      if (attempt < 3) { delay(500); yield(); continue; }
+      fwCheckError    = "Could not start HTTPS connection";
+      fwUpdateChecked = true;
+      return;
+    }
+    http.addHeader("User-Agent", "Piglet-Firmware");
+    http.addHeader("Accept", "application/vnd.github+json");
 
-  DynamicJsonDocument doc(6144);
-  // StreamString publicly inherits both Stream and String, which makes
-  // deserializeJson(doc, payload, ...) ambiguous (ArduinoJson has Reader
-  // specializations for both bases) -- disambiguate by binding to the
-  // String overload explicitly, since the data is already fully buffered.
-  DeserializationError err =
-    deserializeJson(doc, static_cast<const String&>(payload), DeserializationOption::Filter(filter));
+    int code = http.GET();
+    if (code != HTTP_CODE_OK) {
+      // A negative code (e.g. -1 = HTTPC_ERROR_CONNECTION_REFUSED) means the
+      // TLS/TCP connection itself never completed -- no HTTP response was
+      // ever received, so this is NOT the firmware concluding "no update
+      // available". client.lastError() surfaces the actual mbedTLS/socket
+      // failure (DNS, handshake, timeout, etc.) instead of just the bare,
+      // uninformative HTTPClient error code.
+      bool dmaFailure = false;
+      if (code < 0) {
+        char errBuf[100];
+        int sslErr = client.lastError(errBuf, sizeof(errBuf));
+        Serial.printf("[FWUPD] GitHub API returned HTTP %d (TLS error %d: %s) -- attempt %d/3\n", code, sslErr, errBuf, attempt);
+        // -32512 (MBEDTLS_ERR_SSL_ALLOC_FAILED) and esp-aes's own "Failed to
+        // allocate memory" both stem from the same DMA-pool pressure.
+        // Flagged here so the fail-fast branch below can skip retrying it.
+        dmaFailure = (sslErr == -32512);
+        fwLogDmaHeap("Check connect fail");
+      } else {
+        Serial.printf("[FWUPD] GitHub API returned HTTP %d -- attempt %d/3\n", code, attempt);
+      }
+      http.end();
+      if (dmaFailure) {
+        // Retrying in place doesn't help: the narrow DMA pool is depressed
+        // by OTHER connections (the Web UI's own polling loops), not a
+        // momentary hiccup that clears itself within this handler's own
+        // retry delay -- instrumented testing showed dmaLargest identical
+        // across all 3 attempts of a failing check. Worse, every attempt
+        // spent here is time server.handleClient() isn't running, letting
+        // those other connections' pending data pile up instead of
+        // draining. Fail fast so loop() gets control back sooner and the
+        // pool can recover the way it's observed to -- the Web UI already
+        // preserves the last known update status, so pressing the button
+        // again a few seconds later is harmless.
+        fwCheckError    = "Low memory (TLS alloc failed) -- wait a few seconds and try again";
+        fwUpdateChecked = true;
+        return;
+      }
+      if (attempt < 3) { delay(500); yield(); continue; }
+      fwCheckError    = "GitHub connection failed";
+      fwUpdateChecked = true;
+      return;
+    }
 
-  if (err) {
-    Serial.printf("[FWUPD] JSON parse failed: %s\n", err.c_str());
-    fwUpdateChecked = true;
-    return;
+    // See ChunkedReader's comment above for why this parses the response
+    // through a blocking-read wrapper instead of buffering it whole or
+    // handing ArduinoJson the raw stream directly. GitHub's release API
+    // response has been observed both chunked (getSize() <= 0) and with a
+    // real Content-Length (getSize() > 0) -- SizedReader covers the latter
+    // case with the same readBytes()-based blocking reads ChunkedReader uses.
+    doc.clear();
+    DeserializationError err;
+    int bodySize = http.getSize();
+    Serial.printf("[FWUPD] Response getSize()=%d -- parsing via %s path (attempt %d/3)\n",
+                  bodySize, (bodySize > 0) ? "sized" : "chunked", attempt);
+    if (bodySize > 0) {
+      SizedReader reader(http.getStreamPtr(), (size_t)bodySize);
+      err = deserializeJson(doc, reader, DeserializationOption::Filter(filter));
+    } else {
+      ChunkedReader reader(http.getStreamPtr());
+      err = deserializeJson(doc, reader, DeserializationOption::Filter(filter));
+    }
+    http.end();
+
+    if (err) {
+      Serial.printf("[FWUPD] JSON parse failed: %s -- attempt %d/3\n", err.c_str(), attempt);
+      if (attempt < 3) { delay(500); yield(); continue; }
+      fwCheckError    = "Failed to parse GitHub response";
+      fwUpdateChecked = true;
+      return;
+    }
+
+    gotValidDoc = true;
   }
 
   String tag = doc["tag_name"] | "";
   if (tag.length() == 0) {
     Serial.println("[FWUPD] No tag_name in response");
+    fwCheckError    = "GitHub response missing tag_name";
     fwUpdateChecked = true;
     return;
   }
 
-  // Resolve every asset's download URL unconditionally -- even when this
-  // board is already on the latest release (!fwIsNewer() below). "Store
-  // Piglet Node Firmware" (Web UI) needs the PigletNode asset URL whether
-  // or not this board itself needs an update, so bailing out early here (as
-  // this used to do) would leave fwOtherAssetUrls[] empty and break that
-  // button on an up-to-date board.
+  // A complete, valid response is in hand -- safe to replace the published
+  // state now. Resolve every asset's download URL unconditionally -- even
+  // when this board is already on the latest release (!fwIsNewer() below).
+  // "Store Piglet Node Firmware" (Web UI) needs the PigletNode asset URL
+  // whether or not this board itself needs an update, so bailing out early
+  // here (as this used to do) would leave fwOtherAssetUrls[] empty and
+  // break that button on an up-to-date board.
+  fwOwnAssetUrl = "";
+  for (int i = 0; i < FW_OTHER_ASSET_COUNT; i++) fwOtherAssetUrls[i] = "";
   for (JsonObject asset : doc["assets"].as<JsonArray>()) {
     String name = asset["name"] | "";
     String url  = asset["browser_download_url"] | "";
@@ -5413,14 +6592,16 @@ static void fwCheckForUpdate() {
   if (!fwIsNewer(tag, FIRMWARE_VERSION)) {
     Serial.printf("[FWUPD] Up to date (latest=%s, current=%s)\n", tag.c_str(), FIRMWARE_VERSION);
     fwAvailableVersion = tag;  // still useful to show "Latest Available" even when not newer
-    fwUpdateChecked = true;
+    fwUpdateAvailable  = false;
+    fwUpdateChecked    = true;
     return;
   }
 
   if (fwOwnAssetUrl.length() == 0) {
     Serial.println("[FWUPD] Newer release found but no matching asset for this board");
     fwAvailableVersion = tag;
-    fwUpdateChecked = true;
+    fwUpdateAvailable  = false;
+    fwUpdateChecked    = true;
     return;
   }
 
@@ -5430,54 +6611,501 @@ static void fwCheckForUpdate() {
   Serial.printf("[FWUPD] Update available: %s -> %s\n", FIRMWARE_VERSION, fwAvailableVersion.c_str());
 }
 
-static bool fwDownloadAndFlashOwn() {
-  fwInstallStage = String("Downloading ") + FW_OWN_ASSET + "...";
+// ================================================================
+//  Non-blocking download: this board's own release asset -> SD card
+//  Driven one bounded step at a time by fwDownloadTick(), called every
+//  loop() iteration, so server.handleClient() keeps servicing the Web UI's
+//  status-poll requests throughout a multi-megabyte transfer (mirrors the
+//  coreOtaTick() mesh-push state machine above). The connect step (TLS
+//  handshake + headers) still happens synchronously within a single tick
+//  call -- only the body transfer is sliced across ticks.
+// ================================================================
+enum class FwDlPhase : uint8_t { Idle, Preparing, Connecting, Downloading, RetryWait };
 
-  WiFiClientSecure client;
-  client.setInsecure();
-  HTTPClient http;
-  http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
-  http.setTimeout(20000);
-  if (!http.begin(client, fwOwnAssetUrl)) { fwInstallError = "HTTP begin failed"; return false; }
+static struct {
+  FwDlPhase         phase          = FwDlPhase::Idle;
+  WiFiClientSecure*  client        = nullptr;
+  HTTPClient*        http          = nullptr;
+  File               file;
+  String             destPath;
+  int                total         = 0;
+  int                remaining     = 0;
+  int                connectAttempt = 0;
+  int                lastLoggedPct = 0;
+  uint32_t           lastDataMs    = 0;
+  uint32_t           prepStartMs   = 0;
+  uint32_t           prepLastLogMs = 0;
+  uint8_t            sessionAttempt = 0;  // whole-session (Preparing->...->fail) retry count
+  uint32_t           retryAtMs      = 0;
+} fwDl;
 
-  int code = http.GET();
-  if (code != HTTP_CODE_OK) { fwInstallError = "HTTP " + String(code); http.end(); return false; }
+static const uint32_t FW_DL_STALL_MS = 20000;  // no body bytes at all for this long -> give up
+static const int      FW_DL_CONNECT_MAX_ATTEMPTS = 3;
 
-  int len = http.getSize();
-  if (len <= 0) { fwInstallError = "Unknown content length"; http.end(); return false; }
-  fwInstallTotalBytes      = (uint32_t)len;
-  fwInstallDownloadedBytes = 0;
+// Preparing-phase budget: loop() already stops scanning and WDGWars polling
+// the instant fwDownloading goes true (see loop() below), but an async scan
+// already in flight, or deferred lwIP/mbedTLS cleanup from a just-finished
+// Check-for-Update call, both take a moment to actually release their
+// memory back to the DMA pool. Rather than race that cleanup the way a
+// direct-to-Connecting start used to, wait it out first: a mandatory
+// minimum settle so background work has time to actually wind down, then
+// keep polling (up to a hard cap, so a boot session where the pool truly
+// never recovers doesn't hang forever) before proceeding regardless.
+// Field testing showed dmaLargest climbing steadily well past the old 8 s
+// cap -- 25588 -> 36852 -> 38900 bytes over 8 s and still rising, just shy
+// of FW_DL_DMA_HEALTHY_THRESHOLD -- so the old cap was giving up right
+// before the pool would have cleared the threshold. 30 s gives that slow
+// deferred cleanup much more room to finish.
+static const uint32_t FW_DL_PREP_MIN_MS = 3000;
+static const uint32_t FW_DL_PREP_MAX_MS = 30000;
 
-  if (!Update.begin((size_t)len, U_FLASH)) {
-    fwInstallError = String("Update.begin failed: ") + Update.errorString();
-    http.end();
+// Below this MALLOC_CAP_DMA largest-free-block reading, a failed connect to
+// this download target is treated as resource-constrained rather than a
+// plain network hiccup. Chosen from instrumented testing: a pristine,
+// never-used-this-boot pool starts above 60000, but the very first TLS
+// connection of a boot session appears to permanently retain some
+// mbedTLS/esp-aes session-level allocation afterward -- every reading taken
+// for the rest of that boot session has topped out at ~34804-36852, no
+// matter how long the device sits idle. This download target has never
+// succeeded even starting from that ~36852 "recovered" ceiling, so anything
+// below this threshold is presumed insufficient for its particular TLS
+// handshake (a larger cert chain than the lightweight GitHub API check,
+// via the objects.githubusercontent.com redirect).
+static const uint32_t FW_DL_DMA_HEALTHY_THRESHOLD = 40000;
+
+// Whole-session auto-retry budget: this flow is driven from the TFT/button
+// (or a Web UI modal the operator may not be watching), so nobody is
+// necessarily there to notice a failure and manually click/press "try
+// again". Rather than strand the screen on a dead error, keep retrying the
+// entire Preparing->Connecting sequence on its own -- the DMA pool has been
+// observed to vary by several KB over tens of seconds (not just monotonic
+// recovery), so a later attempt genuinely has a different chance than the
+// one that just failed. Capped so a truly persistent problem (no WiFi, SD
+// gone, GitHub down) eventually gives up instead of looping forever.
+static const uint32_t FW_DL_SESSION_RETRY_DELAY_MS = 8000;
+static const uint8_t  FW_DL_SESSION_RETRY_MAX      = 12;
+
+static void fwDownloadCleanup() {
+  if (fwDl.file) fwDl.file.close();
+  if (fwDl.http) { fwDl.http->end(); delete fwDl.http; fwDl.http = nullptr; }
+  if (fwDl.client) { delete fwDl.client; fwDl.client = nullptr; }
+}
+
+static void fwDownloadFail(const String& err) {
+  fwLogAppend("ERROR: %s", err.c_str());
+  fwDownloadCleanup();
+  if (sdOk && fwDl.destPath.length() && SD.exists(fwDl.destPath)) SD.remove(fwDl.destPath);
+  fwDownloadError = err;
+
+  fwDl.sessionAttempt++;
+  if (fwDl.sessionAttempt < FW_DL_SESSION_RETRY_MAX) {
+    // fwDownloading stays true throughout the wait -- the TFT "Updating"
+    // screen and any open Web UI modal keep showing live status instead of
+    // reverting to "press button to download" and silently waiting for a
+    // manual retry that may never come.
+    fwDownloadStage = "Failed -- retrying...";
+    fwDl.retryAtMs  = millis() + FW_DL_SESSION_RETRY_DELAY_MS;
+    fwDl.prepLastLogMs = 0;  // force an immediate countdown update on the next tick
+    fwDl.phase      = FwDlPhase::RetryWait;
+    fwLogAppend("Retrying in %lus (session attempt %d/%d)",
+                (unsigned long)(FW_DL_SESSION_RETRY_DELAY_MS / 1000),
+                (int)fwDl.sessionAttempt + 1, FW_DL_SESSION_RETRY_MAX);
+    return;
+  }
+
+  fwDownloadStage = "Failed";
+  fwDownloading   = false;
+  fwDownloaded    = false;
+  fwDl.phase      = FwDlPhase::Idle;
+  fwLogAppend("Giving up after %d attempts -- press the download button/control again to retry", FW_DL_SESSION_RETRY_MAX);
+}
+
+static void fwDownloadStart() {
+  if (fwDownloading) return;
+  if (!fwUpdateAvailable || fwOwnAssetUrl.length() == 0) {
+    fwDownloadError = "No update available";
+    return;
+  }
+  if (WiFi.status() != WL_CONNECTED) {
+    fwDownloadError = "STA WiFi not connected";
+    return;
+  }
+  if (!sdOk) {
+    fwDownloadError = "SD not available";
+    return;
+  }
+
+  fwLog                = "";
+  fwDownloadError      = "";
+  fwDownloadedBytes    = 0;
+  fwDownloadTotalBytes = 0;
+  fwDownloaded         = false;
+  fwDownloadStage      = "Pausing background tasks...";
+  fwDl.destPath        = String("/Firmware/") + FW_OWN_ASSET;
+  fwDl.connectAttempt  = 0;
+  fwDl.sessionAttempt  = 0;
+  fwDl.prepStartMs     = millis();
+  fwDl.prepLastLogMs   = 0;
+  fwDl.phase           = FwDlPhase::Preparing;
+  fwDownloading        = true;
+  fwLogAppend("Starting download of %s -- pausing scanning and background jobs first", FW_OWN_ASSET);
+}
+
+static void fwDownloadCancel() {
+  if (!fwDownloading) return;
+  fwLogAppend("Download cancelled by user");
+  fwDownloadCleanup();
+  if (sdOk && fwDl.destPath.length() && SD.exists(fwDl.destPath)) SD.remove(fwDl.destPath);
+  fwDownloadStage = "Cancelled";
+  fwDownloadError = "";
+  fwDownloading   = false;
+  fwDownloaded    = false;
+  fwDl.phase      = FwDlPhase::Idle;
+}
+
+// Deletes every file in /Firmware/ on the SD card -- this board's own
+// downloaded-but-not-yet-installed image, plus anything staged for the mesh
+// Core-push engine. Lets the operator clear out a stuck/partial download (or
+// just reclaim SD space) without needing to pull the card. Refuses while a
+// download or install is actively using that directory so a file can't be
+// yanked out from under an in-flight write/flash.
+static bool fwClearFirmwareFolder() {
+  if (fwDownloading || fwInstalling) return false;
+  if (!sdOk) return false;
+
+  File dir = SD.open("/Firmware");
+  if (!dir) return true;              // directory doesn't exist -- nothing to clear
+  if (!dir.isDirectory()) { dir.close(); return true; }
+
+  uint32_t removed = 0;
+  File f = dir.openNextFile();
+  while (f) {
+    bool   isDir = f.isDirectory();
+    String path  = normalizeSdPath("/Firmware", f.name());
+    f.close();
+    if (!isDir && SD.remove(path)) removed++;
+    f = dir.openNextFile();
+  }
+  dir.close();
+
+  fwDownloaded         = false;
+  fwDownloadedBytes    = 0;
+  fwDownloadTotalBytes = 0;
+  fwDownloadStage      = "";
+  fwLogAppend("Cleared %u staged firmware file(s) from /Firmware", (unsigned)removed);
+  return true;
+}
+
+static void fwDownloadTick() {
+  if (!fwDownloading) return;
+
+  switch (fwDl.phase) {
+    case FwDlPhase::RetryWait: {
+      // Holding pattern after a failed whole-session attempt -- see
+      // fwDownloadFail() for why this auto-retries instead of stopping.
+      // Updates the visible countdown at most once a second.
+      uint32_t nowMs = millis();
+      uint32_t remainMs = (nowMs < fwDl.retryAtMs) ? (fwDl.retryAtMs - nowMs) : 0;
+      if (fwDl.prepLastLogMs == 0 || nowMs - fwDl.prepLastLogMs >= 1000) {
+        fwDl.prepLastLogMs = nowMs;
+        fwDownloadStage = "Failed -- retrying in " + String((remainMs + 999) / 1000) + "s...";
+      }
+      if (nowMs >= fwDl.retryAtMs) {
+        fwLogAppend("Retrying now (session attempt %d/%d)...", (int)fwDl.sessionAttempt + 1, FW_DL_SESSION_RETRY_MAX);
+        fwDl.connectAttempt = 0;
+        fwDl.prepStartMs    = millis();
+        fwDl.prepLastLogMs  = 0;
+        fwDownloadStage     = "Pausing background tasks...";
+        fwDl.phase          = FwDlPhase::Preparing;
+      }
+      break;
+    }
+
+    case FwDlPhase::Preparing: {
+      // loop() already forces scanning/WDGWars off the instant fwDownloading
+      // went true above -- this phase just waits for that to actually take
+      // effect (an async scan already in flight, or deferred lwIP/mbedTLS
+      // cleanup from whatever TLS session ran right before this button
+      // press) before spending the DMA pool on a new TLS handshake. Polls
+      // at most once a second so the modal shows real elapsed time instead
+      // of sitting unchanged on "Starting...".
+      uint32_t elapsed = millis() - fwDl.prepStartMs;
+      if (elapsed == 0 || millis() - fwDl.prepLastLogMs >= 1000) {
+        fwDl.prepLastLogMs = millis();
+        uint32_t dmaLargest = heap_caps_get_largest_free_block(MALLOC_CAP_DMA);
+        fwDownloadStage = "Waiting for memory to free up (" + String(elapsed / 1000) + "s)...";
+        fwLogAppend("Settling -- dmaLargest=%u (%lus elapsed)", (unsigned)dmaLargest, (unsigned long)(elapsed / 1000));
+      }
+
+      bool minElapsed = elapsed >= FW_DL_PREP_MIN_MS;
+      bool timedOut   = elapsed >= FW_DL_PREP_MAX_MS;
+      uint32_t dmaLargestNow = heap_caps_get_largest_free_block(MALLOC_CAP_DMA);
+      bool healthy = dmaLargestNow >= FW_DL_DMA_HEALTHY_THRESHOLD;
+
+      if (minElapsed && (healthy || timedOut)) {
+        if (healthy) {
+          fwLogAppend("Memory looks healthy (dmaLargest=%u) -- connecting", (unsigned)dmaLargestNow);
+        } else {
+          fwLogAppend("Memory still low (dmaLargest=%u) after %lus -- connecting anyway",
+                      (unsigned)dmaLargestNow, (unsigned long)(FW_DL_PREP_MAX_MS / 1000));
+        }
+        fwDl.connectAttempt = 0;
+        fwDownloadStage     = "Connecting...";
+        fwDl.phase          = FwDlPhase::Connecting;
+      }
+      break;
+    }
+
+    case FwDlPhase::Connecting: {
+      fwDl.connectAttempt++;
+      fwLogAppend("Connecting (attempt %d/%d)...", fwDl.connectAttempt, FW_DL_CONNECT_MAX_ATTEMPTS);
+
+      bool   connectFailed = false;
+      bool   dmaFailure    = false;
+      String failReason;
+
+      // Manually handle GitHub's one-hop redirect to
+      // objects.githubusercontent.com instead of HTTPC_FORCE_FOLLOW_REDIRECTS.
+      // That mode closes the first (github.com) TLS session and immediately
+      // opens the second (heavier) one back-to-back with no settle time.
+      // Instrumented testing showed this redirect target can fail to
+      // allocate memory for RSA certificate verification (-17040: RSA
+      // public key operation / BIGNUM allocation failure) even starting
+      // from an otherwise healthy pool -- giving the first connection's
+      // just-freed resources a brief moment to actually return to the
+      // MALLOC_CAP_DMA pool before opening the second TLS session is the
+      // one lever this manual approach can pull that FORCE_FOLLOW_REDIRECTS
+      // cannot.
+      String targetUrl = fwOwnAssetUrl;
+      for (int hop = 0; hop < 2; hop++) {
+        fwDl.client = new WiFiClientSecure();
+        fwDl.client->setInsecure();
+        fwDl.http = new HTTPClient();
+        fwDl.http->setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);  // handled manually here
+        // HTTPClient::GET() below is a blocking call -- loop() (and therefore
+        // server.handleClient(), and the Web UI's progress poll) is frozen
+        // for however long it takes to resolve. A real DMA-alloc failure
+        // surfaces almost instantly, but a genuine network hang would
+        // otherwise freeze the Web UI for the full timeout, twice per
+        // attempt (two hops) -- kept short so a stuck connection doesn't
+        // leave the modal looking dead for too long.
+        fwDl.http->setTimeout(10000);
+
+        if (!fwDl.http->begin(*fwDl.client, targetUrl)) {
+          connectFailed = true;
+          failReason    = "HTTP begin failed";
+          break;
+        }
+
+        int code = fwDl.http->GET();
+        bool isRedirect = (code == HTTP_CODE_MOVED_PERMANENTLY || code == HTTP_CODE_FOUND ||
+                           code == HTTP_CODE_SEE_OTHER || code == HTTP_CODE_TEMPORARY_REDIRECT);
+
+        if (isRedirect && hop == 0) {
+          String location = fwDl.http->getLocation();
+          fwDl.http->end();
+          delete fwDl.http;   fwDl.http   = nullptr;
+          delete fwDl.client; fwDl.client = nullptr;
+          if (location.length() == 0) {
+            connectFailed = true;
+            failReason    = "Redirect with no Location header";
+            break;
+          }
+          targetUrl = location;
+          fwLogAppend("Redirected to CDN -- settling before second connection");
+          yield();
+          delay(400);
+          continue;  // second hop, fresh client/http against the CDN URL
+        }
+
+        if (code != HTTP_CODE_OK) {
+          connectFailed = true;
+          if (code < 0) {
+            char errBuf[100];
+            int sslErr = fwDl.client->lastError(errBuf, sizeof(errBuf));
+            failReason = "HTTP " + String(code) + " (TLS " + String(sslErr) + ": " + errBuf + ")";
+            // DMA-pool pressure against this specific target does NOT
+            // reliably surface as any one consistent mbedTLS error code --
+            // observed in the field as -32512 (MBEDTLS_ERR_SSL_ALLOC_FAILED),
+            // -29312 ("connection indicated an EOF"), -1 ("Generic error",
+            // with an explicit "esp-aes: Failed to allocate memory" driver
+            // log alongside it), and -17040 (RSA public key operation /
+            // BIGNUM allocation failure) across different attempts and
+            // sessions. Rather than guess at which mbedTLS codes mean the
+            // same thing, classify directly from the measured pool size
+            // instead -- see FW_DL_DMA_HEALTHY_THRESHOLD above.
+            dmaFailure = (heap_caps_get_largest_free_block(MALLOC_CAP_DMA) < FW_DL_DMA_HEALTHY_THRESHOLD);
+            fwLogDmaHeap("Download connect fail");
+          } else {
+            failReason = "HTTP " + String(code);
+          }
+          break;
+        }
+
+        break;  // success -- fwDl.client/fwDl.http stay alive for the Downloading phase
+      }
+
+      if (connectFailed) {
+        fwLogAppend("%s -- attempt %d/%d", failReason.c_str(), fwDl.connectAttempt, FW_DL_CONNECT_MAX_ATTEMPTS);
+        fwDownloadCleanup();
+        if (dmaFailure) {
+          fwDownloadFail("Low memory (TLS alloc failed) -- wait a few seconds and try again");
+          return;
+        }
+        if (fwDl.connectAttempt < FW_DL_CONNECT_MAX_ATTEMPTS) {
+          delay(500);
+          return;  // retry next tick, phase stays Connecting
+        }
+        fwDownloadFail(failReason);
+        return;
+      }
+
+      int len = fwDl.http->getSize();
+      if (len <= 0) { fwDownloadFail("Unknown content length"); return; }
+
+      digitalWrite(PINS.tft_cs, HIGH);
+      if (!SD.exists("/Firmware")) SD.mkdir("/Firmware");
+      if (SD.exists(fwDl.destPath)) SD.remove(fwDl.destPath);  // delete before write
+      fwDl.file = SD.open(fwDl.destPath, FILE_WRITE);
+      if (!fwDl.file) { fwDownloadFail("Cannot open destination file"); return; }
+
+      fwDl.total               = len;
+      fwDl.remaining           = len;
+      fwDl.lastLoggedPct       = 0;
+      fwDl.lastDataMs          = millis();
+      fwDownloadTotalBytes     = (uint32_t)len;
+      fwDownloadStage          = "Downloading...";
+      fwLogAppend("Connected -- downloading %d bytes", len);
+      fwDl.phase               = FwDlPhase::Downloading;
+      break;
+    }
+
+    case FwDlPhase::Downloading: {
+      if (!fwDl.http->connected() && fwDl.remaining > 0) {
+        fwDownloadFail("Connection lost");
+        return;
+      }
+      WiFiClient* stream = fwDl.http->getStreamPtr();
+      size_t avail = stream->available();
+      if (avail == 0) {
+        if (millis() - fwDl.lastDataMs > FW_DL_STALL_MS) fwDownloadFail("Download stalled");
+        return;  // nothing ready yet -- try again next tick
+      }
+
+      uint8_t buf[2048];
+      int want = (int)((avail > sizeof(buf)) ? sizeof(buf) : avail);
+      int n = stream->readBytes(buf, want);
+      if (n <= 0) return;
+      digitalWrite(PINS.tft_cs, HIGH);
+      if (fwDl.file.write(buf, n) != (size_t)n) { fwDownloadFail("SD write failed"); return; }
+
+      fwDl.remaining    -= n;
+      fwDownloadedBytes += (uint32_t)n;
+      fwDl.lastDataMs    = millis();
+
+      int pct = (fwDl.total > 0) ? (int)(((uint64_t)fwDownloadedBytes * 100) / fwDl.total) : 0;
+      if (pct >= fwDl.lastLoggedPct + 10) {
+        fwDl.lastLoggedPct = (pct / 10) * 10;
+        fwLogAppend("Downloaded %d%% (%u / %u bytes)", pct, (unsigned)fwDownloadedBytes, (unsigned)fwDl.total);
+      }
+
+      if (fwDl.remaining <= 0) {
+        fwDl.file.close();
+        fwDl.http->end();
+        delete fwDl.http;   fwDl.http   = nullptr;
+        delete fwDl.client; fwDl.client = nullptr;
+        fwDownloading   = false;
+        fwDownloaded    = true;
+        fwDownloadStage = "Downloaded -- ready to install";
+        fwLogAppend("Download complete (%u bytes)", (unsigned)fwDownloadedBytes);
+        fwDl.phase = FwDlPhase::Idle;
+      }
+      break;
+    }
+
+    default:
+      break;
+  }
+}
+
+// Reads the already-downloaded SD file back in and flashes it via Update.h.
+// Purely local (SD -> flash), no network -- a couple of seconds for a
+// ~1.3MB image, so unlike the download step this stays a simple blocking
+// call.
+static bool fwInstallFromSD() {
+  if (fwInstalling) return false;
+  if (!fwDownloaded) {
+    fwInstallError = "No firmware downloaded";
+    return false;
+  }
+  if (!sdOk) {
+    fwInstallError = "SD not available";
     return false;
   }
 
-  WiFiClient* stream = http.getStreamPtr();
+  fwInstalling   = true;
+  fwInstallError = "";
+
+  String path = String("/Firmware/") + FW_OWN_ASSET;
+  digitalWrite(PINS.tft_cs, HIGH);
+  File f = SD.open(path, FILE_READ);
+  if (!f) {
+    fwInstallError = "Cannot open downloaded file";
+    fwLogAppend("ERROR: %s", fwInstallError.c_str());
+    fwInstalling = false;
+    return false;
+  }
+
+  size_t size = f.size();
+  if (size == 0) {
+    f.close();
+    fwInstallError = "Downloaded file is empty";
+    fwLogAppend("ERROR: %s", fwInstallError.c_str());
+    fwInstalling = false;
+    return false;
+  }
+
+  if (!Update.begin(size, U_FLASH)) {
+    fwInstallError = String("Update.begin failed: ") + Update.errorString();
+    fwLogAppend("ERROR: %s", fwInstallError.c_str());
+    f.close();
+    fwInstalling = false;
+    return false;
+  }
+
+  fwLogAppend("Flashing %u bytes...", (unsigned)size);
   uint8_t buf[1024];
-  int remaining = len;
-  bool writeFailed = false;
-  while (http.connected() && remaining > 0) {
-    size_t avail = stream->available();
-    if (avail) {
-      int want = (int)((avail > sizeof(buf)) ? sizeof(buf) : avail);
-      int n = stream->readBytes(buf, want);
-      if (n <= 0) break;
-      if (Update.write(buf, n) != (size_t)n) { writeFailed = true; break; }
-      remaining -= n;
-      fwInstallDownloadedBytes += (uint32_t)n;
-    } else {
-      delay(2);
-    }
+  size_t  written = 0;
+  bool    writeFailed = false;
+  while (f.available()) {
+    int n = f.read(buf, sizeof(buf));
+    if (n <= 0) break;
+    if (Update.write(buf, n) != (size_t)n) { writeFailed = true; break; }
+    written += (size_t)n;
     yield();
   }
-  http.end();
+  f.close();
 
-  if (writeFailed) { fwInstallError = "Flash write failed"; Update.abort(); return false; }
-  if (remaining > 0) { fwInstallError = "Download incomplete"; Update.abort(); return false; }
-  if (!Update.end(true)) { fwInstallError = String("Update.end failed: ") + Update.errorString(); return false; }
-  return true;
+  if (writeFailed || written != size) {
+    fwInstallError = "Flash write failed";
+    fwLogAppend("ERROR: %s", fwInstallError.c_str());
+    Update.abort();
+    fwInstalling = false;
+    return false;
+  }
+  if (!Update.end(true)) {
+    fwInstallError = String("Update.end failed: ") + Update.errorString();
+    fwLogAppend("ERROR: %s", fwInstallError.c_str());
+    fwInstalling = false;
+    return false;
+  }
+
+  fwLogAppend("Flash OK -- rebooting");
+  Serial.println("[FWUPD] Flash OK -- restarting");
+  closeLogFile();
+  delay(500);
+  ESP.restart();
+  return true;  // unreached
 }
 
 static bool fwDownloadToSD(const String& url, const String& destPath) {
@@ -5491,8 +7119,33 @@ static bool fwDownloadToSD(const String& url, const String& destPath) {
   http.setTimeout(20000);
   if (!http.begin(client, url)) return false;
 
-  int code = http.GET();
-  if (code != HTTP_CODE_OK) { http.end(); return false; }
+  // Retry transient TLS connect failures -- same esp-aes/DMA-descriptor
+  // allocation pressure the test-key/token functions guard against can hit
+  // here too, especially since this is often one of several back-to-back
+  // HTTPS connections during a single "Install Update" pass. HTTPClient::
+  // connect() re-attempts _client->connect() on every call as long as the
+  // previous attempt left it disconnected (returnError() stops the client
+  // on failure), so simply calling GET() again is sufficient -- no need to
+  // http.end()/begin() between attempts.
+  int code = -1;
+  for (int attempt = 1; attempt <= 3; attempt++) {
+    code = http.GET();
+    if (code == HTTP_CODE_OK) break;
+    if (code < 0) {
+      char errBuf[100];
+      int sslErr = client.lastError(errBuf, sizeof(errBuf));
+      Serial.printf("[FWUPD] Stage download (%s) HTTP %d (TLS %d: %s) -- attempt %d/3\n",
+                    destPath.c_str(), code, sslErr, errBuf, attempt);
+      if (attempt < 3) { delay(500); yield(); }
+    } else {
+      Serial.printf("[FWUPD] Stage download (%s) HTTP %d\n", destPath.c_str(), code);
+      break;  // a real HTTP response was received -- retrying won't change it
+    }
+  }
+  if (code != HTTP_CODE_OK) {
+    http.end();
+    return false;
+  }
 
   int len = http.getSize();
   if (len <= 0) { http.end(); return false; }
@@ -5526,39 +7179,6 @@ static bool fwDownloadToSD(const String& url, const String& destPath) {
 
   if (!ok || remaining > 0) { SD.remove(destPath); return false; }
   return true;
-}
-
-static bool fwInstallUpdate() {
-  if (fwInstalling) return false;
-  if (!fwUpdateAvailable || fwOwnAssetUrl.length() == 0) { fwInstallError = "No update available"; return false; }
-  if (WiFi.status() != WL_CONNECTED) { fwInstallError = "STA WiFi not connected"; return false; }
-
-  fwInstalling             = true;
-  fwInstallError           = "";
-  fwInstallDownloadedBytes = 0;
-  fwInstallTotalBytes      = 0;
-
-  for (int i = 0; i < FW_OTHER_ASSET_COUNT; i++) {
-    fwInstallStage = String("Staging ") + FW_OTHER_ASSETS[i] + "...";
-    String dest = String("/Firmware/") + FW_OTHER_ASSETS[i];
-    bool ok = fwDownloadToSD(fwOtherAssetUrls[i], dest);
-    Serial.printf("[FWUPD] Stage %s: %s\n", FW_OTHER_ASSETS[i], ok ? "OK" : "skipped/failed");
-  }
-
-  bool ok = fwDownloadAndFlashOwn();
-  fwInstalling = false;
-  if (!ok) {
-    fwInstallStage = "Failed";
-    Serial.printf("[FWUPD] Install failed: %s\n", fwInstallError.c_str());
-    return false;
-  }
-
-  fwInstallStage = "Rebooting...";
-  Serial.println("[FWUPD] Flash OK -- restarting");
-  closeLogFile();
-  delay(500);
-  ESP.restart();
-  return true;  // unreached
 }
 
 static bool fwHasNodeAsset() {
@@ -5599,17 +7219,28 @@ static bool fwStageNodeFirmware() {
 }
 
 static void handleUpdateStatus() {
-  DynamicJsonDocument doc(512);
+  // fwLog can hold up to FW_LOG_MAX (2048) bytes of text -- size the
+  // document well above that plus the other fields and JSON overhead.
+  JsonDocument doc(psramJsonAllocator());
   doc["checked"]          = fwUpdateChecked;
   doc["available"]        = fwUpdateAvailable;
   doc["currentVersion"]   = FIRMWARE_VERSION;
   doc["availableVersion"] = fwAvailableVersion;
   doc["notes"]            = fwReleaseNotes;
+  doc["checkError"]       = fwCheckError;
+
+  doc["downloading"]      = fwDownloading;
+  doc["downloaded"]       = fwDownloaded;
+  doc["downloadStage"]    = fwDownloadStage;
+  doc["downloadedBytes"]  = fwDownloadedBytes;
+  doc["totalBytes"]       = fwDownloadTotalBytes;
+  doc["downloadError"]    = fwDownloadError;
+
   doc["installing"]       = fwInstalling;
-  doc["stage"]            = fwInstallStage;
-  doc["downloadedBytes"]  = fwInstallDownloadedBytes;
-  doc["totalBytes"]       = fwInstallTotalBytes;
-  doc["error"]            = fwInstallError;
+  doc["installError"]     = fwInstallError;
+
+  doc["log"]              = fwLog;
+
   doc["nodeAssetKnown"]   = fwHasNodeAsset();
   doc["stagingNode"]      = fwStagingNode;
   doc["stageNodeError"]   = fwStageNodeError;
@@ -5627,24 +7258,70 @@ static void handleUpdateCheck() {
   }
   fwCheckForUpdate();
 
-  DynamicJsonDocument doc(256);
-  doc["ok"]               = true;
+  bool ok = (fwCheckError.length() == 0);
+  JsonDocument doc(psramJsonAllocator());
+  doc["ok"]               = ok;
+  doc["message"]          = fwCheckError;
   doc["available"]        = fwUpdateAvailable;
   doc["availableVersion"] = fwAvailableVersion;
 
   String out;
   out.reserve(measureJson(doc) + 1);
   serializeJson(doc, out);
-  server.send(200, "application/json", out);
+  server.send(ok ? 200 : 502, "application/json", out);
 }
 
-static void handleUpdateInstall() {
-  if (!fwUpdateAvailable) { server.send(400, "text/plain", "No update available"); return; }
-  if (WiFi.status() != WL_CONNECTED) { server.send(400, "text/plain", "STA WiFi not connected"); return; }
+static void handleUpdateDownloadStart() {
+  fwDownloadStart();
+  // fwDownloadStart() is synchronous but non-blocking -- it only validates
+  // preconditions and arms the state machine fwDownloadTick() drives from
+  // loop(). fwDownloading is true here if a transfer is now (still) in
+  // progress; otherwise fwDownloadError holds the rejection reason.
+  bool ok = fwDownloading;
 
-  bool ok = fwInstallUpdate();
+  JsonDocument doc(psramJsonAllocator());
+  doc["ok"]    = ok;
+  doc["error"] = fwDownloadError;
 
-  DynamicJsonDocument doc(256);
+  String out;
+  out.reserve(measureJson(doc) + 1);
+  serializeJson(doc, out);
+  server.send(ok ? 200 : 400, "application/json", out);
+}
+
+static void handleUpdateDownloadCancel() {
+  fwDownloadCancel();
+  server.send(200, "text/plain", "OK");
+}
+
+// Deletes every file currently staged in /Firmware/ (this board's own
+// downloaded-but-not-yet-installed image, plus anything staged for the mesh
+// Core-push engine) -- lets the operator clear a stuck/partial download or
+// just reclaim SD space without pulling the card.
+static void handleUpdateClearFirmware() {
+  bool ok = fwClearFirmwareFolder();
+
+  JsonDocument doc(psramJsonAllocator());
+  doc["ok"] = ok;
+  if (!ok) {
+    doc["error"] = (fwDownloading || fwInstalling)
+      ? "Cannot clear while a download or install is in progress"
+      : "SD not available";
+  }
+
+  String out;
+  out.reserve(measureJson(doc) + 1);
+  serializeJson(doc, out);
+  server.send(ok ? 200 : 400, "application/json", out);
+}
+
+static void handleUpdateInstallFromSD() {
+  // Blocking, but purely local (SD -> flash, no network) so it's quick. On
+  // success this calls ESP.restart() internally and never returns -- a
+  // response is only sent here if it failed before flashing began.
+  bool ok = fwInstallFromSD();
+
+  JsonDocument doc(psramJsonAllocator());
   doc["ok"]    = ok;
   doc["error"] = fwInstallError;
 
@@ -5660,7 +7337,7 @@ static void handleUpdateStageNode() {
   bool ok = fwStageNodeFirmware();
   if (ok) coreOtaPreload();  // reload PSRAM images so the new file is usable without a reboot
 
-  DynamicJsonDocument doc(256);
+  JsonDocument doc(psramJsonAllocator());
   doc["ok"]    = ok;
   doc["error"] = fwStageNodeError;
 
@@ -5679,7 +7356,7 @@ static bool webMacParse(const String& s, uint8_t* macOut) {
 }
 
 static void handleMeshChannelOverridesGet() {
-  DynamicJsonDocument doc(1024);
+  JsonDocument doc(psramJsonAllocator());
   JsonArray arr = doc.createNestedArray("overrides");
   uint8_t count = meshChOverrideGetCount();
   for (uint8_t i = 0; i < count; i++) {
@@ -5714,7 +7391,7 @@ static void handleMeshChannelOverridesSet() {
   int chEnd   = server.arg("chEnd").toInt();
   bool ok = meshChOverrideSet(mac, chStart, chEnd);
 
-  DynamicJsonDocument doc(128);
+  JsonDocument doc(psramJsonAllocator());
   doc["ok"] = ok;
   if (!ok) doc["error"] = "Invalid channel -- must match a supported 2.4/5GHz channel number";
   String out;
@@ -5729,6 +7406,15 @@ static void handleMeshChannelOverridesClear() {
   if (!webMacParse(server.arg("mac"), mac)) { server.send(400, "text/plain", "Bad MAC format"); return; }
   bool ok = meshChOverrideClear(mac);
   server.send(ok ? 200 : 404, "text/plain", ok ? "OK" : "Not found");
+}
+
+// Fire-and-forget sink for Web UI button-press logging (see logBtn() in
+// INDEX_HTML) -- makes field debugging able to see exactly which control
+// was pressed and when, directly in the serial console.
+static void handleUiLog() {
+  String msg = server.hasArg("msg") ? server.arg("msg") : "(unknown)";
+  Serial.printf("[UI] %s\n", msg.c_str());
+  server.send(200, "text/plain", "OK");
 }
 
 static void startWebServer() {
@@ -5751,15 +7437,19 @@ static void startWebServer() {
   server.on("/wardrift/test",      HTTP_POST, handleWardriftTest);
   server.on("/wardrift/uploadAll", HTTP_POST, handleWardriftUploadAll);
   server.on("/reboot",          HTTP_POST, handleReboot);
+  server.on("/uiLog",           HTTP_POST, handleUiLog);
   server.on("/cleanup",         HTTP_POST, handleCleanup);
   server.on("/deleteAll",       HTTP_POST, handleDeleteAll);
   server.on("/mesh/nodes.json", handleMeshNodes);
   server.on("/mesh/ota/start",  HTTP_POST, handleMeshOtaStart);
   server.on("/mesh/ota/cancel", HTTP_POST, handleMeshOtaCancel);
-  server.on("/update/status",    handleUpdateStatus);
-  server.on("/update/check",     HTTP_POST, handleUpdateCheck);
-  server.on("/update/install",   HTTP_POST, handleUpdateInstall);
-  server.on("/update/stageNode", HTTP_POST, handleUpdateStageNode);
+  server.on("/update/status",         handleUpdateStatus);
+  server.on("/update/check",          HTTP_POST, handleUpdateCheck);
+  server.on("/update/downloadStart",  HTTP_POST, handleUpdateDownloadStart);
+  server.on("/update/downloadCancel", HTTP_POST, handleUpdateDownloadCancel);
+  server.on("/update/clearFirmware",  HTTP_POST, handleUpdateClearFirmware);
+  server.on("/update/installFromSD",  HTTP_POST, handleUpdateInstallFromSD);
+  server.on("/update/stageNode",      HTTP_POST, handleUpdateStageNode);
   server.on("/mesh/channelOverrides",       HTTP_GET,  handleMeshChannelOverridesGet);
   server.on("/mesh/channelOverrides",       HTTP_POST, handleMeshChannelOverridesSet);
   server.on("/mesh/channelOverrides/clear", HTTP_POST, handleMeshChannelOverridesClear);
@@ -5853,7 +7543,10 @@ static void stopAPIfAllowed() {
     forceStatusFullRedraw();
     apExtended = false; apForceClose = false;
     WiFi.setAutoReconnect(false); WiFi.persistent(false);
-    WiFi.disconnect(true, true); delay(50);
+    // wifioff=false -- see the matching comment in handleStaTransitions()
+    // below for why tearing down the STA netif here can crash the
+    // still-running WebServer.
+    WiFi.disconnect(false, true); delay(50);
     if (WiFi.status() != WL_CONNECTED) WiFi.mode(WIFI_STA);
     if (!(userScanOverride && !scanningEnabled)) scanningEnabled = true;
   }
@@ -5868,7 +7561,14 @@ static void handleStaTransitions() {
     // and cause it to return 0 results even while the scan indicator shows active.
     WiFi.setAutoReconnect(false);
     WiFi.persistent(false);
-    WiFi.disconnect(true, false);  // stop reconnect; eraseap=false keeps NVS credentials
+    // wifioff MUST be false here: true calls STA.end(), which tears down
+    // the STA network interface while the WebServer (server.handleClient()
+    // runs every loop() iteration and never stops) may still have a client
+    // connected through it. That previously crashed with a Guru Meditation
+    // Instruction access fault (MEPC=0) inside esp_pbuf_free() ->
+    // esp_netif_free_rx_buffer() -- lwIP freeing a receive buffer that
+    // referenced the just-destroyed interface.
+    WiFi.disconnect(false, false);  // stop reconnect; eraseap=false keeps NVS credentials
     delay(50);
     WiFi.mode(WIFI_STA);  // clean idle STA state ready for scanning
     if (!(userScanOverride && !scanningEnabled)) scanningEnabled = true;
@@ -5917,7 +7617,10 @@ static void checkHomeNetworkReturn() {
     Serial.println("[WIFI] Home network connect failed -- resuming wardriving");
     WiFi.setAutoReconnect(false);
     WiFi.persistent(false);
-    WiFi.disconnect(true, false);  // eraseap=false keeps NVS credentials
+    // wifioff=false -- see the matching comment in handleStaTransitions()
+    // for why tearing down the STA netif here can crash the still-running
+    // WebServer.
+    WiFi.disconnect(false, false);  // eraseap=false keeps NVS credentials
     delay(50);
     WiFi.mode(WIFI_STA);           // idle STA ready for scanning
     return;
@@ -5934,7 +7637,7 @@ static void checkHomeNetworkReturn() {
     if (hasWdg)   Serial.print("WDGoWars ");
     if (hasWigle) Serial.print("WiGLE ");
     Serial.println();
-    uploadAllCsvsToWigle(cfg.maxBootUploads);
+    uploadAllPending(cfg.maxBootUploads);
   } else {
     Serial.println("[UPLOAD] Skipped (SD not ready, no tokens set, or maxBootUploads=0)");
   }
@@ -5957,20 +7660,26 @@ static void processScanResults(int n) {
 
   String firstSeen = iso8601NowUTC();
   double lat = 0, lon = 0, altM = 0, accM = 0;
-  if (gpsHasFix) {
+  bool   havePosition = false;
+
+  if (gpsHasFix && gpsCoordIsValid(gps.location.lat(), gps.location.lng())) {
     lat  = gps.location.lat();
     lon  = gps.location.lng();
     altM = gps.altitude.isValid() ? gps.altitude.meters() : 0.0;
     accM = gps.hdop.isValid()     ? gps.hdop.hdop()       : 0.0;
+    havePosition = true;
     // lastLat/lastLon is maintained by loop() — no update here.
-  } else if (lastGpsValid && (millis() - lastGpsValidMs) <= GPS_CACHE_MAX_MS) {
+  } else if (lastGpsValid && (millis() - lastGpsValidMs) <= GPS_CACHE_MAX_MS &&
+             gpsCoordIsValid(lastLat, lastLon)) {
     lat  = lastLat;
     lon  = lastLon;
     altM = lastAlt;
     accM = lastAcc;
+    havePosition = true;
   }
 
   uint32_t wrote = 0;
+  uint32_t skipped = 0;
   for (int i = 0; i < n; i++) {
     // Periodic cooperative yield so a large batch (dense-area scan) doesn't
     // monopolize the CPU between appendWigleRow()'s own flush-triggered yields.
@@ -5998,6 +7707,12 @@ static void processScanResults(int n) {
     if (is2g) networksFound2G++;
     else      networksFound5G++;
 
+    // Never fabricate a position (0,0 or otherwise) -- if there's no
+    // trustworthy fix or cached last-known-good location yet, skip logging
+    // this network entirely rather than writing "Null Island". It'll be
+    // logged on a later scan cycle once a real position is available.
+    if (!havePosition) { skipped++; continue; }
+
     if (appendWigleRow(mac, ssid, authStr, firstSeen, ch, rssi, lat, lon, altM, accM)) wrote++;
   }
 
@@ -6011,6 +7726,9 @@ static void processScanResults(int n) {
   }
 
   if (wrote > 0) ledPulseGreen();
+  if (skipped > 0) {
+    Serial.printf("[SCAN] %u network(s) not logged -- no valid GPS position yet (never writes 0,0)\n", (unsigned)skipped);
+  }
   Serial.printf("[SCAN] Wrote %lu rows\n", (unsigned long)wrote);
 }
 
@@ -6170,6 +7888,21 @@ static void pollButton() {
       // using this page's normal single-press action.
       coreUpdatePromptConfirm();
       Serial.println("[BTN] Press -> mesh update prompt confirmed");
+    } else if (currentPage == 0 && fwDownloaded && !fwDownloading && !fwInstalling) {
+      // Download finished, status page is showing "Restart to install" --
+      // a single press restarts now. The actual install runs automatically
+      // at next boot (see setup()), not here, so it never competes with
+      // anything else for memory.
+      Serial.println("[BTN] Press -> restarting to install firmware update");
+      ESP.restart();
+    } else if (currentPage == 0 && fwUpdateAvailable && !fwDownloading && !fwDownloaded && !fwInstalling) {
+      // Status page is showing the "Firmware update available" banner --
+      // a single press starts the on-device download instead of advancing
+      // pages. Driven entirely from the TFT/button, no Web UI involved, so
+      // there's no browser polling traffic competing with the download's
+      // TLS session for the same narrow DMA-capable heap pool.
+      Serial.println("[BTN] Press -> starting on-device firmware download");
+      fwDownloadStart();
     } else {
       // Single (or unrecognised multi) press -> advance page
       advancePage();
@@ -6258,6 +7991,33 @@ void setup() {
     File test = SD.open("/logs");
     if (test) test.close();
     else { sdOk = false; ledRed(); }
+  }
+
+  // Resume an on-device firmware update staged by a previous session: the
+  // "Download & Install" on-device flow (status page button press) writes
+  // this board's own release asset to /Firmware/ and asks the user to
+  // restart rather than installing immediately, so the install itself never
+  // competes with anything else for memory -- see updateTFT()/pollButton()
+  // for the download/restart side of this flow. fwInstallFromSD() normally
+  // requires fwDownloaded to already be true (set by this session's own
+  // download); after a fresh boot that in-RAM flag is gone, so set it here
+  // once the file's presence on SD is confirmed. A failed install
+  // (corrupt/partial file) deletes it so a bad image can't block every boot.
+  if (sdOk && SD.exists(String("/Firmware/") + FW_OWN_ASSET)) {
+    Serial.println("[BOOT] Staged firmware update found -- installing...");
+    tft.fillScreen(BLACK);
+    tft.setTextColor(WHITE, BLACK);
+    tftDrawCentered(20, "Installing", 2);
+    tftDrawCentered(50, "firmware update...", 1);
+    tftDrawCentered(85, "Do not power off", 1);
+    fwDownloaded = true;
+    if (!fwInstallFromSD()) {
+      // fwInstallFromSD() only returns on failure -- success calls
+      // ESP.restart() internally and never comes back here.
+      Serial.printf("[BOOT] Staged firmware install failed: %s -- removing file\n", fwInstallError.c_str());
+      SD.remove(String("/Firmware/") + FW_OWN_ASSET);
+      fwDownloaded = false;
+    }
   }
 
   // Mesh Core OTA images: load once now (PSRAM-resident) so that entering
@@ -6360,6 +8120,7 @@ void setup() {
       if (root) {
         File f = root.openNextFile();
         while (f) {
+          f.setBufferSize(64);  // avoid the 4KB default stdio buffer -- see addDirFiles()
           String path = normalizeSdPath("/logs", f.name());
           if (path.endsWith(".csv")) toDelete.push_back(path);
           f.close(); f = root.openNextFile();
@@ -6371,9 +8132,11 @@ void setup() {
         if (!csvHasDataRows(path, &sz)) {
           Serial.printf("[CLEANUP] Empty CSV (%u bytes), deleting: %s\n", (unsigned)sz, pathBasename(path).c_str());
           if (!SD.remove(path)) Serial.printf("[CLEANUP] WARNING: SD.remove failed for %s -- file left in place\n", pathBasename(path).c_str());
+          clearUploadState(pathBasename(path));
         }
       }
     }
+    pruneUploadState();  // drop ledger entries for files no longer in /logs
   }
 
   // Boot upload: WDGoWars first (if key set), then WiGLE (if token set).
@@ -6386,7 +8149,7 @@ void setup() {
       if (hasWdg)   Serial.print("WDGoWars ");
       if (hasWigle) Serial.print("WiGLE");
       Serial.println();
-      uploadAllCsvsToWigle(cfg.maxBootUploads);
+      uploadAllPending(cfg.maxBootUploads);
     } else if (!staOk || !sdOk) {
       Serial.println("[UPLOAD] Skipped (STA/SD not ready).");
     } else if (cfg.maxBootUploads == 0) {
@@ -6476,7 +8239,7 @@ void loop() {
   if (gpsHasFix) {
     float hdop = gps.hdop.isValid()       ? gps.hdop.hdop()           : 99.0f;
     int   sats = gps.satellites.isValid() ? (int)gps.satellites.value() : 0;
-    if (hdop <= 10.0f && sats >= 3) {
+    if (hdop <= 10.0f && sats >= 3 && gpsCoordIsValid(gps.location.lat(), gps.location.lng())) {
       lastLat        = gps.location.lat();
       lastLon        = gps.location.lng();
       lastAlt        = gps.altitude.isValid() ? gps.altitude.meters() : 0.0;
@@ -6486,8 +8249,13 @@ void loop() {
     }
   }
 
-  // GPS health log every 10 s until fix acquired
-  if (!gpsHasFix) {
+  // GPS health log every 10 s until fix acquired. Skipped during a firmware
+  // download: each burst of Serial.printf() over the native USB-Serial/JTAG
+  // CDC interface measurably dipped MALLOC_CAP_DMA largest-free-block in
+  // field testing (the USB peripheral's own internal buffers compete for
+  // the same DMA-capable heap pool TLS needs), right when that pool is
+  // already under the most pressure.
+  if (!gpsHasFix && !fwDownloading) {
     static uint32_t lastGpsDiagMs = 0;
     if (millis() - lastGpsDiagMs >= 10000) {
       lastGpsDiagMs = millis();
@@ -6567,8 +8335,16 @@ void loop() {
 
   // Check on any WDGoWars jobs queued during the last upload batch. This is
   // rate-limited internally to at most one short network round-trip per
-  // call, so it never blocks scanning, GPS, or the display.
-  wdgwarsServicePendingJobs();
+  // call, so it never blocks scanning, GPS, or the display. Skipped while a
+  // firmware download is in flight -- its own HTTPS connection would
+  // otherwise compete with the download's TLS session for the same narrow
+  // DMA-capable heap pool.
+  if (!fwDownloading) wdgwarsServicePendingJobs();
+
+  // Drive an in-progress firmware download one bounded step at a time. A
+  // no-op unless the Web UI's "Download & Install Firmware" modal has
+  // started a transfer.
+  fwDownloadTick();
 
   // Scanning — mesh page handles its own logic; skip normal scan path
   if (currentPage == 4) {
@@ -6578,7 +8354,11 @@ void loop() {
     autoPaused = shouldPauseScanning();
     wifi_mode_t m = WiFi.getMode();
     bool apActive = (m == WIFI_AP || m == WIFI_AP_STA);
-    bool allowScan = scanningEnabled && sdOk && !apActive && (userScanOverride || !autoPaused);
+    // A firmware download holding a TLS session open fully stops scanning
+    // (overriding even a user scan override) rather than just throttling
+    // it, so the radio and heap aren't also servicing scan traffic while
+    // the download needs every spare byte of the DMA-capable heap pool.
+    bool allowScan = !fwDownloading && scanningEnabled && sdOk && !apActive && (userScanOverride || !autoPaused);
     if (allowScan) doScanOnce();
   }
 

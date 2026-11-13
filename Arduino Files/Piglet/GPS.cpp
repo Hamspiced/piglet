@@ -58,6 +58,16 @@ double headingSmoothedDeg() {
   return normDeg360(ang);
 }
 
+// ---- Coordinate validation ----
+
+bool gpsCoordIsValid(double lat, double lon) {
+  if (!isfinite(lat) || !isfinite(lon)) return false;
+  if (lat < -90.0 || lat > 90.0) return false;
+  if (lon < -180.0 || lon > 180.0) return false;
+  if (lat == 0.0 && lon == 0.0) return false;  // Null Island / no-fix sentinel
+  return true;
+}
+
 // ---- Time helpers ----
 
 time_t makeUtcEpochFromTm(struct tm* t) {

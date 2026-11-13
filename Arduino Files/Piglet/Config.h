@@ -101,6 +101,17 @@ struct Config {
   // actively pushing updates benefits from a card rated for sustained writes;
   // 16GB+ is recommended. Default off.
   bool autoUpdateHeadlessNodes = false;
+
+  // When true (default): CSVs are gzip-compressed before upload to WiGLE
+  // (one combined/merged archive per batch) and WDGoWars (each file
+  // individually compressed, since it cannot accept a multi-file archive).
+  // Wardrift uploads are ALWAYS sent uncompressed regardless of this
+  // setting -- its /v1/ingest/signals endpoint does not honor
+  // Content-Encoding: gzip (confirmed in the field: a gzip body comes back
+  // HTTP 400 "file did not contain supported signal rows"). Escape hatch in
+  // case WiGLE/WDGoWars ever reject the gzip framing too -- flip off to
+  // fall back to plain uncompressed uploads for those without a rebuild.
+  bool gzipUploads = true;
 };
 
 const PinMap& detectPinsByChip();

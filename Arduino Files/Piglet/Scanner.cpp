@@ -38,18 +38,28 @@ static void processScanResults(int n) {
 
   String firstSeen = iso8601NowUTC();
   double lat = 0, lon = 0, altM = 0, accM = 0;
-  if (gpsHasFix) {
+  bool   havePosition = false;
+
+  if (gpsHasFix && gpsCoordIsValid(gps.location.lat(), gps.location.lng())) {
     lat  = gps.location.lat();
     lon  = gps.location.lng();
     altM = gps.altitude.isValid() ? gps.altitude.meters() : 0.0;
     accM = gps.hdop.isValid()     ? gps.hdop.hdop()       : 0.0;
+    havePosition = true;
     // lastLat/lastLon is maintained by loop() — no update here.
   } else if (lastGpsValid && (millis() - lastGpsValidMs) <= GPS_CACHE_MAX_MS) {
-    // Use last-known position (quality-gated, 3-min expiry) until fix returns
-    lat = lastLat; lon = lastLon; altM = lastAlt; accM = lastAcc;
+    // Use last-known position (quality-gated, 3-min expiry) until fix returns.
+    // Already range-checked by gpsCoordIsValid() before loop() cached it, but
+    // rechecked here too since it's cheap and this is the last line of
+    // defense before a row would otherwise be written with it.
+    if (gpsCoordIsValid(lastLat, lastLon)) {
+      lat = lastLat; lon = lastLon; altM = lastAlt; accM = lastAcc;
+      havePosition = true;
+    }
   }
 
   uint32_t wrote = 0;
+  uint32_t skipped = 0;
   for (int i = 0; i < n; i++) {
     // Periodic cooperative yield so a large batch (dense-area scan) doesn't
     // monopolize the CPU between appendWigleRow()'s own flush-triggered yields.
@@ -79,6 +89,12 @@ static void processScanResults(int n) {
     if (is2g) networksFound2G++;
     else      networksFound5G++;
 
+    // Never fabricate a position (0,0 or otherwise) -- if there's no
+    // trustworthy fix or cached last-known-good location yet, skip logging
+    // this network entirely rather than writing "Null Island". It'll be
+    // logged on a later scan cycle once a real position is available.
+    if (!havePosition) { skipped++; continue; }
+
     if (appendWigleRow(mac, ssid, authStr, firstSeen, ch, rssi, lat, lon, altM, accM)) wrote++;
   }
 
@@ -88,6 +104,9 @@ static void processScanResults(int n) {
   // Minimises data loss if the device loses power between scan cycles.
   if (wrote > 0 && sdOk && logFile) logFile.flush();
 
+  if (skipped > 0) {
+    Serial.printf("[SCAN] %u network(s) not logged -- no valid GPS position yet (never writes 0,0)\n", (unsigned)skipped);
+  }
   Serial.printf("[SCAN] Wrote %lu rows\n", (unsigned long)wrote);
 }
 

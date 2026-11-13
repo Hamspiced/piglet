@@ -4,9 +4,13 @@
 #include "SDUtils.h"
 #include "Display.h"
 #include "WigleUpload.h"
+#include "UploadState.h"
+#include "GzipDeflate.h"
 #include "MeshNode.h"
 #include "FirmwareUpdate.h"
 #include <ArduinoJson.h>
+#include "esp_heap_caps.h"
+#include "JsonPsramAllocator.h"
 
 // ---------------- Embedded HTML ----------------
 static const char INDEX_HTML[] PROGMEM = R"HTML(
@@ -211,16 +215,26 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
     background:linear-gradient(90deg,var(--accent),color-mix(in srgb,var(--accent) 60%,#fff));
     animation:barPulse 1.5s ease-in-out infinite;
   }
-  #fwBar{
+  #fwModalBar{
     height:8px;width:0%;border-radius:8px;
     background:var(--accent);
     transition:width .4s ease;
   }
-  #fwBar.active{
+  #fwModalBar.active{
     background:linear-gradient(90deg,var(--accent),color-mix(in srgb,var(--accent) 60%,#fff));
     animation:barPulse 1.5s ease-in-out infinite;
   }
   @keyframes barPulse{0%,100%{opacity:1}50%{opacity:.65}}
+  /* Indeterminate sweep -- shown while connecting/resolving a redirect,
+     before a byte total is known, so the bar isn't just sitting stuck at
+     0% width with no visible activity. */
+  #fwModalBar.indeterminate{
+    width:30%!important;
+    background:linear-gradient(90deg,var(--accent),color-mix(in srgb,var(--accent) 60%,#fff));
+    animation:barSweep 1.1s ease-in-out infinite;
+    transition:none;
+  }
+  @keyframes barSweep{0%{transform:translateX(-120%)}100%{transform:translateX(420%)}}
 
   /* ---- File list ---- */
   .file-row{
@@ -352,18 +366,22 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
       <div><span class="k">Latest Available</span><span class="v" id="vFwAvailable">—</span></div>
     </div>
     <div id="fwNotes" class="muted mt-sm" style="font-size:13px"></div>
-    <div class="barWrap mt-sm"><div id="fwBar"></div></div>
     <div id="fwMsg" class="muted mt-sm" style="font-size:14px">—</div>
     <div class="row mt-sm">
       <button onclick="fwCheck()">Check for Update</button>
-      <button class="btn-primary" id="fwInstallBtn" onclick="fwInstall()" disabled>Install Update</button>
+      <button class="btn-primary" id="fwDownloadBtn" onclick="fwDownloadOpen()" disabled>Download &amp; Install Firmware</button>
     </div>
-    <p style="margin-top:12px;font-size:12px;color:var(--muted)">Downloads and verifies over HTTPS from GitHub Releases; only the size is checked before flashing (no code-signing). Requires STA Wi-Fi. The device reboots automatically once the install finishes.</p>
+    <p style="margin-top:12px;font-size:12px;color:var(--muted)">Downloads over HTTPS from GitHub Releases to the SD card first; only the size is checked before flashing (no code-signing). Requires STA Wi-Fi. You choose when to install once the download finishes, and the device reboots automatically once the install finishes.</p>
     <div class="row mt-sm">
       <button id="fwStageNodeBtn" onclick="fwStageNode()">Store Piglet Node Firmware</button>
     </div>
     <div id="fwStageNodeMsg" class="muted mt-sm" style="font-size:13px"></div>
     <p style="margin-top:8px;font-size:12px;color:var(--muted)">Downloads the latest <code>PigletNode.ota.bin</code> release asset to <code>/Firmware/</code> so this Core can push it to connected headless PigletNode nodes over ESP-NOW &mdash; works even if this board's own firmware is already current.</p>
+    <div class="row mt-sm">
+      <button class="btn-danger" id="fwClearBtn" onclick="fwClearFirmware()">Delete Staged Firmware Files</button>
+    </div>
+    <div id="fwClearMsg" class="muted mt-sm" style="font-size:12px"></div>
+    <p style="margin-top:8px;font-size:12px;color:var(--muted)">Deletes everything currently in <code>/Firmware/</code> on the SD card (this board's downloaded-but-not-yet-installed image, plus anything staged for mesh nodes) &mdash; use this to clear out a stuck or partial download before retrying. Disabled while a download or install is in progress.</p>
   </div>
 
   <!-- ============ MESH NODES (Core mode only) ============ -->
@@ -511,11 +529,14 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
   <div class="card">
     <h3>SD Card Files</h3>
     <div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:10px">
-      <button class="btn-sm" onclick="loadFiles()">&#8635; Refresh</button>
-      <button class="btn-sm" onclick="window.location.href='/downloadAll'">&#11015; Download All (CSV.GZ)</button>
+      <button class="btn-sm" onclick="loadFilesClick()">&#8635; Load Files</button>
+      <button class="btn-sm" onclick="downloadAllClick()">&#11015; Download All (CSV.GZ)</button>
       <button class="btn-sm btn-danger" onclick="deleteAllLogs()">&#128465; Delete All</button>
     </div>
-    <div id="files" style="font-size:14px">Loading&hellip;</div>
+    <div id="files" style="font-size:14px">Click "Load Files" to view SD card contents.</div>
+    <div style="margin-top:10px">
+      <button id="filesLoadMoreBtn" class="btn-sm" style="display:none" onclick="loadMoreFiles()">Load More</button>
+    </div>
   </div>
 
 <!-- AP keep-alive prompt (shown ~30 s before the extended AP window expires) -->
@@ -527,6 +548,23 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
   <div class="row gap-sm">
     <button class="btn-primary" onclick="apKeepAliveYes()">Stay</button>
     <button onclick="apKeepAliveNo()">Start Scanning Now</button>
+  </div>
+</div>
+
+<!-- Firmware download/install modal (shown while fwDownloadOpen() is active) -->
+<div id="fwModalOverlay" style="display:none;position:fixed;inset:0;background:rgba(10,14,19,.92);z-index:9998;align-items:center;justify-content:center;padding:32px">
+  <div class="card" style="max-width:420px;width:100%;margin:0;text-align:center;display:flex;flex-direction:column;align-items:center;gap:14px">
+    <div style="font-size:40px">&#x1f437;</div>
+    <h2 id="fwModalTitle" style="margin:0;font-size:22px">Downloading Firmware...</h2>
+    <p id="fwModalHint" style="color:var(--muted);margin:0;font-size:12px">The device pauses scanning, waits for memory to free up, then connects &mdash; this can take up to a couple of minutes. Please wait.</p>
+    <div class="barWrap" style="width:100%"><div id="fwModalBar"></div></div>
+    <p id="fwModalPct" style="color:var(--muted);margin:0;font-size:14px">0%</p>
+    <pre id="fwModalLog" style="width:100%;max-height:220px;overflow-y:auto;text-align:left;background:#0d1117;border:1px solid #30363d;border-radius:8px;padding:10px;font-size:12px;line-height:1.5;color:var(--muted);white-space:pre-wrap;word-break:break-word"></pre>
+    <div class="row gap-sm" style="width:100%">
+      <button id="fwModalCancelBtn" onclick="fwDownloadModalCancel()">Cancel</button>
+      <button id="fwModalCloseBtn" onclick="fwDownloadModalClose()" style="display:none">Close</button>
+      <button class="btn-primary" id="fwModalInstallBtn" onclick="fwInstallNow()" style="display:none">Install Now</button>
+    </div>
   </div>
 </div>
 
@@ -575,6 +613,12 @@ function formatBytes(b){
   if(b<1024)return b+' B';
   if(b<1048576)return (b/1024).toFixed(1)+' KB';
   return (b/1048576).toFixed(1)+' MB';
+}
+
+/* ---- UI button-press logging -- fire-and-forget, visible on the serial
+   console so field debugging can see exactly which control was pressed. ---- */
+function logBtn(label){
+  try{ fetch('/uiLog?msg='+encodeURIComponent(label+' button pressed'),{method:'POST'}); }catch(e){}
 }
 
 /* ---- Masked config keys that should not be filled back into form ---- */
@@ -650,45 +694,107 @@ function syncUploadOnNetworkSeen(){
   if(autoOn)uns.value='false';
 }
 
-/* ---- Files ---- */
-async function loadFiles(){
-  try{
-    const r=await fetch('/files.json');const j=await r.json();
-    const el=$('files');
-    if(!j.ok){el.textContent='SD card not available';return;}
-    if(!j.files||j.files.length===0){el.textContent='No files on SD card';return;}
+/* ---- Files (loaded on demand, paginated 50 at a time) ---- */
+const FILES_PAGE_SIZE=50;
+let filesLoaded=false;
+let filesOffset=0;
+let filesLoading=false;
 
-    el.innerHTML=j.files.map(f=>{
-      const isUploaded=f.uploaded;
-      let badge=isUploaded
-        ?'<span class="file-badge uploaded">uploaded</span>'
-        :'<span class="file-badge log">Not Uploaded</span>';
-      
-      const uploadBtn=isUploaded?''
-        :'<button class="btn-sm" onclick="wigleUploadOne(\''+f.name.replace(/'/g,"\\'")+'\')">Upload</button>';
-      return '<div class="file-row">'
-        +'<a href="/download?name='+encodeURIComponent(f.name)+'">'+f.name+'</a> '
-        +badge
-        +'<span class="file-size">'+formatBytes(f.size)+'</span>'
-        +'<span class="file-actions">'
-        +uploadBtn
-        +'<button class="btn-sm btn-danger" onclick="delFile(\''+f.name.replace(/'/g,"\\'")+'\')">Delete</button>'
-        +'</span></div>';
-    }).join('');
-  }catch(e){console.error('loadFiles',e)}
+function renderFileRow(f){
+  const isUploaded=f.uploaded;
+  let badge=isUploaded
+    ?'<span class="file-badge uploaded">uploaded</span>'
+    :'<span class="file-badge log">Not Uploaded</span>';
+
+  const uploadBtn=isUploaded?''
+    :'<button class="btn-sm" onclick="wigleUploadOne(\''+f.name.replace(/'/g,"\\'")+'\')">Upload</button>';
+  return '<div class="file-row">'
+    +'<a href="/download?name='+encodeURIComponent(f.name)+'">'+f.name+'</a> '
+    +badge
+    +'<span class="file-size">'+formatBytes(f.size)+'</span>'
+    +'<span class="file-actions">'
+    +uploadBtn
+    +'<button class="btn-sm btn-danger" onclick="delFile(\''+f.name.replace(/'/g,"\\'")+'\')">Delete</button>'
+    +'</span></div>';
+}
+
+function setFilesLoadMoreVisible(visible){
+  const btn=$('filesLoadMoreBtn');
+  if(btn)btn.style.display=visible?'':'none';
+}
+
+async function fetchFilesPage(reset){
+  if(filesLoading)return;
+  filesLoading=true;
+  setFilesLoadMoreVisible(false);
+  const el=$('files');
+  try{
+    const r=await fetch('/files.json?offset='+filesOffset+'&limit='+FILES_PAGE_SIZE);
+    const j=await r.json();
+    if(!j.ok){el.innerHTML='SD card not available';filesLoading=false;return;}
+
+    const rowsHtml=(j.files||[]).map(renderFileRow).join('');
+    if(reset){
+      el.innerHTML=(j.files&&j.files.length)?rowsHtml:'No files on SD card';
+    }else if(rowsHtml){
+      el.insertAdjacentHTML('beforeend',rowsHtml);
+    }
+    filesOffset+=(j.files?j.files.length:0);
+    setFilesLoadMoreVisible(!!j.hasMore);
+  }catch(e){
+    console.error('loadFiles',e);
+    if(reset)el.innerHTML='Failed to load files';
+  }
+  filesLoading=false;
+}
+
+async function loadFiles(){
+  filesLoaded=true;
+  filesOffset=0;
+  $('files').innerHTML='Loading\u2026';
+  await fetchFilesPage(true);
+}
+
+// Thin wrapper so the "Load Files" button logs a press every time it's
+// clicked, without loadFiles() itself (reused internally to silently
+// refresh the list after other actions) logging a false positive.
+async function loadFilesClick(){
+  logBtn('Load Files');
+  await loadFiles();
+}
+
+async function loadMoreFiles(){
+  logBtn('Load More');
+  await fetchFilesPage(false);
+}
+
+function downloadAllClick(){
+  logBtn('Download All (CSV.GZ)');
+  window.location.href='/downloadAll';
+}
+
+// Re-pulls the first page only if the operator has already opened the Files
+// list this session -- keeps actions elsewhere on the page (WiGLE/WDGoWars/
+// Wardrift uploads) from silently triggering a full directory walk when
+// nobody is even looking at the Files card.
+async function refreshFilesIfLoaded(){
+  if(filesLoaded)await loadFiles();
 }
 
 /* ---- Actions ---- */
 async function doStart(){
+  logBtn('Start Scan');
   await fetch('/start',{method:'POST'});
   await loadStatus();
 }
 async function doStop(){
+  logBtn('Stop Scan');
   await fetch('/stop',{method:'POST'});
   await loadStatus();
 }
 
 async function delFile(name){
+  logBtn('Delete File ('+name+')');
   if(!confirm('Delete '+name+'?'))return;
   const el=$('files');
   const prev=el.innerHTML;
@@ -704,6 +810,7 @@ async function delFile(name){
 }
 
 async function deleteAllLogs(){
+  logBtn('Delete All');
   if(!confirm('Delete ALL log files from /logs and /uploaded?\nThis cannot be undone.'))return;
   const el=$('files');
   el.innerHTML='<span style="color:var(--muted)">Deleting all logs\u2026</span>';
@@ -745,6 +852,7 @@ async function doSave(){
 }
 
 async function saveCfg(){
+  logBtn('Save Config');
   try{
     await doSave();
     alert('Config saved. Reboot the device to apply WiFi / GPS changes.');
@@ -752,6 +860,7 @@ async function saveCfg(){
 }
 
 async function saveAndReboot(){
+  logBtn('Save & Reboot');
   try{ await doSave(); }catch(e){ alert('Save failed: '+e); return; }
 
   // Show the reboot overlay
@@ -783,6 +892,7 @@ function setWdgwarsMsg(t,cls){
 }
 
 async function wdgwarsTest(){
+  logBtn('WDGoWars Test API Key');
   setWdgwarsMsg('Testing key\u2026');
   try{
     const r=await fetch('/wdgwars/test',{method:'POST'});
@@ -792,6 +902,7 @@ async function wdgwarsTest(){
 }
 
 async function wdgwarsUploadAll(){
+  logBtn('WDGoWars Upload All CSVs');
   setWdgwarsMsg('Uploading all CSVs to WDGoWars\u2026');
   try{
     const r=await fetch('/wdgwars/uploadAll',{method:'POST'});
@@ -801,7 +912,7 @@ async function wdgwarsUploadAll(){
       setWdgwarsMsg(msg,j.ok?'ok-text':'bad-text');
     }
   }catch(e){setWdgwarsMsg('Upload request failed','bad-text')}
-  await loadFiles();
+  await refreshFilesIfLoaded();
 }
 
 function setWardriftMsg(t,cls){
@@ -811,6 +922,7 @@ function setWardriftMsg(t,cls){
 }
 
 async function wardriftTest(){
+  logBtn('Wardrift Test API Key');
   setWardriftMsg('Testing key\u2026');
   try{
     const r=await fetch('/wardrift/test',{method:'POST'});
@@ -820,6 +932,7 @@ async function wardriftTest(){
 }
 
 async function wardriftUploadAll(){
+  logBtn('Wardrift Upload All CSVs');
   setWardriftMsg('Uploading all CSVs to Wardrift\u2026');
   try{
     const r=await fetch('/wardrift/uploadAll',{method:'POST'});
@@ -829,10 +942,11 @@ async function wardriftUploadAll(){
       setWardriftMsg(msg,j.ok?'ok-text':'bad-text');
     }
   }catch(e){setWardriftMsg('Upload request failed','bad-text')}
-  await loadFiles();
+  await refreshFilesIfLoaded();
 }
 
 async function wigleTest(){
+  logBtn('WiGLE Test Token');
   setWigleMsg('Testing token\u2026');
   try{
     const r=await fetch('/wigle/test',{method:'POST'});
@@ -843,6 +957,7 @@ async function wigleTest(){
 }
 
 async function wigleUploadAll(){
+  logBtn('WiGLE Upload All CSVs');
   setWigleMsg('Starting upload\u2026');
   try{
     const r=await fetch('/wigle/uploadAll',{method:'POST'});
@@ -852,11 +967,12 @@ async function wigleUploadAll(){
       setWigleMsg(msg,j.ok?'ok-text':'bad-text');
     }
   }catch(e){setWigleMsg('Upload request failed','bad-text')}
-  await loadFiles();
+  await refreshFilesIfLoaded();
   await loadStatus();
 }
 
 async function wigleUploadOne(name){
+  logBtn('Upload File ('+name+')');
   setWigleMsg('Uploading '+name+'\u2026');
   try{
     const r=await fetch('/wigle/upload?name='+encodeURIComponent(name),{method:'POST'});
@@ -898,11 +1014,13 @@ function showApKeepAlive(initialRemainingMs){
 }
 
 async function apKeepAliveYes(){
+  logBtn('AP Keep-Alive Stay');
   try{await fetch('/extend',{method:'POST'});}catch(e){}
   apModalDismissed=true;  // require remaining to recover before re-showing
   hideApKeepAlive();
 }
 async function apKeepAliveNo(){
+  logBtn('AP Keep-Alive Start Scanning Now');
   hideApKeepAlive();
   try{await fetch('/start',{method:'POST'});}catch(e){}
   // AP will go down; the page becomes unreachable until reconnect.
@@ -938,7 +1056,12 @@ async function pollUpload(){
   }catch(e){/* silent */}
 }
 
-/* ---- Firmware Update (self-update from GitHub Releases) ---- */
+/* ---- Firmware Update (self-update from GitHub Releases) ----
+   Two-step flow: "Download & Install Firmware" opens a modal and kicks off
+   a non-blocking download to the SD card (fwDownloadStart(), ticked from
+   loop() so the modal can poll live progress). Once the download finishes,
+   the modal swaps its Cancel button for "Install Now", which triggers a
+   quick local SD->flash step and reboot. */
 function setFwMsg(t,cls){
   const el=$('fwMsg');
   el.textContent=t;
@@ -951,21 +1074,22 @@ async function loadUpdateStatus(){
     setText('vFwCurrent',j.currentVersion);
     setText('vFwAvailable',j.available?j.availableVersion:'Up to date');
     $('fwNotes').textContent=j.notes||'';
-    $('fwInstallBtn').disabled=!j.available||j.installing;
+    $('fwDownloadBtn').disabled=!j.available||j.downloading||j.installing;
+    $('fwClearBtn').disabled=j.downloading||j.installing;
 
-    const pct=j.totalBytes>0?Math.round((j.downloadedBytes/j.totalBytes)*100):0;
-    const bar=$('fwBar');
-    bar.style.width=pct+'%';
-    bar.classList.toggle('active',j.installing);
-
-    if(j.installing)setFwMsg((j.stage||'Installing\u2026')+' ('+pct+'%)');
-    else if(j.error)setFwMsg(j.error,'bad-text');
+    if(j.downloading||j.installing){/* modal poller owns fwMsg while active */}
+    else if(j.downloadError)setFwMsg(j.downloadError,'bad-text');
+    else if(j.installError)setFwMsg(j.installError,'bad-text');
+    else if(j.downloaded)setFwMsg('Downloaded \u2014 ready to install','ok-text');
     else if(j.available)setFwMsg('Update available: '+j.availableVersion);
+    else if(j.checkError)setFwMsg(j.checkError,'bad-text');
     else if(j.checked)setFwMsg('Up to date','ok-text');
+    return j;
   }catch(e){console.error('loadUpdateStatus',e)}
 }
 
 async function fwCheck(){
+  logBtn('Check for Update');
   setFwMsg('Checking\u2026');
   try{
     const r=await fetch('/update/check',{method:'POST'});
@@ -975,17 +1099,150 @@ async function fwCheck(){
   await loadUpdateStatus();
 }
 
-async function fwInstall(){
-  if(!confirm('Install the update now? The device will reboot when finished.'))return;
-  setFwMsg('Starting install\u2026');
-  $('fwInstallBtn').disabled=true;
+function setFwClearMsg(t,cls){
+  const el=$('fwClearMsg');
+  el.textContent=t;
+  el.className=cls||'muted';
+}
+
+async function fwClearFirmware(){
+  logBtn('Delete Staged Firmware Files');
+  if(!confirm('Delete all files in /Firmware on the SD card?\nThis removes any downloaded-but-not-installed image and anything staged for mesh nodes.'))return;
+  setFwClearMsg('Deleting\u2026');
   try{
-    const r=await fetch('/update/install',{method:'POST'});
+    const r=await fetch('/update/clearFirmware',{method:'POST'});
     const j=await r.json().catch(()=>null);
-    if(j&&!j.ok)setFwMsg(j.error||'Install failed','bad-text');
+    if(j&&j.ok)setFwClearMsg('Cleared','ok-text');
+    else setFwClearMsg((j&&j.error)||'Delete failed','bad-text');
+  }catch(e){setFwClearMsg('Request failed','bad-text')}
+  await loadUpdateStatus();
+}
+
+let fwModalIv=null;
+
+function fwModalShow(title){
+  $('fwModalTitle').textContent=title;
+  $('fwModalLog').textContent='';
+  const bar=$('fwModalBar');
+  bar.style.width='0%';
+  bar.classList.remove('active','indeterminate');
+  $('fwModalPct').textContent='Starting\u2026';
+  $('fwModalHint').style.display='';
+  $('fwModalCancelBtn').style.display='';
+  $('fwModalCloseBtn').style.display='none';
+  $('fwModalInstallBtn').style.display='none';
+  $('fwModalOverlay').style.display='flex';
+}
+
+function fwModalHide(){
+  if(fwModalIv){clearInterval(fwModalIv);fwModalIv=null;}
+  $('fwModalOverlay').style.display='none';
+}
+
+function fwModalRender(j){
+  $('fwModalLog').textContent=j.log||'';
+  const log=$('fwModalLog');
+  log.scrollTop=log.scrollHeight;
+
+  const bar=$('fwModalBar');
+  const haveSize=j.totalBytes>0;
+  if(j.downloading&&!haveSize){
+    // Connecting / following GitHub's redirect to the CDN -- no byte total
+    // yet, so sweep an indeterminate bar instead of sitting stuck at 0%
+    // width with no visible activity, and surface the stage text (e.g.
+    // "Connecting (attempt 1/3)...", "Redirected to CDN -- settling...")
+    // so the user can see work is actually happening in the background.
+    bar.classList.remove('active');
+    bar.classList.add('indeterminate');
+    $('fwModalPct').textContent=j.downloadStage||'Connecting\u2026';
+    $('fwModalHint').style.display='';
+  }else{
+    const pct=haveSize?Math.round((j.downloadedBytes/j.totalBytes)*100):0;
+    bar.classList.remove('indeterminate');
+    bar.style.width=pct+'%';
+    bar.classList.toggle('active',j.downloading);
+    $('fwModalPct').textContent=(j.downloading?pct+'%':(j.downloadStage||''));
+    $('fwModalHint').style.display='none';
+  }
+
+  if(j.downloaded&&!j.installing){
+    $('fwModalTitle').textContent='Download Complete';
+    $('fwModalCancelBtn').style.display='none';
+    $('fwModalCloseBtn').style.display='';
+    $('fwModalInstallBtn').style.display='';
+  }
+  if(j.installing){
+    $('fwModalTitle').textContent='Installing Firmware...';
+    $('fwModalCancelBtn').style.display='none';
+    $('fwModalCloseBtn').style.display='none';
+    $('fwModalInstallBtn').style.display='none';
+  }
+  if(!j.downloading&&!j.downloaded&&!j.installing&&j.downloadError){
+    $('fwModalTitle').textContent='Download Failed';
+    $('fwModalCancelBtn').style.display='none';
+    $('fwModalCloseBtn').style.display='';
+    $('fwModalInstallBtn').style.display='none';
+  }
+}
+
+async function fwModalPoll(){
+  const j=await loadUpdateStatus();
+  if(j)fwModalRender(j);
+}
+
+async function fwDownloadOpen(){
+  logBtn('Download & Install Firmware');
+  fwModalShow('Downloading Firmware...');
+  try{
+    const r=await fetch('/update/downloadStart',{method:'POST'});
+    const j=await r.json().catch(()=>null);
+    if(j&&!j.ok){
+      $('fwModalLog').textContent=j.error||'Could not start download';
+      $('fwModalCancelBtn').style.display='none';
+      $('fwModalCloseBtn').style.display='';
+      return;
+    }
+  }catch(e){
+    $('fwModalLog').textContent='Request failed';
+    $('fwModalCancelBtn').style.display='none';
+    $('fwModalCloseBtn').style.display='';
+    return;
+  }
+  fwModalIv=setInterval(fwModalPoll,500);
+  fwModalPoll();
+}
+
+async function fwDownloadModalCancel(){
+  logBtn('Cancel Firmware Download');
+  try{await fetch('/update/downloadCancel',{method:'POST'});}catch(e){}
+  fwModalHide();
+  await loadUpdateStatus();
+}
+
+async function fwDownloadModalClose(){
+  fwModalHide();
+  await loadUpdateStatus();
+}
+
+async function fwInstallNow(){
+  logBtn('Install Now');
+  if(fwModalIv){clearInterval(fwModalIv);fwModalIv=null;}
+  $('fwModalTitle').textContent='Installing Firmware...';
+  $('fwModalCancelBtn').style.display='none';
+  $('fwModalCloseBtn').style.display='none';
+  $('fwModalInstallBtn').style.display='none';
+  try{
+    const r=await fetch('/update/installFromSD',{method:'POST'});
+    const j=await r.json().catch(()=>null);
+    if(j&&!j.ok){
+      $('fwModalLog').textContent+=(j.error||'Install failed')+'\n';
+      $('fwModalTitle').textContent='Install Failed';
+      $('fwModalCloseBtn').style.display='';
+    }
   }catch(e){
     // Expected once the device restarts mid-response on success.
-    setFwMsg('Device is rebooting\u2026');
+    $('fwModalTitle').textContent='Rebooting...';
+    $('fwModalLog').textContent+='Device is rebooting\u2026\n';
   }
   await loadUpdateStatus();
 }
@@ -997,6 +1254,7 @@ function setFwStageNodeMsg(t,cls){
 }
 
 async function fwStageNode(){
+  logBtn('Store Piglet Node Firmware');
   setFwStageNodeMsg('Downloading PigletNode.ota.bin\u2026');
   $('fwStageNodeBtn').disabled=true;
   try{
@@ -1008,7 +1266,13 @@ async function fwStageNode(){
   $('fwStageNodeBtn').disabled=false;
   await loadMeshNodes();
 }
-setInterval(loadUpdateStatus,2000);
+// Slowed from 2000ms -- the firmware-update modal has its own dedicated
+// 500ms poller (fwModalIv) while a download/install is actually active, so
+// this background interval only needs to catch "an update appeared" /
+// error-state changes when the modal is closed. A slower idle cadence
+// leaves the narrow MALLOC_CAP_DMA pool (shared with GitHub's own TLS
+// handshake) less contended at rest.
+setInterval(loadUpdateStatus,5000);
 
 /* ---- Mesh Nodes (Core-pushed OTA to connected nodes) ---- */
 function otaPhaseText(p){
@@ -1021,19 +1285,34 @@ function otaPhaseText(p){
   }
 }
 
+// Self-rescheduling (setTimeout, not setInterval) so the cadence can adapt:
+// fast (1000ms) for a few seconds around an active node OTA push, slow
+// (6000ms) otherwise. Mesh nodes/OTA progress isn't time-critical when
+// nothing is pushing, and most boards never use this card at all -- a slow
+// idle default leaves the narrow MALLOC_CAP_DMA pool (shared with GitHub's
+// own Check-for-Update TLS handshake) less contended at rest.
+let meshNodesTimer=null;
+let meshNodesBusyUntilMs=0;
+function scheduleMeshNodes(ms){
+  if(meshNodesTimer)clearTimeout(meshNodesTimer);
+  meshNodesTimer=setTimeout(loadMeshNodes,ms);
+}
 async function loadMeshNodes(){
+  let nextMs=6000;
   try{
     const r=await fetch('/mesh/nodes.json');const j=await r.json();
     const card=$('meshNodesCard');
-    if(!j.coreActive){card.style.display='none';return;}
+    if(!j.coreActive){card.style.display='none';scheduleMeshNodes(nextMs);return;}
     card.style.display='';
 
     const el=$('meshNodes');
     const ota=j.ota||{};
     const busy=ota.phase===1||ota.phase===2;
+    if(busy)meshNodesBusyUntilMs=Date.now()+5000;
+    nextMs=Date.now()<meshNodesBusyUntilMs?1000:6000;
     const loadEl=$('meshNodesLoadMsg');
     if(loadEl)loadEl.textContent=ota.loadMsg?('Staged on SD: '+ota.loadMsg):'';
-    if(!j.nodes||j.nodes.length===0){el.innerHTML='<span class="muted">No nodes connected</span>';return;}
+    if(!j.nodes||j.nodes.length===0){el.innerHTML='<span class="muted">No nodes connected</span>';scheduleMeshNodes(nextMs);return;}
 
     el.innerHTML=j.nodes.map(n=>{
       const isBusy=busy&&ota.nodeIdx===n.idx;
@@ -1049,9 +1328,11 @@ async function loadMeshNodes(){
         +'<span class="file-actions">'+actionBtn+'</span></div>';
     }).join('');
   }catch(e){console.error('loadMeshNodes',e)}
+  scheduleMeshNodes(nextMs);
 }
 
 async function meshOtaStart(idx){
+  logBtn('Mesh Node Update (idx='+idx+')');
   try{
     const r=await fetch('/mesh/ota/start?idx='+idx,{method:'POST'});
     const j=await r.json().catch(()=>null);
@@ -1061,10 +1342,12 @@ async function meshOtaStart(idx){
 }
 
 async function meshOtaCancel(){
+  logBtn('Mesh OTA Cancel');
   try{await fetch('/mesh/ota/cancel',{method:'POST'});}catch(e){}
   await loadMeshNodes();
 }
-setInterval(loadMeshNodes,2000);
+// loadMeshNodes() self-reschedules (see scheduleMeshNodes() above) -- no
+// setInterval needed here.
 
 /* ---- Manual per-node channel-range overrides ---- */
 function setChOvrMsg(t,cls){
@@ -1087,6 +1370,7 @@ async function loadChOverrides(){
 }
 
 async function chOvrSet(){
+  logBtn('Set Channel Override');
   const mac=($('chOvrMac').value||'').trim();
   const chStart=$('chOvrStart').value;
   const chEnd=$('chOvrEnd').value;
@@ -1103,15 +1387,19 @@ async function chOvrSet(){
 }
 
 async function chOvrClear(mac){
+  logBtn('Remove Channel Override ('+mac+')');
   try{
     await fetch('/mesh/channelOverrides/clear',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'mac='+encodeURIComponent(mac)});
   }catch(e){}
   await loadChOverrides();
 }
-setInterval(loadChOverrides,5000);
+// No recurring poll -- channel overrides only change via explicit admin
+// action (chOvrSet()/chOvrClear() below already refresh this list right
+// after mutating), so a background interval here was pure idle DMA-pool
+// chatter with no benefit.
 
 setInterval(pollUpload,1500);
-loadStatus();loadFiles();loadUpdateStatus();loadMeshNodes();loadChOverrides();
+loadStatus();loadUpdateStatus();loadMeshNodes();loadChOverrides();
 </script>
 </body>
 </html>
@@ -1124,8 +1412,20 @@ static void handlePing() {
   server.send(200, "text/plain", "pong");
 }
 
+// Fire-and-forget sink for Web UI button-press logging (see logBtn() in
+// INDEX_HTML) -- makes field debugging able to see exactly which control
+// was pressed and when, directly in the serial console.
+static void handleUiLog() {
+  String msg = server.hasArg("msg") ? server.arg("msg") : "(unknown)";
+  Serial.printf("[UI] %s\n", msg.c_str());
+  server.send(200, "text/plain", "OK");
+}
+
 static void handleRoot() {
-  Serial.printf("[WEB] / requested  heap=%u\n", ESP.getFreeHeap());
+  Serial.printf("[WEB] / requested  heap=%u largestBlock=%u largestBlock8bit=%u\n",
+                (unsigned)ESP.getFreeHeap(),
+                (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+                (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
   server.sendHeader("Cache-Control", "no-store");
   server.send_P(200, "text/html", INDEX_HTML);
   Serial.println("[WEB] / send_P done");
@@ -1137,7 +1437,7 @@ static void handleStatus() {
   // risks a stack overflow.  DynamicJsonDocument allocates from the heap instead.
   // Bumped from 2048 -> 3072 to leave headroom for the 10 ssidWhitelistN
   // string fields (each up to a full 32-byte SSID) added to "config".
-  DynamicJsonDocument doc(3072);
+  JsonDocument doc(psramJsonAllocator());
 
   bool allowScan = scanningEnabled && sdOk && (userScanOverride || !autoPaused);
   doc["scanningEnabled"] = scanningEnabled;
@@ -1210,46 +1510,104 @@ static void handleStatus() {
   server.send(200, "application/json", output);
 }
 
-static void addDirFiles(JsonArray arr, const char* dir) {
-  File root = SD.open(dir);
-  if (!root) return;
+// Minimum internal free heap to keep in reserve while walking a directory.
+// Measurement showed each fopen()/fclose() cycle here (via SD.open()'s
+// underlying VFS layer) permanently loses roughly 100-130 bytes of internal
+// heap with no recovery -- unaffected by shrinking the file's stdio buffer
+// via setBufferSize(), so the loss isn't that buffer; it's deeper in the
+// Arduino core's newlib/VFS fopen() plumbing, outside this codebase's
+// control. The Web UI now only ever requests one page (default 50 files) at
+// a time via offset/limit, which keeps a normal page far under this floor;
+// it remains as a safety net for a worst-case jump to a very large offset
+// on a directory with many thousands of files.
+static const uint32_t DIR_LISTING_HEAP_FLOOR = 24576;
 
-  bool isUploaded = (String(dir) == "/uploaded");
+// Walks /logs then /uploaded as one continuous, stably-ordered sequence,
+// skipping the first `offset` entries and collecting up to `limit` of them
+// into `arr`. Peeking one entry past the page sets `hasMore` without
+// including it, so the Web UI's "Load More" button only appears when there
+// really is another page -- this avoids walking (and opening) the entire
+// remainder of a large directory just to report a total count. Returns true
+// if the heap-floor circuit breaker had to stop the walk early.
+static bool collectFilesPage(JsonArray arr, uint32_t offset, uint32_t limit, bool& hasMore) {
+  hasMore = false;
+  uint32_t index = 0;
+  bool floorHit = false;
+  const char* dirs[] = { "/logs", "/uploaded" };
 
-  File f = root.openNextFile();
-  while (f) {
-    const char* rawName = f.name();
+  for (const char* dir : dirs) {
+    if (floorHit) break;
+    File root = SD.open(dir);
+    if (!root) continue;
+    bool isUploaded = (String(dir) == "/uploaded");
 
-    String fullPath = normalizeSdPath(dir, rawName);
-    if (fullPath.length() == 0) {
+    File f = root.openNextFile();
+    while (f) {
+      if (heap_caps_get_free_size(MALLOC_CAP_INTERNAL) < DIR_LISTING_HEAP_FLOOR) {
+        f.close();
+        floorHit = true;
+        break;
+      }
+
+      if (index < offset) {
+        // Still skipping toward the requested page -- nothing to build yet.
+        f.close();
+        index++;
+        f = root.openNextFile();
+        continue;
+      }
+
+      if ((uint32_t)arr.size() >= limit) {
+        // Page is already full; this file's mere existence means there's
+        // another page, so stop without doing any more work on it.
+        f.close();
+        hasMore = true;
+        break;
+      }
+
+      // Every fopen() in the Arduino core's VFS layer unconditionally
+      // allocates a 4096-byte stdio buffer via setvbuf() (DEFAULT_FILE_BUFFER_SIZE
+      // in vfs_api.cpp), even though this loop never reads file content --
+      // .size() below is served from the fstat() already cached in the File's
+      // constructor. Shrinking it immediately after open (must be the very
+      // next call per the library's own doc comment) reduces peak per-file
+      // memory pressure/fragmentation.
+      f.setBufferSize(64);
+
+      String fullPath = normalizeSdPath(dir, f.name());
+      if (fullPath.length() > 0) {
+        JsonObject o = arr.createNestedObject();
+        o["name"] = fullPath;
+        o["size"] = (uint32_t)f.size();
+        o["uploaded"] = isUploaded;
+      }
       f.close();
+      index++;
       f = root.openNextFile();
-      continue;
     }
-
-    JsonObject o = arr.createNestedObject();
-    o["name"] = fullPath;
-    o["size"] = (uint32_t)f.size();
-    o["uploaded"] = isUploaded;
-
-    f.close();
-    f = root.openNextFile();
+    root.close();
   }
 
-  root.close();
+  return floorHit;
 }
 
 static void handleFiles() {
   // 4096-byte STATIC doc would use half the entire 8192-byte task stack.
   // Use dynamic (heap) allocation instead.
-  DynamicJsonDocument doc(4096);
+  JsonDocument doc(psramJsonAllocator());
   doc["ok"] = sdOk;
 
   JsonArray arr = doc.createNestedArray("files");
+  bool hasMore   = false;
+  bool truncated = false;
   if (sdOk) {
-    addDirFiles(arr, "/logs");
-    addDirFiles(arr, "/uploaded");
+    uint32_t offset = server.hasArg("offset") ? (uint32_t)server.arg("offset").toInt() : 0;
+    uint32_t limit  = server.hasArg("limit")  ? (uint32_t)server.arg("limit").toInt()  : 50;
+    if (limit == 0 || limit > 200) limit = 50;  // sane bounds -- Web UI always asks for 50
+    truncated = collectFilesPage(arr, offset, limit, hasMore);
   }
+  doc["hasMore"]   = hasMore;
+  doc["truncated"] = truncated;
 
   // Check if JSON buffer overflowed
   if (doc.overflowed()) {
@@ -1289,6 +1647,7 @@ static void handleDeleteAll() {
   if (!sdOk) { server.send(500, "application/json", "{\"ok\":false,\"error\":\"SD not available\"}"); return; }
 
   uint32_t deleted = 0;
+  bool truncated = false;
   const char* dirs[] = { "/logs", "/uploaded" };
   for (const char* dir : dirs) {
     File root = SD.open(dir);
@@ -1296,9 +1655,31 @@ static void handleDeleteAll() {
     std::vector<String> paths;
     File f = root.openNextFile();
     while (f) {
+      f.setBufferSize(64);  // avoid the 4KB default stdio buffer -- see addDirFiles()
       String p = normalizeSdPath(dir, f.name());
       f.close();
-      if (p.length() > 0) paths.push_back(p);
+      // Skip dot-prefixed housekeeping entries (the .gzscratch gzip scratch
+      // directory, the .upload_state.cfg per-file upload ledger) -- "Delete
+      // All" should only ever touch user wardriving data. Wiping the ledger
+      // here used to be harmless only because every CSV it referenced was
+      // also being deleted in the same pass; the heap-floor circuit breaker
+      // below can stop that pass early, which left any not-yet-deleted CSVs
+      // looking "never uploaded" on the next upload round.
+      if (p.length() > 0 && !isHiddenSdEntry(pathBasename(p))) paths.push_back(p);
+
+      // Same heap-floor circuit breaker as addDirFiles() -- a directory with
+      // enough accumulated files can drain internal heap via this same
+      // listing loop before the delete pass below even starts. Stopping
+      // early here still deletes everything collected so far; the operator
+      // can click "Delete All" again afterward (heap fully recovers on
+      // reboot, or partially recovers here once fewer files remain) to
+      // finish the rest.
+      if (heap_caps_get_free_size(MALLOC_CAP_INTERNAL) < DIR_LISTING_HEAP_FLOOR) {
+        Serial.printf("[WEB] handleDeleteAll(%s): stopping listing early (heap floor reached)\n", dir);
+        truncated = true;
+        break;
+      }
+
       f = root.openNextFile();
     }
     root.close();
@@ -1308,9 +1689,10 @@ static void handleDeleteAll() {
     }
   }
 
-  DynamicJsonDocument doc(128);
+  JsonDocument doc(psramJsonAllocator());
   doc["ok"] = true;
   doc["deleted"] = deleted;
+  doc["truncated"] = truncated;
   String out; out.reserve(measureJson(doc) + 1); serializeJson(doc, out);
   server.send(200, "application/json", out);
 }
@@ -1354,7 +1736,7 @@ static void handleSaveConfig() {
 
   // If someone posts JSON manually, still accept it (nice fallback)
   if (body[0] == '{') {
-    DynamicJsonDocument doc(1024);
+    JsonDocument doc(psramJsonAllocator());
     DeserializationError err = deserializeJson(doc, body);
     if (err) { server.send(400, "text/plain", "Bad JSON"); return; }
 
@@ -1413,7 +1795,7 @@ static void handleReboot() {
 static void handleWigleTest() {
   bool ok = wigleTestToken();
 
-  DynamicJsonDocument doc(384);
+  JsonDocument doc(psramJsonAllocator());
   doc["ok"] = ok;
   doc["tokenStatus"] = wigleTokenStatus;
   doc["httpCode"] = wigleLastHttpCode;
@@ -1439,7 +1821,7 @@ static void handleWdgwarsTest() {
 
   bool ok = wdgwarsTestKey();
 
-  DynamicJsonDocument doc(256);
+  JsonDocument doc(psramJsonAllocator());
   doc["ok"]      = ok;
   doc["message"] = uploadLastResult;
 
@@ -1457,7 +1839,7 @@ static void handleWdgwarsUploadAll() {
   // Pass -1 explicitly: web-triggered uploads bypass the maxBootUploads cap.
   uint32_t okCount = uploadAllCsvsToWdgwars(-1);
 
-  DynamicJsonDocument doc(256);
+  JsonDocument doc(psramJsonAllocator());
   doc["ok"]       = (okCount > 0);
   doc["uploaded"] = okCount;
   doc["total"]    = uploadTotalFiles;
@@ -1483,7 +1865,7 @@ static void handleWardriftTest() {
 
   bool ok = wardriftTestKey();
 
-  DynamicJsonDocument doc(256);
+  JsonDocument doc(psramJsonAllocator());
   doc["ok"]      = ok;
   doc["message"] = uploadLastResult;
 
@@ -1500,7 +1882,7 @@ static void handleWardriftUploadAll() {
 
   uint32_t okCount = uploadAllCsvsToWardrift(-1);
 
-  DynamicJsonDocument doc(256);
+  JsonDocument doc(psramJsonAllocator());
   doc["ok"]       = (okCount > 0);
   doc["uploaded"] = okCount;
   doc["total"]    = uploadTotalFiles;
@@ -1518,11 +1900,11 @@ static void handleWigleUploadAll() {
 
   // Pass -1 explicitly: web-triggered uploads are always unlimited,
   // bypassing the maxBootUploads cap which applies only at boot.
-  uint32_t okCount = uploadAllCsvsToWigle(-1);
+  uint32_t okCount = uploadAllPending(-1);
 
   // History will auto-refresh when user next accesses /files.json
   
-  DynamicJsonDocument doc(384);
+  JsonDocument doc(psramJsonAllocator());
   doc["ok"] = (okCount > 0);
   doc["uploaded"] = okCount;
   doc["total"] = uploadTotalFiles;
@@ -1532,6 +1914,15 @@ static void handleWigleUploadAll() {
   out.reserve(measureJson(doc) + 1);
   serializeJson(doc, out);
   server.send(200, "application/json", out);
+}
+
+// Scratch path for a single on-demand per-file gzip upload below -- mirrors
+// the combined orchestrator's gzScratchPathFor() in WigleUpload.cpp, kept
+// local here since this is the only place in WebUI.cpp that needs it.
+static String gzScratchPathForOne(const String& basename) {
+  static const char* dir = "/logs/.gzscratch";
+  if (!SD.exists(dir)) SD.mkdir(dir);
+  return String(dir) + "/" + basename + ".gz";
 }
 
 static void handleWigleUploadOne() {
@@ -1550,6 +1941,9 @@ static void handleWigleUploadOne() {
     return;
   }
 
+  String basename = pathBasename(path);
+  FileUploadState st = loadUploadState(basename);
+
   uploading = true;
   uploadPausedScanWasEnabled = scanningEnabled;
   scanningEnabled = false;
@@ -1559,35 +1953,57 @@ static void handleWigleUploadOne() {
   uploadCurrentFile = path;
   updateOLED(0);
 
-  // Mirrors the batch upload flow (uploadAllCsvsToWigle): try WDGoWars, then
-  // Wardrift, then WiGLE (whichever are configured), and move the file to
-  // /uploaded if ANY succeed. Previously this only ever attempted WiGLE, so
-  // a file uploaded via this per-file button never moved out of /logs when
-  // only a WDGoWars API key was configured (no WiGLE token).
+  // Mirrors the combined orchestrator's per-file gzip path (WigleUpload.cpp's
+  // uploadAllPending()): try whichever services are still pending for this
+  // file -- WDGoWars, then Wardrift, then WiGLE -- skipping any already
+  // marked done, and only move the file to /uploaded/ once every configured
+  // service is done.
   wigleLastHttpCode = 0;  // avoid reporting a stale code if WiGLE isn't attempted below
-  bool wdgOk = false;
-  if (hasWdg) {
+  String wdgResult = "Already done", wardriftResult = "Already done", wigleResult = "Already done";
+
+  if (hasWdg && !st.wdgwDone) {
     uploadTargetName = "WDGW UL";
     updateOLED(0);
-    wdgOk = uploadFileToWdgwars(path);
+    bool ok;
+    if (cfg.gzipUploads) {
+      String scratch = gzScratchPathForOne(basename);
+      ok = gzipCompressFileToFile(path, scratch) && uploadFileToWdgwars(scratch);
+      SD.remove(scratch);
+    } else {
+      ok = uploadFileToWdgwars(path);
+    }
+    if (ok) { markServiceDone(basename, UploadService::Wdgw); st.wdgwDone = true; }
+    wdgResult = uploadLastResult;
     if (hasWardrift || hasWigle) delay(1500);  // brief settle between TLS sessions
   }
-  String wdgResult = uploadLastResult;  // preserve before the next call overwrites it
 
-  bool wardriftOk = false;
-  if (hasWardrift) {
+  if (hasWardrift && !st.wardriftDone) {
     uploadTargetName = "Wardrift UL";
     updateOLED(0);
-    wardriftOk = uploadFileToWardrift(path);
+    // Always sent uncompressed -- Wardrift's /v1/ingest/signals endpoint
+    // does not honor Content-Encoding: gzip (confirmed in the field: a
+    // gzip-compressed body comes back HTTP 400 "file did not contain
+    // supported signal rows", even though the same file succeeds against
+    // WDGoWars, which does support gzip). Ignore cfg.gzipUploads here.
+    bool ok = uploadFileToWardrift(path);
+    if (ok) { markServiceDone(basename, UploadService::Wardrift); st.wardriftDone = true; }
+    wardriftResult = uploadLastResult;
     if (hasWigle) delay(1500);  // brief settle between TLS sessions
   }
-  String wardriftResult = uploadLastResult;  // preserve before uploadFileToWigle overwrites it
 
-  bool wigleOk = false;
-  if (hasWigle) {
+  if (hasWigle && !st.wigleDone) {
     uploadTargetName = "WiGLE UL";
     updateOLED(0);
-    wigleOk = uploadFileToWigle(path);
+    bool ok;
+    if (cfg.gzipUploads) {
+      String scratch = gzScratchPathForOne(basename);
+      ok = gzipCompressFileToFile(path, scratch) && uploadFileToWigle(scratch);
+      SD.remove(scratch);
+    } else {
+      ok = uploadFileToWigle(path);
+    }
+    if (ok) { markServiceDone(basename, UploadService::Wigle); st.wigleDone = true; }
+    wigleResult = uploadLastResult;
   }
 
   uploadDoneFiles = 1;
@@ -1599,28 +2015,41 @@ static void handleWigleUploadOne() {
   uploadTargetName = "";
   updateOLED(0);
 
-  bool ok = wigleOk || wdgOk || wardriftOk;
+  bool ok = allConfiguredServicesDone(st);
   if (ok) {
-    moveToUploaded(path);
-    // History will auto-refresh when user next accesses /files.json
+    // See the matching comment in WigleUpload.cpp's uploadAllPending()
+    // finalize loop -- only clear the ledger once the move actually
+    // succeeds, so a transient SD hiccup here can't make an already-fully-
+    // uploaded file look unsent again on the next run.
+    if (moveToUploaded(path)) {
+      clearUploadState(basename);
+      // History will auto-refresh when user next accesses /files.json
+    } else {
+      Serial.printf("[UPLOAD] WARNING: moveToUploaded failed for %s -- file stays in /logs, ledger kept\n", basename.c_str());
+    }
   }
 
-  // Combine all attempted services' results into the message
+  // Combine all configured services' results into the message
   int attempted = (hasWdg ? 1 : 0) + (hasWardrift ? 1 : 0) + (hasWigle ? 1 : 0);
-  String message = uploadLastResult;
+  String message;
   if (attempted > 1) {
     std::vector<String> parts;
     if (hasWdg)      parts.push_back("WDGW: " + wdgResult);
     if (hasWardrift) parts.push_back("Wardrift: " + wardriftResult);
-    if (hasWigle)    parts.push_back("WiGLE: " + uploadLastResult);
-    message = "";
+    if (hasWigle)    parts.push_back("WiGLE: " + wigleResult);
     for (size_t i = 0; i < parts.size(); i++) {
       if (i) message += " | ";
       message += parts[i];
     }
+  } else if (hasWdg) {
+    message = wdgResult;
+  } else if (hasWardrift) {
+    message = wardriftResult;
+  } else {
+    message = wigleResult;
   }
 
-  DynamicJsonDocument doc(384);
+  JsonDocument doc(psramJsonAllocator());
   doc["ok"] = ok;
   doc["httpCode"] = wigleLastHttpCode;
   doc["message"] = message;
@@ -1643,7 +2072,7 @@ static const char* meshBoardTypeLabel(uint8_t bt) {
 }
 
 static void handleMeshNodes() {
-  DynamicJsonDocument doc(2048);
+  JsonDocument doc(psramJsonAllocator());
   doc["coreActive"] = meshCoreActive;
 
   JsonArray arr = doc.createNestedArray("nodes");
@@ -1690,7 +2119,7 @@ static void handleMeshOtaStart() {
   bool ok = coreOtaStart(idx);
   CoreOtaStatus st = coreOtaStatus();
 
-  DynamicJsonDocument doc(256);
+  JsonDocument doc(psramJsonAllocator());
   doc["ok"]  = ok;
   doc["msg"] = st.msg;
 
@@ -1715,7 +2144,7 @@ static bool webMacParse(const String& s, uint8_t* macOut) {
 }
 
 static void handleMeshChannelOverridesGet() {
-  DynamicJsonDocument doc(1024);
+  JsonDocument doc(psramJsonAllocator());
   JsonArray arr = doc.createNestedArray("overrides");
   uint8_t count = meshChOverrideGetCount();
   for (uint8_t i = 0; i < count; i++) {
@@ -1750,7 +2179,7 @@ static void handleMeshChannelOverridesSet() {
   int chEnd   = server.arg("chEnd").toInt();
   bool ok = meshChOverrideSet(mac, chStart, chEnd);
 
-  DynamicJsonDocument doc(128);
+  JsonDocument doc(psramJsonAllocator());
   doc["ok"] = ok;
   if (!ok) doc["error"] = "Invalid channel -- must match a supported 2.4/5GHz channel number";
   String out;
@@ -1770,17 +2199,28 @@ static void handleMeshChannelOverridesClear() {
 // ---- Firmware Update (self-update from GitHub Releases) ----
 
 static void handleUpdateStatus() {
-  DynamicJsonDocument doc(512);
+  // fwLog can hold up to FW_LOG_MAX (2048) bytes of text -- size the
+  // document well above that plus the other fields and JSON overhead.
+  JsonDocument doc(psramJsonAllocator());
   doc["checked"]         = fwUpdateChecked;
   doc["available"]       = fwUpdateAvailable;
   doc["currentVersion"]  = FIRMWARE_VERSION;
   doc["availableVersion"] = fwAvailableVersion;
   doc["notes"]           = fwReleaseNotes;
+  doc["checkError"]      = fwCheckError;
+
+  doc["downloading"]     = fwDownloading;
+  doc["downloaded"]      = fwDownloaded;
+  doc["downloadStage"]   = fwDownloadStage;
+  doc["downloadedBytes"] = fwDownloadedBytes;
+  doc["totalBytes"]      = fwDownloadTotalBytes;
+  doc["downloadError"]   = fwDownloadError;
+
   doc["installing"]      = fwInstalling;
-  doc["stage"]           = fwInstallStage;
-  doc["downloadedBytes"] = fwInstallDownloadedBytes;
-  doc["totalBytes"]      = fwInstallTotalBytes;
-  doc["error"]           = fwInstallError;
+  doc["installError"]    = fwInstallError;
+
+  doc["log"]             = fwLog;
+
   doc["nodeAssetKnown"]  = fwHasNodeAsset();
   doc["stagingNode"]     = fwStagingNode;
   doc["stageNodeError"]  = fwStageNodeError;
@@ -1799,28 +2239,74 @@ static void handleUpdateCheck() {
   }
 
   fwCheckForUpdate();
+  Serial.printf("[FWUPD] Post-check heap: free=%u largestBlock=%u\n",
+                (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
 
-  DynamicJsonDocument doc(256);
-  doc["ok"]               = true;
+  bool ok = (fwCheckError.length() == 0);
+  JsonDocument doc(psramJsonAllocator());
+  doc["ok"]               = ok;
+  doc["message"]          = fwCheckError;
   doc["available"]        = fwUpdateAvailable;
   doc["availableVersion"] = fwAvailableVersion;
 
   String out;
   out.reserve(measureJson(doc) + 1);
   serializeJson(doc, out);
-  server.send(200, "application/json", out);
+  server.send(ok ? 200 : 502, "application/json", out);
 }
 
-static void handleUpdateInstall() {
-  if (!fwUpdateAvailable) { server.send(400, "text/plain", "No update available"); return; }
-  if (WiFi.status() != WL_CONNECTED) { server.send(400, "text/plain", "STA WiFi not connected"); return; }
+static void handleUpdateDownloadStart() {
+  fwDownloadStart();
+  // fwDownloadStart() is synchronous but non-blocking -- it only validates
+  // preconditions and arms the state machine fwDownloadTick() drives from
+  // loop(). fwDownloading is true here if a transfer is now (still) in
+  // progress; otherwise fwDownloadError holds the rejection reason.
+  bool ok = fwDownloading;
 
-  // Blocking, same pattern as the existing upload handlers. On success this
-  // calls ESP.restart() internally and never returns -- a response is only
-  // sent here if it failed before flashing began.
-  bool ok = fwInstallUpdate();
+  JsonDocument doc(psramJsonAllocator());
+  doc["ok"]    = ok;
+  doc["error"] = fwDownloadError;
 
-  DynamicJsonDocument doc(256);
+  String out;
+  out.reserve(measureJson(doc) + 1);
+  serializeJson(doc, out);
+  server.send(ok ? 200 : 400, "application/json", out);
+}
+
+static void handleUpdateDownloadCancel() {
+  fwDownloadCancel();
+  server.send(200, "text/plain", "OK");
+}
+
+// Deletes every file currently staged in /Firmware/ (this board's own
+// downloaded-but-not-yet-installed image, plus anything staged for the mesh
+// Core-push engine) -- lets the operator clear a stuck/partial download or
+// just reclaim SD space without pulling the card.
+static void handleUpdateClearFirmware() {
+  bool ok = fwClearFirmwareFolder();
+
+  JsonDocument doc(psramJsonAllocator());
+  doc["ok"] = ok;
+  if (!ok) {
+    doc["error"] = (fwDownloading || fwInstalling)
+      ? "Cannot clear while a download or install is in progress"
+      : "SD not available";
+  }
+
+  String out;
+  out.reserve(measureJson(doc) + 1);
+  serializeJson(doc, out);
+  server.send(ok ? 200 : 400, "application/json", out);
+}
+
+static void handleUpdateInstallFromSD() {
+  // Blocking, but purely local (SD -> flash, no network) so it's quick. On
+  // success this calls ESP.restart() internally and never returns -- a
+  // response is only sent here if it failed before flashing began.
+  bool ok = fwInstallFromSD();
+
+  JsonDocument doc(psramJsonAllocator());
   doc["ok"]    = ok;
   doc["error"] = fwInstallError;
 
@@ -1839,7 +2325,7 @@ static void handleUpdateStageNode() {
   bool ok = fwStageNodeFirmware();
   if (ok) coreOtaPreload();  // reload PSRAM images so the new file is usable without a reboot
 
-  DynamicJsonDocument doc(256);
+  JsonDocument doc(psramJsonAllocator());
   doc["ok"]    = ok;
   doc["error"] = fwStageNodeError;
 
@@ -1891,21 +2377,9 @@ static void handleDownloadAll() {
     cl.write((const uint8_t*)"\r\n", 2);
   };
 
-  // CRC32 (ISO 3309 / gzip polynomial 0xEDB88320)
-  auto crc32Up = [](uint32_t crc, const uint8_t* b, size_t n) -> uint32_t {
-    static const uint32_t T[16] = {
-      0x00000000,0x1DB71064,0x3B6E20C8,0x26D930AC,
-      0x76DC4190,0x6B6B51F4,0x4DB26158,0x5005713C,
-      0xEDB88320,0xF00F9344,0xD6D6A3E8,0xCB61B38C,
-      0x9B64C2B0,0x86D3D2D4,0xA00AE278,0xBDBDF21C
-    };
-    crc = ~crc;
-    for (size_t i = 0; i < n; i++) {
-      crc = (crc >> 4) ^ T[(crc ^ b[i]) & 0xF];
-      crc = (crc >> 4) ^ T[(crc ^ (b[i] >> 4)) & 0xF];
-    }
-    return ~crc;
-  };
+  // CRC32 (ISO 3309 / gzip polynomial 0xEDB88320) -- shared implementation
+  // in GzipDeflate.cpp, also used by the real-compression upload path.
+  auto crc32Up = gzipCrc32Update;
 
   // RFC 1952 gzip header (10 bytes)
   const uint8_t gzHdr[10] = {
@@ -1979,6 +2453,7 @@ void startWebServer() {
   server.on("/saveConfig", HTTP_POST, handleSaveConfig);
 
   server.on("/ping",            handlePing);
+  server.on("/uiLog",           HTTP_POST, handleUiLog);
   server.on("/reboot",          HTTP_POST, handleReboot);
   server.on("/cleanup",         HTTP_POST, handleCleanup);
   server.on("/deleteAll",       HTTP_POST, handleDeleteAll);
@@ -1998,10 +2473,13 @@ void startWebServer() {
   server.on("/mesh/channelOverrides",       HTTP_POST, handleMeshChannelOverridesSet);
   server.on("/mesh/channelOverrides/clear", HTTP_POST, handleMeshChannelOverridesClear);
 
-  server.on("/update/status",    handleUpdateStatus);
-  server.on("/update/check",     HTTP_POST, handleUpdateCheck);
-  server.on("/update/install",   HTTP_POST, handleUpdateInstall);
-  server.on("/update/stageNode", HTTP_POST, handleUpdateStageNode);
+  server.on("/update/status",         handleUpdateStatus);
+  server.on("/update/check",          HTTP_POST, handleUpdateCheck);
+  server.on("/update/downloadStart",  HTTP_POST, handleUpdateDownloadStart);
+  server.on("/update/downloadCancel", HTTP_POST, handleUpdateDownloadCancel);
+  server.on("/update/clearFirmware",  HTTP_POST, handleUpdateClearFirmware);
+  server.on("/update/installFromSD",  HTTP_POST, handleUpdateInstallFromSD);
+  server.on("/update/stageNode",      HTTP_POST, handleUpdateStageNode);
 
   server.begin();
   Serial.println("[WEB] Server started");

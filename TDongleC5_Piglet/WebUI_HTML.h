@@ -43,8 +43,10 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
   .barWrap{height:7px;border-radius:7px;overflow:hidden;margin-top:8px;background:var(--barBg)}
   #wigleBar{height:7px;width:0%;border-radius:7px;background:var(--accent);transition:width .4s}
   #wigleBar.active{animation:pulse 1.5s ease-in-out infinite} @keyframes pulse{0%,100%{opacity:1}50%{opacity:.6}}
-  #fwBar{height:7px;width:0%;border-radius:7px;background:var(--accent);transition:width .4s}
-  #fwBar.active{animation:pulse 1.5s ease-in-out infinite}
+  #fwModalBar{height:7px;width:0%;border-radius:7px;background:var(--accent);transition:width .4s}
+  #fwModalBar.active{animation:pulse 1.5s ease-in-out infinite}
+  #fwModalBar.indeterminate{width:30%!important;animation:barSweep 1.1s ease-in-out infinite;transition:none}
+  @keyframes barSweep{0%{transform:translateX(-120%)}100%{transform:translateX(420%)}}
   .inner-card{border:1px solid var(--border);border-radius:8px;padding:12px;margin-top:12px;background:var(--input)}
   .cfg-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px} @media(max-width:520px){.cfg-grid{grid-template-columns:1fr}} .cfg-grid>div{display:flex;flex-direction:column}
   .file-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:6px 0;border-bottom:1px solid var(--border)} .file-row:last-child{border-bottom:none}
@@ -112,17 +114,21 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
       <div><span class="k">Available</span><span class="v" id="vFwAvailable">—</span></div>
     </div>
     <div id="fwNotes" class="muted mt-sm" style="font-size:12px"></div>
-    <div class="barWrap mt-sm"><div id="fwBar"></div></div>
     <div id="fwMsg" class="muted mt-sm" style="font-size:13px">—</div>
     <div class="row mt-sm">
       <button onclick="fwCheck()">Check for Update</button>
-      <button class="btn-primary" id="fwInstallBtn" onclick="fwInstall()" disabled>Install Update</button>
+      <button class="btn-primary" id="fwDownloadBtn" onclick="fwDownloadOpen()" disabled>Download &amp; Install Firmware</button>
     </div>
     <div class="row mt-sm">
       <button id="fwStageNodeBtn" onclick="fwStageNode()">Store Piglet Node Firmware</button>
     </div>
     <div id="fwStageNodeMsg" class="muted mt-sm" style="font-size:12px"></div>
     <p style="margin-top:6px;font-size:11px;color:var(--muted)">Downloads the latest <code>PigletNode.ota.bin</code> to <code>/Firmware/</code> so this Core can push it to connected headless PigletNode nodes -- works even if this board's own firmware is current.</p>
+    <div class="row mt-sm">
+      <button class="btn-danger" id="fwClearBtn" onclick="fwClearFirmware()">Delete Staged Firmware Files</button>
+    </div>
+    <div id="fwClearMsg" class="muted mt-sm" style="font-size:11px"></div>
+    <p style="margin-top:6px;font-size:11px;color:var(--muted)">Deletes everything in <code>/Firmware/</code> on the SD card -- use this to clear a stuck or partial download before retrying. Disabled while a download or install is active.</p>
   </div>
 
   <div class="card" id="meshNodesCard" style="display:none">
@@ -182,11 +188,14 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
   <div class="card">
     <h3>SD Card Files</h3>
     <div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:10px">
-      <button class="btn-sm" onclick="loadFiles()">&#8635; Refresh</button>
-      <button class="btn-sm" onclick="window.location.href='/downloadAll'">&#11015; Download All (CSV.GZ)</button>
+      <button class="btn-sm" onclick="loadFilesClick()">&#8635; Load Files</button>
+      <button class="btn-sm" onclick="downloadAllClick()">&#11015; Download All (CSV.GZ)</button>
       <button class="btn-sm btn-danger" onclick="deleteAllLogs()">&#128465; Delete All</button>
     </div>
-    <div id="files" style="font-size:13px">Loading&hellip;</div>
+    <div id="files" style="font-size:13px">Click "Load Files" to view SD card contents.</div>
+    <div style="margin-top:8px">
+      <button id="filesLoadMoreBtn" class="btn-sm" style="display:none" onclick="loadMoreFiles()">Load More</button>
+    </div>
   </div>
 
 <!-- AP keep-alive prompt (shown ~30 s before the AP window expires) -->
@@ -198,6 +207,23 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
   <div class="row">
     <button class="btn-primary" onclick="apKeepAliveYes()">Stay</button>
     <button onclick="apKeepAliveNo()">Start Scanning Now</button>
+  </div>
+</div>
+
+<!-- Firmware download/install modal (shown while fwDownloadOpen() is active) -->
+<div id="fwModalOverlay" style="display:none;position:fixed;inset:0;background:rgba(10,14,19,.92);z-index:9998;align-items:center;justify-content:center;padding:24px">
+  <div class="card" style="max-width:360px;width:100%;margin:0;text-align:center;display:flex;flex-direction:column;align-items:center;gap:12px">
+    <div style="font-size:36px">&#x1f437;</div>
+    <h2 id="fwModalTitle" style="margin:0;color:#e2eaf4">Downloading Firmware...</h2>
+    <p id="fwModalHint" style="color:#8899ab;margin:0;font-size:11px">The device pauses scanning, waits for memory to free up, then connects -- this can take up to a couple of minutes. Please wait.</p>
+    <div class="barWrap" style="width:100%"><div id="fwModalBar"></div></div>
+    <p id="fwModalPct" style="color:#8899ab;margin:0;font-size:13px">0%</p>
+    <pre id="fwModalLog" style="width:100%;max-height:200px;overflow-y:auto;text-align:left;background:#0d1117;border:1px solid #30363d;border-radius:7px;padding:8px;font-size:11px;line-height:1.5;color:#8899ab;white-space:pre-wrap;word-break:break-word"></pre>
+    <div class="row" style="width:100%">
+      <button id="fwModalCancelBtn" onclick="fwDownloadModalCancel()">Cancel</button>
+      <button id="fwModalCloseBtn" onclick="fwDownloadModalClose()" style="display:none">Close</button>
+      <button class="btn-primary" id="fwModalInstallBtn" onclick="fwInstallNow()" style="display:none">Install Now</button>
+    </div>
   </div>
 </div>
 
@@ -216,6 +242,9 @@ function setPill(id,text,cls){const el=$(id);if(!el)return;el.classList.remove('
 function setText(id,val){const el=$(id);if(el)el.textContent=(val===undefined||val===null||val==='')?'\u2014':String(val)}
 function setWigleMsg(t,cls){const el=$('wigleMsg');el.textContent=t;el.className=cls||'muted'}
 function formatBytes(b){if(b<1024)return b+' B';if(b<1048576)return(b/1024).toFixed(1)+' KB';return(b/1048576).toFixed(1)+' MB'}
+// UI button-press logging -- fire-and-forget, visible on the serial console
+// so field debugging can see exactly which control was pressed.
+function logBtn(label){try{ fetch('/uiLog?msg='+encodeURIComponent(label+' button pressed'),{method:'POST'}); }catch(e){}}
 const maskedKeys=new Set(['homePsk']);
 function setWdgwarsMsg(t,cls){const el=$('wdgwarsMsg');el.textContent=t;el.className=cls||'muted'}
 function setWardriftMsg(t,cls){const el=$('wardriftMsg');el.textContent=t;el.className=cls||'muted'}
@@ -243,23 +272,72 @@ async function loadStatus(){try{
   }
 }catch(e){console.error(e)}}
 
-async function loadFiles(){try{
-  const r=await fetch('/files.json');const j=await r.json();const el=$('files');
-  if(!j.ok){el.textContent='SD not available';return}
-  if(!j.files||j.files.length===0){el.textContent='No files';return}
-  el.innerHTML=j.files.map(f=>{
-    const isUp=f.name.startsWith('/uploaded');
-    const badge=isUp?'<span class="file-badge uploaded">uploaded</span>':'<span class="file-badge log">Not Uploaded</span>';
-    const upBtn=isUp?'':'<button class="btn-sm" onclick="wigleUploadOne(\''+f.name.replace(/'/g,"\\\'")+'\')">Upload</button>';
-    return '<div class="file-row"><a href="/download?name='+encodeURIComponent(f.name)+'">'+f.name+'</a> '+badge+
-      '<span class="file-size">'+formatBytes(f.size)+'</span><span class="file-actions">'+upBtn+
-      '<button class="btn-sm btn-danger" onclick="delFile(\''+f.name.replace(/'/g,"\\\'")+'\')">Delete</button></span></div>'
-  }).join('')
-}catch(e){console.error(e)}}
+const FILES_PAGE_SIZE=50;
+let filesLoaded=false;
+let filesOffset=0;
+let filesLoading=false;
 
-async function doStart(){await fetch('/start',{method:'POST'});await loadStatus()}
-async function doStop(){await fetch('/stop',{method:'POST'});await loadStatus()}
+function renderFileRow(f){
+  const isUp=f.name.startsWith('/uploaded');
+  const badge=isUp?'<span class="file-badge uploaded">uploaded</span>':'<span class="file-badge log">Not Uploaded</span>';
+  const upBtn=isUp?'':'<button class="btn-sm" onclick="wigleUploadOne(\''+f.name.replace(/'/g,"\\\'")+'\')">Upload</button>';
+  return '<div class="file-row"><a href="/download?name='+encodeURIComponent(f.name)+'">'+f.name+'</a> '+badge+
+    '<span class="file-size">'+formatBytes(f.size)+'</span><span class="file-actions">'+upBtn+
+    '<button class="btn-sm btn-danger" onclick="delFile(\''+f.name.replace(/'/g,"\\\'")+'\')">Delete</button></span></div>'
+}
+
+function setFilesLoadMoreVisible(visible){const btn=$('filesLoadMoreBtn');if(btn)btn.style.display=visible?'':'none'}
+
+async function fetchFilesPage(reset){
+  if(filesLoading)return;
+  filesLoading=true;
+  setFilesLoadMoreVisible(false);
+  const el=$('files');
+  try{
+    const r=await fetch('/files.json?offset='+filesOffset+'&limit='+FILES_PAGE_SIZE);
+    const j=await r.json();
+    if(!j.ok){el.textContent='SD not available';filesLoading=false;return}
+    const rowsHtml=(j.files||[]).map(renderFileRow).join('');
+    if(reset){
+      el.innerHTML=(j.files&&j.files.length)?rowsHtml:'No files';
+    }else if(rowsHtml){
+      el.insertAdjacentHTML('beforeend',rowsHtml);
+    }
+    filesOffset+=(j.files?j.files.length:0);
+    setFilesLoadMoreVisible(!!j.hasMore);
+  }catch(e){
+    console.error(e);
+    if(reset)el.textContent='Failed to load files';
+  }
+  filesLoading=false;
+}
+
+async function loadFiles(){
+  filesLoaded=true;
+  filesOffset=0;
+  $('files').innerHTML='Loading\u2026';
+  await fetchFilesPage(true);
+}
+
+// Thin wrapper so the "Load Files" button logs a press every time it's
+// clicked, without loadFiles() itself (reused internally to silently
+// refresh the list after other actions) logging a false positive.
+async function loadFilesClick(){logBtn('Load Files');await loadFiles();}
+
+async function loadMoreFiles(){logBtn('Load More');await fetchFilesPage(false)}
+
+function downloadAllClick(){logBtn('Download All (CSV.GZ)');window.location.href='/downloadAll';}
+
+// Re-pulls the first page only if the operator has already opened the Files
+// list this session -- keeps actions elsewhere on the page (WiGLE/WDGoWars/
+// Wardrift uploads) from silently triggering a full directory walk when
+// nobody is even looking at the Files card.
+async function refreshFilesIfLoaded(){if(filesLoaded)await loadFiles()}
+
+async function doStart(){logBtn('Start Scan');await fetch('/start',{method:'POST'});await loadStatus()}
+async function doStop(){logBtn('Stop Scan');await fetch('/stop',{method:'POST'});await loadStatus()}
 async function delFile(name){
+  logBtn('Delete File ('+name+')');
   if(!confirm('Delete '+name+'?'))return;
   const el=$('files');
   el.innerHTML='<span style="color:#8899ab">Deleting...</span>';
@@ -273,6 +351,7 @@ async function delFile(name){
   await loadFiles();
 }
 async function deleteAllLogs(){
+  logBtn('Delete All');
   if(!confirm('Delete ALL log files from /logs and /uploaded?\nThis cannot be undone.'))return;
   const el=$('files');
   el.innerHTML='<span style="color:#8899ab">Deleting all logs\u2026</span>';
@@ -296,26 +375,27 @@ async function doSave(){
   await fetch('/saveConfig',{method:'POST',headers:{'Content-Type':'text/plain'},body});
   await loadStatus();
 }
-async function saveCfg(){try{await doSave();alert('Config saved. Reboot to apply WiFi/GPS changes.')}catch(e){alert('Save failed: '+e)}}
+async function saveCfg(){logBtn('Save Config');try{await doSave();alert('Config saved. Reboot to apply WiFi/GPS changes.')}catch(e){alert('Save failed: '+e)}}
 async function saveAndReboot(){
+  logBtn('Save & Reboot');
   try{await doSave();}catch(e){alert('Save failed: '+e);return;}
   const ov=$('rebootOverlay');ov.style.display='flex';
   try{await fetch('/reboot',{method:'POST'});}catch(e){}
   let t=12;$('rebootCountdown').textContent=t+'s';
   const iv=setInterval(()=>{t--;$('rebootCountdown').textContent=t>0?t+'s':'';if(t<=0){clearInterval(iv);$('rebootMsg').textContent='Device rebooted. Reconnect and refresh.';setTimeout(()=>location.reload(),2000);}},1000);
 }
-async function wigleTest(){setWigleMsg('Testing...');try{const r=await fetch('/wigle/test',{method:'POST'});const j=await r.json().catch(()=>({ok:false,message:'Bad response'}));setWigleMsg(j.message||(j.ok?'Valid':'Invalid'),j.ok?'ok-text':'bad-text')}catch(e){setWigleMsg('Failed','bad-text')}await loadStatus()}
-async function wigleUploadAll(){setWigleMsg('Uploading...');try{const r=await fetch('/wigle/uploadAll',{method:'POST'});const j=await r.json().catch(()=>null);if(j){setWigleMsg(j.message||(j.ok?j.uploaded+' uploaded':'Failed'),j.ok?'ok-text':'bad-text')}}catch(e){setWigleMsg('Failed','bad-text')}await loadFiles();await loadStatus()}
-async function wigleUploadOne(name){setWigleMsg('Uploading '+name+'...');try{const r=await fetch('/wigle/upload?name='+encodeURIComponent(name),{method:'POST'});const j=await r.json().catch(()=>null);if(j)setWigleMsg(j.message||(j.ok?'OK':'Failed'),j.ok?'ok-text':'bad-text')}catch(e){setWigleMsg('Failed','bad-text')}await loadFiles();await loadStatus()}
-async function wdgwarsTest(){setWdgwarsMsg('Testing...');try{const r=await fetch('/wdgwars/test',{method:'POST'});const j=await r.json().catch(()=>({ok:false,message:'Bad response'}));setWdgwarsMsg(j.message||(j.ok?'Key valid':'Key invalid'),j.ok?'ok-text':'bad-text')}catch(e){setWdgwarsMsg('Failed','bad-text')}}
-async function wdgwarsUploadAll(){setWdgwarsMsg('Uploading...');try{const r=await fetch('/wdgwars/uploadAll',{method:'POST'});const j=await r.json().catch(()=>null);if(j){setWdgwarsMsg(j.message||(j.ok?j.uploaded+' uploaded':'Failed'),j.ok?'ok-text':'bad-text')}}catch(e){setWdgwarsMsg('Failed','bad-text')}await loadFiles();}
-async function wardriftTest(){setWardriftMsg('Testing...');try{const r=await fetch('/wardrift/test',{method:'POST'});const j=await r.json().catch(()=>({ok:false,message:'Bad response'}));setWardriftMsg(j.message||(j.ok?'Key valid':'Key invalid'),j.ok?'ok-text':'bad-text')}catch(e){setWardriftMsg('Failed','bad-text')}}
-async function wardriftUploadAll(){setWardriftMsg('Uploading...');try{const r=await fetch('/wardrift/uploadAll',{method:'POST'});const j=await r.json().catch(()=>null);if(j){setWardriftMsg(j.message||(j.ok?j.uploaded+' uploaded':'Failed'),j.ok?'ok-text':'bad-text')}}catch(e){setWardriftMsg('Failed','bad-text')}await loadFiles();}
+async function wigleTest(){logBtn('WiGLE Test Token');setWigleMsg('Testing...');try{const r=await fetch('/wigle/test',{method:'POST'});const j=await r.json().catch(()=>({ok:false,message:'Bad response'}));setWigleMsg(j.message||(j.ok?'Valid':'Invalid'),j.ok?'ok-text':'bad-text')}catch(e){setWigleMsg('Failed','bad-text')}await loadStatus()}
+async function wigleUploadAll(){logBtn('WiGLE Upload All CSVs');setWigleMsg('Uploading...');try{const r=await fetch('/wigle/uploadAll',{method:'POST'});const j=await r.json().catch(()=>null);if(j){setWigleMsg(j.message||(j.ok?j.uploaded+' uploaded':'Failed'),j.ok?'ok-text':'bad-text')}}catch(e){setWigleMsg('Failed','bad-text')}await refreshFilesIfLoaded();await loadStatus()}
+async function wigleUploadOne(name){logBtn('Upload File ('+name+')');setWigleMsg('Uploading '+name+'...');try{const r=await fetch('/wigle/upload?name='+encodeURIComponent(name),{method:'POST'});const j=await r.json().catch(()=>null);if(j)setWigleMsg(j.message||(j.ok?'OK':'Failed'),j.ok?'ok-text':'bad-text')}catch(e){setWigleMsg('Failed','bad-text')}await loadFiles();await loadStatus()}
+async function wdgwarsTest(){logBtn('WDGoWars Test API Key');setWdgwarsMsg('Testing...');try{const r=await fetch('/wdgwars/test',{method:'POST'});const j=await r.json().catch(()=>({ok:false,message:'Bad response'}));setWdgwarsMsg(j.message||(j.ok?'Key valid':'Key invalid'),j.ok?'ok-text':'bad-text')}catch(e){setWdgwarsMsg('Failed','bad-text')}}
+async function wdgwarsUploadAll(){logBtn('WDGoWars Upload All CSVs');setWdgwarsMsg('Uploading...');try{const r=await fetch('/wdgwars/uploadAll',{method:'POST'});const j=await r.json().catch(()=>null);if(j){setWdgwarsMsg(j.message||(j.ok?j.uploaded+' uploaded':'Failed'),j.ok?'ok-text':'bad-text')}}catch(e){setWdgwarsMsg('Failed','bad-text')}await refreshFilesIfLoaded();}
+async function wardriftTest(){logBtn('Wardrift Test API Key');setWardriftMsg('Testing...');try{const r=await fetch('/wardrift/test',{method:'POST'});const j=await r.json().catch(()=>({ok:false,message:'Bad response'}));setWardriftMsg(j.message||(j.ok?'Key valid':'Key invalid'),j.ok?'ok-text':'bad-text')}catch(e){setWardriftMsg('Failed','bad-text')}}
+async function wardriftUploadAll(){logBtn('Wardrift Upload All CSVs');setWardriftMsg('Uploading...');try{const r=await fetch('/wardrift/uploadAll',{method:'POST'});const j=await r.json().catch(()=>null);if(j){setWardriftMsg(j.message||(j.ok?j.uploaded+' uploaded':'Failed'),j.ok?'ok-text':'bad-text')}}catch(e){setWardriftMsg('Failed','bad-text')}await refreshFilesIfLoaded();}
 let apModalShown=false,apModalDismissed=false,apModalIv=null;
 function hideApKeepAlive(){const ov=$('apKeepAliveOverlay');if(ov)ov.style.display='none';if(apModalIv){clearInterval(apModalIv);apModalIv=null;}apModalShown=false;}
 function showApKeepAlive(ms){const ov=$('apKeepAliveOverlay');if(!ov||apModalShown)return;apModalShown=true;ov.style.display='flex';let s=Math.max(0,Math.ceil(ms/1000));$('apKeepAliveCountdown').textContent=s+'s';apModalIv=setInterval(()=>{s--;if(s<=0){clearInterval(apModalIv);apModalIv=null;return;}$('apKeepAliveCountdown').textContent=s+'s';},1000);}
-async function apKeepAliveYes(){try{await fetch('/extend',{method:'POST'});}catch(e){}apModalDismissed=true;hideApKeepAlive();}
-async function apKeepAliveNo(){hideApKeepAlive();try{await fetch('/start',{method:'POST'});}catch(e){}}
+async function apKeepAliveYes(){logBtn('AP Keep-Alive Stay');try{await fetch('/extend',{method:'POST'});}catch(e){}apModalDismissed=true;hideApKeepAlive();}
+async function apKeepAliveNo(){logBtn('AP Keep-Alive Start Scanning Now');hideApKeepAlive();try{await fetch('/start',{method:'POST'});}catch(e){}}
 function handleApTimer(j){if(!j||!j.apActive){hideApKeepAlive();return;}const rem=j.apRemainingMs|0;const lead=j.apExtendPromptLeadMs|30000;if(rem>lead)apModalDismissed=false;if(!apModalDismissed&&rem>0&&rem<=lead)showApKeepAlive(rem);}
 async function pollUpload(){try{const r=await fetch('/status.json');const j=await r.json();const up=!!j.uploading;const done=j.uploadDoneFiles||0;const total=j.uploadTotalFiles||0;const pct=total>0?Math.round((done/total)*100):0;const bar=$('wigleBar');bar.style.width=pct+'%';bar.classList.toggle('active',up);if(up){const fail=j.uploadFailedFiles||0;const failStr=fail>0?' F:'+fail:'';setWigleMsg('Uploading '+done+'/'+total+' ('+pct+'%)'+failStr)}handleApTimer(j);}catch(e){}}
 
@@ -325,29 +405,141 @@ async function loadUpdateStatus(){try{
   setText('vFwCurrent',j.currentVersion);
   setText('vFwAvailable',j.available?j.availableVersion:'Up to date');
   $('fwNotes').textContent=j.notes||'';
-  $('fwInstallBtn').disabled=!j.available||j.installing;
-  const pct=j.totalBytes>0?Math.round((j.downloadedBytes/j.totalBytes)*100):0;
-  const bar=$('fwBar');bar.style.width=pct+'%';bar.classList.toggle('active',j.installing);
-  if(j.installing)setFwMsg((j.stage||'Installing...')+' ('+pct+'%)');
-  else if(j.error)setFwMsg(j.error,'bad-text');
+  $('fwDownloadBtn').disabled=!j.available||j.downloading||j.installing;
+  $('fwClearBtn').disabled=j.downloading||j.installing;
+  if(j.downloading||j.installing){/* modal poller owns fwMsg while active */}
+  else if(j.downloadError)setFwMsg(j.downloadError,'bad-text');
+  else if(j.installError)setFwMsg(j.installError,'bad-text');
+  else if(j.downloaded)setFwMsg('Downloaded \u2014 ready to install','ok-text');
   else if(j.available)setFwMsg('Update available: '+j.availableVersion);
+  else if(j.checkError)setFwMsg(j.checkError,'bad-text');
   else if(j.checked)setFwMsg('Up to date','ok-text');
+  return j;
 }catch(e){console.error(e)}}
-async function fwCheck(){setFwMsg('Checking...');try{const r=await fetch('/update/check',{method:'POST'});const j=await r.json().catch(()=>null);if(j&&!j.ok)setFwMsg(j.message||'Check failed','bad-text')}catch(e){setFwMsg('Check failed','bad-text')}await loadUpdateStatus();}
-async function fwInstall(){
-  if(!confirm('Install the update now? The device will reboot when finished.'))return;
-  setFwMsg('Starting install...');$('fwInstallBtn').disabled=true;
+async function fwCheck(){logBtn('Check for Update');setFwMsg('Checking...');try{const r=await fetch('/update/check',{method:'POST'});const j=await r.json().catch(()=>null);if(j&&!j.ok)setFwMsg(j.message||'Check failed','bad-text')}catch(e){setFwMsg('Check failed','bad-text')}await loadUpdateStatus();}
+function setFwClearMsg(t,cls){const el=$('fwClearMsg');el.textContent=t;el.className=cls||'muted'}
+async function fwClearFirmware(){
+  logBtn('Delete Staged Firmware Files');
+  if(!confirm('Delete all files in /Firmware on the SD card?\nThis removes any downloaded-but-not-installed image and anything staged for mesh nodes.'))return;
+  setFwClearMsg('Deleting...');
   try{
-    const r=await fetch('/update/install',{method:'POST'});
+    const r=await fetch('/update/clearFirmware',{method:'POST'});
     const j=await r.json().catch(()=>null);
-    if(j&&!j.ok)setFwMsg(j.error||'Install failed','bad-text');
-  }catch(e){setFwMsg('Device is rebooting...');}
+    if(j&&j.ok)setFwClearMsg('Cleared','ok-text');
+    else setFwClearMsg((j&&j.error)||'Delete failed','bad-text');
+  }catch(e){setFwClearMsg('Request failed','bad-text')}
   await loadUpdateStatus();
 }
-setInterval(loadUpdateStatus,2000);
+
+let fwModalIv=null;
+function fwModalShow(title){
+  $('fwModalTitle').textContent=title;
+  $('fwModalLog').textContent='';
+  const bar=$('fwModalBar');
+  bar.style.width='0%';
+  bar.classList.remove('active','indeterminate');
+  $('fwModalPct').textContent='Starting...';
+  $('fwModalHint').style.display='';
+  $('fwModalCancelBtn').style.display='';
+  $('fwModalCloseBtn').style.display='none';
+  $('fwModalInstallBtn').style.display='none';
+  $('fwModalOverlay').style.display='flex';
+}
+function fwModalHide(){if(fwModalIv){clearInterval(fwModalIv);fwModalIv=null;}$('fwModalOverlay').style.display='none';}
+function fwModalRender(j){
+  $('fwModalLog').textContent=j.log||'';
+  const log=$('fwModalLog');log.scrollTop=log.scrollHeight;
+  const bar=$('fwModalBar');
+  const haveSize=j.totalBytes>0;
+  if(j.downloading&&!haveSize){
+    // Connecting / following GitHub's redirect to the CDN -- no byte total
+    // yet, so sweep an indeterminate bar and surface the stage text instead
+    // of sitting stuck at 0% with no visible activity.
+    bar.classList.remove('active');
+    bar.classList.add('indeterminate');
+    $('fwModalPct').textContent=j.downloadStage||'Connecting...';
+    $('fwModalHint').style.display='';
+  }else{
+    const pct=haveSize?Math.round((j.downloadedBytes/j.totalBytes)*100):0;
+    bar.classList.remove('indeterminate');
+    bar.style.width=pct+'%';
+    bar.classList.toggle('active',j.downloading);
+    $('fwModalPct').textContent=(j.downloading?pct+'%':(j.downloadStage||''));
+    $('fwModalHint').style.display='none';
+  }
+  if(j.downloaded&&!j.installing){
+    $('fwModalTitle').textContent='Download Complete';
+    $('fwModalCancelBtn').style.display='none';
+    $('fwModalCloseBtn').style.display='';
+    $('fwModalInstallBtn').style.display='';
+  }
+  if(j.installing){
+    $('fwModalTitle').textContent='Installing Firmware...';
+    $('fwModalCancelBtn').style.display='none';
+    $('fwModalCloseBtn').style.display='none';
+    $('fwModalInstallBtn').style.display='none';
+  }
+  if(!j.downloading&&!j.downloaded&&!j.installing&&j.downloadError){
+    $('fwModalTitle').textContent='Download Failed';
+    $('fwModalCancelBtn').style.display='none';
+    $('fwModalCloseBtn').style.display='';
+    $('fwModalInstallBtn').style.display='none';
+  }
+}
+async function fwModalPoll(){const j=await loadUpdateStatus();if(j)fwModalRender(j);}
+async function fwDownloadOpen(){
+  logBtn('Download & Install Firmware');
+  fwModalShow('Downloading Firmware...');
+  try{
+    const r=await fetch('/update/downloadStart',{method:'POST'});
+    const j=await r.json().catch(()=>null);
+    if(j&&!j.ok){
+      $('fwModalLog').textContent=j.error||'Could not start download';
+      $('fwModalCancelBtn').style.display='none';
+      $('fwModalCloseBtn').style.display='';
+      return;
+    }
+  }catch(e){
+    $('fwModalLog').textContent='Request failed';
+    $('fwModalCancelBtn').style.display='none';
+    $('fwModalCloseBtn').style.display='';
+    return;
+  }
+  fwModalIv=setInterval(fwModalPoll,500);
+  fwModalPoll();
+}
+async function fwDownloadModalCancel(){logBtn('Cancel Firmware Download');try{await fetch('/update/downloadCancel',{method:'POST'});}catch(e){}fwModalHide();await loadUpdateStatus();}
+async function fwDownloadModalClose(){fwModalHide();await loadUpdateStatus();}
+async function fwInstallNow(){
+  logBtn('Install Now');
+  if(fwModalIv){clearInterval(fwModalIv);fwModalIv=null;}
+  $('fwModalTitle').textContent='Installing Firmware...';
+  $('fwModalCancelBtn').style.display='none';
+  $('fwModalCloseBtn').style.display='none';
+  $('fwModalInstallBtn').style.display='none';
+  try{
+    const r=await fetch('/update/installFromSD',{method:'POST'});
+    const j=await r.json().catch(()=>null);
+    if(j&&!j.ok){
+      $('fwModalLog').textContent+=(j.error||'Install failed')+'\n';
+      $('fwModalTitle').textContent='Install Failed';
+      $('fwModalCloseBtn').style.display='';
+    }
+  }catch(e){
+    $('fwModalTitle').textContent='Rebooting...';
+    $('fwModalLog').textContent+='Device is rebooting...\n';
+  }
+  await loadUpdateStatus();
+}
+// Slowed from 2000ms -- the firmware modal has its own dedicated 500ms
+// poller (fwModalIv) while active; a slower idle cadence leaves the narrow
+// MALLOC_CAP_DMA pool (shared with GitHub's own TLS handshake) less
+// contended at rest.
+setInterval(loadUpdateStatus,5000);
 
 function setFwStageNodeMsg(t,cls){const el=$('fwStageNodeMsg');el.textContent=t;el.className=cls||'muted'}
 async function fwStageNode(){
+  logBtn('Store Piglet Node Firmware');
   setFwStageNodeMsg('Downloading PigletNode.ota.bin...');$('fwStageNodeBtn').disabled=true;
   try{
     const r=await fetch('/update/stageNode',{method:'POST'});
@@ -360,17 +552,28 @@ async function fwStageNode(){
 }
 
 function otaPhaseText(p){switch(p){case 1:return'Starting';case 2:return'Sending';case 3:return'Done';case 4:return'Failed';default:return'Idle';}}
-async function loadMeshNodes(){try{
+// Self-rescheduling (setTimeout, not setInterval) so the cadence can adapt:
+// fast (1000ms) for a few seconds around an active node OTA push, slow
+// (6000ms) otherwise -- leaves the narrow MALLOC_CAP_DMA pool less
+// contended at rest.
+let meshNodesTimer=null;
+let meshNodesBusyUntilMs=0;
+function scheduleMeshNodes(ms){if(meshNodesTimer)clearTimeout(meshNodesTimer);meshNodesTimer=setTimeout(loadMeshNodes,ms);}
+async function loadMeshNodes(){
+  let nextMs=6000;
+  try{
   const r=await fetch('/mesh/nodes.json');const j=await r.json();
   const card=$('meshNodesCard');
-  if(!j.coreActive){card.style.display='none';return;}
+  if(!j.coreActive){card.style.display='none';scheduleMeshNodes(nextMs);return;}
   card.style.display='';
   const el=$('meshNodes');
   const ota=j.ota||{};
   const busy=ota.phase===1||ota.phase===2;
+  if(busy)meshNodesBusyUntilMs=Date.now()+5000;
+  nextMs=Date.now()<meshNodesBusyUntilMs?1000:6000;
   const loadEl=$('meshNodesLoadMsg');
   if(loadEl)loadEl.textContent=ota.loadMsg?('Staged on SD: '+ota.loadMsg):'';
-  if(!j.nodes||j.nodes.length===0){el.innerHTML='<span class="muted">No nodes connected</span>';return;}
+  if(!j.nodes||j.nodes.length===0){el.innerHTML='<span class="muted">No nodes connected</span>';scheduleMeshNodes(nextMs);return;}
   el.innerHTML=j.nodes.map(n=>{
     const isBusy=busy&&ota.nodeIdx===n.idx;
     const pct=ota.totalBytes>0?Math.round((ota.sentBytes/ota.totalBytes)*100):0;
@@ -382,10 +585,13 @@ async function loadMeshNodes(){try{
       :'<button class="btn-sm" onclick="meshOtaStart('+n.idx+')"'+(busy?' disabled':'')+'>Update</button>';
     return '<div class="file-row"><span>'+n.mac+'</span><span class="file-size">'+statusTxt+'</span><span class="file-actions">'+actionBtn+'</span></div>';
   }).join('');
-}catch(e){console.error(e)}}
-async function meshOtaStart(idx){try{const r=await fetch('/mesh/ota/start?idx='+idx,{method:'POST'});const j=await r.json().catch(()=>null);if(j&&!j.ok)alert(j.msg||'Could not start update')}catch(e){alert('Request failed')}await loadMeshNodes();}
-async function meshOtaCancel(){try{await fetch('/mesh/ota/cancel',{method:'POST'});}catch(e){}await loadMeshNodes();}
-setInterval(loadMeshNodes,2000);
+  }catch(e){console.error(e)}
+  scheduleMeshNodes(nextMs);
+}
+async function meshOtaStart(idx){logBtn('Mesh Node Update (idx='+idx+')');try{const r=await fetch('/mesh/ota/start?idx='+idx,{method:'POST'});const j=await r.json().catch(()=>null);if(j&&!j.ok)alert(j.msg||'Could not start update')}catch(e){alert('Request failed')}await loadMeshNodes();}
+async function meshOtaCancel(){logBtn('Mesh OTA Cancel');try{await fetch('/mesh/ota/cancel',{method:'POST'});}catch(e){}await loadMeshNodes();}
+// loadMeshNodes() self-reschedules (see scheduleMeshNodes() above) -- no
+// setInterval needed here.
 
 function setChOvrMsg(t,cls){const el=$('chOvrMsg');el.textContent=t;el.className=cls||'muted'}
 async function loadChOverrides(){try{
@@ -398,6 +604,7 @@ async function loadChOverrides(){try{
   ).join('');
 }catch(e){console.error(e)}}
 async function chOvrSet(){
+  logBtn('Set Channel Override');
   const mac=($('chOvrMac').value||'').trim();
   const chStart=$('chOvrStart').value, chEnd=$('chOvrEnd').value;
   if(!mac||chStart===''||chEnd===''){setChOvrMsg('MAC, start, and end channel are required','bad-text');return;}
@@ -412,12 +619,16 @@ async function chOvrSet(){
   await loadChOverrides();
 }
 async function chOvrClear(mac){
+  logBtn('Remove Channel Override ('+mac+')');
   try{await fetch('/mesh/channelOverrides/clear',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'mac='+encodeURIComponent(mac)});}catch(e){}
   await loadChOverrides();
 }
-setInterval(loadChOverrides,5000);
+// No recurring poll -- channel overrides only change via explicit admin
+// action (chOvrSet()/chOvrClear() above already refresh this list right
+// after mutating), so a background interval here was pure idle DMA-pool
+// chatter with no benefit.
 
-setInterval(pollUpload,1500);loadStatus();loadFiles();loadUpdateStatus();loadMeshNodes();loadChOverrides();
+setInterval(pollUpload,1500);loadStatus();loadUpdateStatus();loadMeshNodes();loadChOverrides();
 </script>
 </body>
 </html>

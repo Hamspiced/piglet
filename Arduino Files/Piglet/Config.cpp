@@ -2,6 +2,7 @@
 #include "Globals.h"
 #include <SD.h>
 #include <ArduinoJson.h>
+#include "JsonPsramAllocator.h"
 
 #if __has_include(<esp_chip_info.h>)
   #include <esp_chip_info.h>
@@ -157,6 +158,10 @@ void cfgAssignKV(const String& k, const String& v) {
     String vv = v; vv.toLowerCase();
     cfg.autoUpdateHeadlessNodes = (vv == "true" || vv == "1");
   }
+  else if (k == "gzipUploads") {
+    String vv = v; vv.toLowerCase();
+    cfg.gzipUploads = (vv == "true" || vv == "1");
+  }
 }
 
 void cfgEnforceMutualExclusion() {
@@ -214,7 +219,7 @@ bool loadConfigFromSD() {
       return false;
     }
 
-    DynamicJsonDocument doc(2048);
+    JsonDocument doc(psramJsonAllocator());
     DeserializationError err = deserializeJson(doc, f);
     f.close();
     if (err) {
@@ -366,6 +371,12 @@ bool saveConfigToSD() {
   f.println("# confirm prompt instead, regardless of this setting.");
   f.println("# CAUTION: use an SD card rated at least 16GB for sustained-write reliability.");
   f.print("autoUpdateHeadlessNodes="); f.println(cfg.autoUpdateHeadlessNodes ? "true" : "false");
+
+  f.println("");
+  f.println("# Gzip-compress CSVs before upload (WiGLE: one merged archive per batch;");
+  f.println("# WDGoWars/Wardrift: each file individually). Default true -- set false to");
+  f.println("# fall back to plain uncompressed uploads if a service ever rejects gzip.");
+  f.print("gzipUploads="); f.println(cfg.gzipUploads ? "true" : "false");
 
   f.flush();
   f.close();

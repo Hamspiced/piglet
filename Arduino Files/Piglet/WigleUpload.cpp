@@ -2,11 +2,40 @@
 #include "Globals.h"
 #include "SDUtils.h"
 #include "Display.h"
+#include "GzipDeflate.h"
+#include "UploadState.h"
 #include <WiFiClientSecure.h>
 #include <vector>
+#include "esp_heap_caps.h"
+
+// Scratch directory for gzip-compressed uploads -- cleared opportunistically
+// (each file removed right after its upload attempt) rather than at a fixed
+// point, so a mid-batch crash/reset never leaves more than one stale file.
+static const char* GZ_SCRATCH_DIR = "/logs/.gzscratch";
+
+static void ensureGzScratchDir() {
+  if (!SD.exists(GZ_SCRATCH_DIR)) SD.mkdir(GZ_SCRATCH_DIR);
+}
+
+static String gzScratchPathFor(const String& basename) {
+  return String(GZ_SCRATCH_DIR) + "/" + basename + ".gz";
+}
 
 static const char*     WDGWARS_HOST = "wdgwars.pl";
 static const uint16_t  WDGWARS_PORT = 443;
+
+// Logs free/largest-contiguous MALLOC_CAP_DMA heap -- the narrower pool the
+// hardware AES/DMA driver allocates its (small) per-operation descriptors
+// from, separate from general MALLOC_CAP_INTERNAL free heap. A failed
+// client.connect() with plenty of MALLOC_CAP_INTERNAL free but a tight or
+// zero MALLOC_CAP_DMA pool is the "esp-aes: Failed to allocate memory"
+// signature; called on every failed TLS connect attempt below so the next
+// occurrence has concrete numbers instead of a guess.
+static void logDmaHeap(const char* tag) {
+  Serial.printf("[HEAP] %s: dmaFree=%u dmaLargest=%u\n", tag,
+                (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
+                (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
+}
 
 // ---- WDGoWars async job tracking ----
 // A 202 response only means the CSV was received and queued for import —
@@ -21,9 +50,18 @@ struct WdgwarsPendingJob {
   String   filename;
   uint32_t queuedAtMs;
   uint32_t lastCheckMs;
+  // Exponential backoff per job (see WDGWARS_JOB_CHECK_INTERVAL_MS below) --
+  // starts at the base interval and doubles (capped) each inconclusive
+  // check, instead of hammering a fresh TLS connection every 4s for up to
+  // 5 minutes straight. That steady background TLS churn was a prime
+  // suspect for the AES/DMA-pool exhaustion behind repeated, sustained
+  // (not just momentary) "esp-aes: Failed to allocate memory" failures
+  // seen on foreground Test Token/Key TLS attempts during the same window.
+  uint32_t nextDelayMs;
 };
 static std::vector<WdgwarsPendingJob> wdgwarsPendingJobs;
-static const uint32_t WDGWARS_JOB_CHECK_INTERVAL_MS = 4000;            // min gap between checks
+static const uint32_t WDGWARS_JOB_CHECK_INTERVAL_MS = 4000;            // base/min gap between checks
+static const uint32_t WDGWARS_JOB_CHECK_MAX_MS      = 60000;           // backoff ceiling per job
 static const uint32_t WDGWARS_JOB_MAX_AGE_MS        = 5UL * 60UL * 1000UL; // give up after 5 min
 
 // ---- Token test ----
@@ -72,7 +110,24 @@ bool wigleTestToken() {
       Serial.println(ip);
     }
 
-    if (!client.connect(WIGLE_HOST, WIGLE_PORT)) {
+    // Retry TLS connect -- transient esp-aes/DMA-descriptor allocation
+    // failures (logged as "esp-aes: Failed to allocate memory") can make a
+    // single connect() attempt fail even though overall free heap looks
+    // fine; the AES driver needs a small allocation from the separate
+    // MALLOC_CAP_DMA pool, which a short retry gives a chance to free up.
+    // Same pattern already used by the upload functions below.
+    bool connected = false;
+    for (int attempt = 1; attempt <= 3; attempt++) {
+      if (client.connect(WIGLE_HOST, WIGLE_PORT)) { connected = true; break; }
+      char errBuf[100];
+      int sslErr = client.lastError(errBuf, sizeof(errBuf));
+      Serial.printf("[WiGLE] Test token TLS connect failed (attempt %d/3): error %d: %s\n", attempt, sslErr, errBuf);
+      logDmaHeap("WiGLE test token connect fail");
+      client.stop();
+      delay(500);
+      yield();
+    }
+    if (!connected) {
       uploadLastResult = "TLS connect fail";
       wigleTokenStatus = -1;
       return false;
@@ -341,7 +396,20 @@ bool wdgwarsTestKey() {
   client.setInsecure();
   client.setTimeout(15000);
 
-  if (!client.connect(WDGWARS_HOST, WDGWARS_PORT)) {
+  // Retry TLS connect -- see the matching comment in wigleTestToken() for
+  // why a single connect() attempt here can fail transiently.
+  bool connected = false;
+  for (int attempt = 1; attempt <= 3; attempt++) {
+    if (client.connect(WDGWARS_HOST, WDGWARS_PORT)) { connected = true; break; }
+    char errBuf[100];
+    int sslErr = client.lastError(errBuf, sizeof(errBuf));
+    Serial.printf("[WDGWars] Test key TLS connect failed (attempt %d/3): error %d: %s\n", attempt, sslErr, errBuf);
+    logDmaHeap("WDGWars test key connect fail");
+    client.stop();
+    delay(500);
+    yield();
+  }
+  if (!connected) {
     uploadLastResult = "TLS connect fail";
     return false;
   }
@@ -486,11 +554,17 @@ bool uploadFileToWdgwars(const String& path) {
     return false;
   }
 
-  // HTTP request — WDGoWars V2 async endpoint
+  // HTTP request — WDGoWars V2 async endpoint. A `.gz`-suffixed path means
+  // this is a scratch file already gzip-compressed by GzipDeflate.cpp --
+  // signal that with the standard Content-Encoding header (the multipart
+  // part's own Content-Type stays text/csv; it's the transport encoding of
+  // the body that's gzip, same as any other gzip-compressed POST).
+  bool isGzip = path.endsWith(".gz");
   client.print("POST /api/v2/upload-csv HTTP/1.0\r\n");
   client.print(String("Host: ") + WDGWARS_HOST + "\r\n");
   client.print(String("X-API-Key: ") + cfg.wdgwarsApiKey + "\r\n");
   client.print(String("Content-Type: multipart/form-data; boundary=") + boundary + "\r\n");
+  if (isGzip) client.print("Content-Encoding: gzip\r\n");
   client.print(String("Content-Length: ") + String(contentLen) + "\r\n");
   client.print("Connection: close\r\n\r\n");
 
@@ -593,7 +667,7 @@ bool uploadFileToWdgwars(const String& path) {
     }
 
     uint32_t nowMs = millis();
-    wdgwarsPendingJobs.push_back({ jobId, filename, nowMs, nowMs });
+    wdgwarsPendingJobs.push_back({ jobId, filename, nowMs, nowMs, WDGWARS_JOB_CHECK_INTERVAL_MS });
     uploadLastResult = "WDGW: queued (job " + String(jobId) + ")";
     Serial.printf("[WDGWars] Job %d submitted for %s — result will be checked in background\n",
                   jobId, filename.c_str());
@@ -637,7 +711,20 @@ bool wardriftTestKey() {
   client.setInsecure();
   client.setTimeout(15000);
 
-  if (!client.connect(WARDRIFT_HOST, WARDRIFT_PORT)) {
+  // Retry TLS connect -- see the matching comment in wigleTestToken() for
+  // why a single connect() attempt here can fail transiently.
+  bool connected = false;
+  for (int attempt = 1; attempt <= 3; attempt++) {
+    if (client.connect(WARDRIFT_HOST, WARDRIFT_PORT)) { connected = true; break; }
+    char errBuf[100];
+    int sslErr = client.lastError(errBuf, sizeof(errBuf));
+    Serial.printf("[Wardrift] Test key TLS connect failed (attempt %d/3): error %d: %s\n", attempt, sslErr, errBuf);
+    logDmaHeap("Wardrift test key connect fail");
+    client.stop();
+    delay(500);
+    yield();
+  }
+  if (!connected) {
     uploadLastResult = "TLS connect fail";
     return false;
   }
@@ -794,10 +881,15 @@ bool uploadFileToWardrift(const String& path) {
     return false;
   }
 
+  // A `.gz`-suffixed path means this is a scratch file already
+  // gzip-compressed by GzipDeflate.cpp -- signal that with the standard
+  // Content-Encoding header, same rationale as uploadFileToWdgwars() above.
+  bool isGzip = path.endsWith(".gz");
   client.print("POST /v1/ingest/signals HTTP/1.0\r\n");
   client.print(String("Host: ") + WARDRIFT_HOST + "\r\n");
   client.print(String("X-API-Key: ") + cfg.wardriftApiKey + "\r\n");
   client.print("Content-Type: text/csv\r\n");
+  if (isGzip) client.print("Content-Encoding: gzip\r\n");
   client.print(String("X-File-Name: ") + filename + "\r\n");
   client.print(String("Content-Length: ") + String(fileSize) + "\r\n");
   client.print("Connection: close\r\n\r\n");
@@ -922,10 +1014,11 @@ static bool wdgwarsCheckOnePendingJob() {
 
   uint32_t nowMs = millis();
 
-  // Find the least-recently-checked job that's due for a check
+  // Find the least-recently-checked job that's due for a check, using each
+  // job's own (growing) backoff interval rather than a fixed one.
   int idx = -1;
   for (size_t i = 0; i < wdgwarsPendingJobs.size(); i++) {
-    if (nowMs - wdgwarsPendingJobs[i].lastCheckMs >= WDGWARS_JOB_CHECK_INTERVAL_MS) {
+    if (nowMs - wdgwarsPendingJobs[i].lastCheckMs >= wdgwarsPendingJobs[i].nextDelayMs) {
       idx = (int)i;
       break;
     }
@@ -944,11 +1037,20 @@ static bool wdgwarsCheckOnePendingJob() {
   }
 
   wdgwarsPendingJobs[idx].lastCheckMs = nowMs;
+  // Double the wait before the next check on this job (capped), whether
+  // this attempt connects or not -- a resolving check erases the entry
+  // anyway, so only the "still processing"/connect-fail paths ever see the
+  // larger gap take effect.
+  wdgwarsPendingJobs[idx].nextDelayMs =
+    (job.nextDelayMs > WDGWARS_JOB_CHECK_MAX_MS / 2) ? WDGWARS_JOB_CHECK_MAX_MS : job.nextDelayMs * 2;
 
   WiFiClientSecure pc;
   pc.setInsecure();
   pc.setTimeout(8000);
-  if (!pc.connect(WDGWARS_HOST, WDGWARS_PORT)) return true;
+  if (!pc.connect(WDGWARS_HOST, WDGWARS_PORT)) {
+    logDmaHeap("WDGWars job-poll connect fail");
+    return true;
+  }
 
   String jobPath = String("/api/v2/upload-job/") + String(job.jobId);
   pc.print("GET " + jobPath + " HTTP/1.0\r\n");
@@ -1058,6 +1160,84 @@ static bool csvHasDataRows(const String& path, uint32_t* outSize = nullptr) {
   return hasData;
 }
 
+// ---- No-GPS-fix guard ----
+// Returns true only if the file has at least one data row AND every one of
+// those rows has lat=lon=0.000000 -- "null island", the exact placeholder
+// appendWigleRow() writes when GPS has never had a fix this session (see
+// Scanner.cpp's processScanResults()). A file like this is either a bench/
+// indoor test capture or a session where GPS never locked, and is exactly
+// the shape Wardrift's "no supported signal rows" validator rejects (it
+// treats 0,0 as no-fix, not a real location) -- confirmed against real
+// uploads where every row sent was rejected this way. Scans only as far as
+// the first non-zero coordinate before stopping, so a large real-data file
+// is cheap to clear.
+//
+// Relies on the row format appendWigleRow() writes: field 0 is the
+// unquoted MAC, field 1 is the double-quoted SSID (the only quoted field in
+// a WiGLE data row, per RFC4180), and everything after it --
+// AuthMode,FirstSeen,Channel,Frequency,RSSI,Lat,Lon,... -- is plain,
+// unquoted CSV. Lat/Lon are always formatted with exactly 6 decimal places
+// ("%.6f"), so a genuine no-fix row is always the literal string
+// "0.000000", not just numerically close to zero.
+static bool csvAllRowsZeroGps(const String& path) {
+  File f = SD.open(path, FILE_READ);
+  if (!f) return false;  // can't verify -- never delete on an unknown
+
+  // Skip the two WiGLE header lines.
+  for (int i = 0; i < 2; i++) {
+    if (!f.available()) { f.close(); return false; }  // no data rows -- csvHasDataRows() handles this
+    f.readStringUntil('\n');
+  }
+
+  bool sawAnyRow = false;
+  while (f.available()) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0) continue;
+
+    int c1 = line.indexOf(',');            // end of the unquoted MAC field
+    if (c1 < 0) continue;                  // malformed row -- ignore, don't let it block deletion
+    int i = c1 + 1;
+    int n = line.length();
+    if (i >= n || line[i] != '"') continue;  // expected the quoted SSID here -- malformed, skip
+
+    // Walk to the SSID's closing quote, honoring doubled """ "" escaping.
+    i++;
+    while (i < n) {
+      if (line[i] == '"') {
+        if (i + 1 < n && line[i + 1] == '"') { i += 2; continue; }
+        i++;
+        break;
+      }
+      i++;
+    }
+    if (i >= n || line[i] != ',') continue;  // malformed -- skip
+
+    // Remainder is plain CSV: AuthMode,FirstSeen,Channel,Frequency,RSSI,Lat,Lon,...
+    String rest = line.substring(i + 1);
+    int pos = 0, field = 0;
+    String lat, lon;
+    while (field <= 6) {
+      int comma = rest.indexOf(',', pos);
+      String val = (comma < 0) ? rest.substring(pos) : rest.substring(pos, comma);
+      if (field == 5) lat = val;
+      if (field == 6) lon = val;
+      if (comma < 0) break;
+      pos = comma + 1;
+      field++;
+    }
+
+    sawAnyRow = true;
+    if (lat != "0.000000" || lon != "0.000000") {
+      f.close();
+      return false;  // found a real fix -- not a no-GPS file
+    }
+  }
+  f.close();
+
+  return sawAnyRow;
+}
+
 // ---- Standalone empty-CSV cleanup ----
 // Scans /logs and deletes any CSV that has no data rows (header-only).
 // Called at boot and available via /cleanup endpoint.
@@ -1069,6 +1249,7 @@ void deleteEmptyCsvs() {
   std::vector<String> toDelete;
   File f = root.openNextFile();
   while (f) {
+    f.setBufferSize(64);  // avoid the 4KB default stdio buffer -- see WebUI.cpp's addDirFiles()
     String path = normalizeSdPath("/logs", f.name());
     bool isCsv    = path.endsWith(".csv");
     bool isCurrent = (currentCsvPath.length() && path == currentCsvPath);
@@ -1089,12 +1270,79 @@ void deleteEmptyCsvs() {
   }
 }
 
-// ---- Batch upload ----
+// ---- Shared file collection for batch uploads ----
+// Enumerates /logs/*.csv (excluding the active log file and the hidden
+// gzip-scratch/ledger housekeeping files, which never match ".csv"
+// anyway), deleting header-only files along the way. Returns the remaining
+// eligible paths, capped to maxFiles if positive.
+static std::vector<String> collectEligibleCsvs(int maxFiles) {
+  std::vector<String> all;
+  File root = SD.open("/logs");
+  if (root) {
+    File f = root.openNextFile();
+    while (f) {
+      f.setBufferSize(64);  // avoid the 4KB default stdio buffer -- see WebUI.cpp's addDirFiles()
+      String name = normalizeSdPath("/logs", f.name());
+      // Explicitly skip dot-prefixed housekeeping entries (the .gzscratch
+      // scratch directory, the .upload_state.cfg ledger) -- redundant with
+      // the .csv suffix check below today, but makes the exclusion explicit
+      // and keeps it safe if either ever changes shape.
+      bool isHidden = isHiddenSdEntry(pathBasename(name));
+      bool isCsv = name.endsWith(".csv");
+      bool isCurrent = (currentCsvPath.length() && name == currentCsvPath);
+      f.close();
+      if (isCsv && !isHidden && !isCurrent) all.push_back(name);
+      f = root.openNextFile();
+    }
+    root.close();
+  }
 
-uint32_t uploadAllCsvsToWigle(int maxFiles) {
+  std::vector<String> eligible;
+  eligible.reserve(all.size());
+  for (const String& p : all) {
+    uint32_t emptySz = 0;
+    if (!csvHasDataRows(p, &emptySz)) {
+      Serial.printf("[UPLOAD] Empty CSV (%u bytes, no data rows), deleting: %s\n",
+                    (unsigned)emptySz, pathBasename(p).c_str());
+      if (!SD.remove(p)) {
+        Serial.printf("[UPLOAD] WARNING: SD.remove failed for %s -- file left in place\n", pathBasename(p).c_str());
+      }
+      clearUploadState(pathBasename(p));
+      continue;
+    }
+    if (csvAllRowsZeroGps(p)) {
+      Serial.printf("[UPLOAD] No GPS fix in any row -- deleting bench-test/no-lock capture: %s\n",
+                    pathBasename(p).c_str());
+      if (!SD.remove(p)) {
+        Serial.printf("[UPLOAD] WARNING: SD.remove failed for %s -- file left in place\n", pathBasename(p).c_str());
+      }
+      clearUploadState(pathBasename(p));
+      continue;
+    }
+    eligible.push_back(p);
+  }
+
+  if (maxFiles > 0 && (uint32_t)maxFiles < eligible.size()) {
+    Serial.printf("[UPLOAD] Limiting this round to %d of %u eligible files (maxBootUploads)\n",
+                  maxFiles, (unsigned)eligible.size());
+    eligible.resize((size_t)maxFiles);
+  }
+  return eligible;
+}
+
+// ---- Combined batch upload (service-major, with per-file/per-service retry tracking) ----
+// Uploads every pending file to WiGLE first (as one merged, gzip-compressed
+// archive when more than one file is pending -- WiGLE's upload API can take
+// many files' worth of rows in a single call), then every file still
+// pending to WDGoWars (gzip per file -- it cannot accept an archive), then
+// every file still pending to Wardrift (same, per file). A file only moves
+// to /uploaded/ once every *configured* service has succeeded for it (see
+// UploadState.h); a failure against one service never blocks or re-triggers
+// the others for that file -- it just stays in /logs, retried next time
+// only against whichever service(s) are still pending.
+uint32_t uploadAllPending(int maxFiles) {
   if (!sdOk) { uploadLastResult = "SD not OK"; return 0; }
 
-  // Pause scanning during upload to avoid SD contention + WiFi scan interference
   uploadPausedScanWasEnabled = scanningEnabled;
   scanningEnabled = false;
 
@@ -1105,135 +1353,157 @@ uint32_t uploadAllCsvsToWigle(int maxFiles) {
   uploadCurrentFile = "";
   updateOLED(0);
 
-  // First pass: count
-  File root = SD.open("/logs");
-  if (root) {
-    File f = root.openNextFile();
-    while (f) {
-      String name = normalizeSdPath("/logs", f.name());
-      bool isCsv = name.endsWith(".csv");
-      bool isCurrent = (currentCsvPath.length() && name == currentCsvPath);
-      if (isCsv && !isCurrent) uploadTotalFiles++;
-      f.close();
-      f = root.openNextFile();
-    }
-    root.close();
-  }
+  std::vector<String> paths = collectEligibleCsvs(maxFiles);
 
-  if (uploadTotalFiles == 0) {
+  if (paths.empty()) {
     uploading = false;
     scanningEnabled = uploadPausedScanWasEnabled;
     uploadLastResult = "No CSVs to upload";
     return 0;
   }
 
-  // Skip token pre-check to avoid 30-45s delay at start of batch upload.
-  // If token is invalid, first upload will fail with 401/403.
-  // Note: wigleTokenStatus may be stale; web UI still validates on demand.
+  ensureGzScratchDir();
 
-  // Apply maxFiles limit if specified
-  uint32_t filesToUpload = uploadTotalFiles;
-  if (maxFiles > 0 && (uint32_t)maxFiles < uploadTotalFiles) {
-    filesToUpload = (uint32_t)maxFiles;
-    Serial.printf("[WiGLE] Limiting upload to %d of %d files (maxBootUploads)\n", 
-                  filesToUpload, uploadTotalFiles);
+  std::vector<FileUploadState> states(paths.size());
+  for (size_t i = 0; i < paths.size(); i++) {
+    states[i] = loadUploadState(pathBasename(paths[i]));
   }
-  
-  // Second pass: collect file paths first (avoid rename while dir handle is open)
-  std::vector<String> paths;
-  paths.reserve(uploadTotalFiles + 4);
 
-  root = SD.open("/logs");
-  if (root) {
-    File f = root.openNextFile();
-    while (f) {
-      String path = normalizeSdPath("/logs", f.name());
-      bool isCsv = path.endsWith(".csv");
-      bool isCurrent = (currentCsvPath.length() && path == currentCsvPath);
-      f.close();
+  // Progress (OLED/web UI) tracks individual upload ATTEMPTS across all three
+  // service phases, not "every configured service done for this file" -- a
+  // file can succeed WiGLE but still be mid-flight on WDGoWars/Wardrift, and
+  // the operator should see the bar/counter visibly tick forward on every
+  // attempt (success or fail), matching what the serial log shows, instead
+  // of sitting still until a file clears every service.
+  for (size_t i = 0; i < paths.size(); i++) {
+    if (!states[i].wigleDone)    uploadTotalFiles++;
+    if (!states[i].wdgwDone)     uploadTotalFiles++;
+    if (!states[i].wardriftDone) uploadTotalFiles++;
+  }
+  auto touchFile = [&](size_t /*idx*/) { uploadDoneFiles++; };
 
-      if (isCsv && !isCurrent) {
-        paths.push_back(path);
-        // Stop collecting if we've hit the limit
-        if (maxFiles > 0 && paths.size() >= filesToUpload) break;
+  // ---- Phase 1: WiGLE ----
+  if (cfg.wigleBasicToken.length() >= 8) {
+    std::vector<size_t> pendingIdx;
+    for (size_t i = 0; i < paths.size(); i++) if (!states[i].wigleDone) pendingIdx.push_back(i);
+
+    if (!pendingIdx.empty()) {
+      uploadTargetName = "WiGLE UL";
+
+      if (cfg.gzipUploads && pendingIdx.size() > 1) {
+        // One merged + gzip-compressed archive covering every pending file.
+        uploadCurrentFile = "(" + String(pendingIdx.size()) + " files)";
+        updateOLED(0);
+        std::vector<String> srcPaths;
+        for (size_t idx : pendingIdx) srcPaths.push_back(paths[idx]);
+        String scratch = gzScratchPathFor("wigle_batch");
+        bool ok = gzipCompressMergedFilesToFile(srcPaths, scratch) && uploadFileToWigle(scratch);
+        SD.remove(scratch);
+        if (ok) {
+          Serial.printf("[WiGLE] Merged archive OK -- %u file(s) marked done\n", (unsigned)pendingIdx.size());
+        } else {
+          Serial.printf("[WiGLE] Merged archive FAILED -- %u file(s) remain pending\n", (unsigned)pendingIdx.size());
+          uploadFailedFiles++;
+        }
+        for (size_t idx : pendingIdx) {
+          if (ok) { markServiceDone(pathBasename(paths[idx]), UploadService::Wigle); states[idx].wigleDone = true; }
+          touchFile(idx);
+        }
+      } else {
+        // Single pending file, or gzip disabled (can't merge multiple files
+        // into one request without compression) -- send one at a time.
+        for (size_t n = 0; n < pendingIdx.size(); n++) {
+          size_t idx = pendingIdx[n];
+          uploadCurrentFile = paths[idx];
+          updateOLED(0);
+          bool ok;
+          if (cfg.gzipUploads) {
+            String scratch = gzScratchPathFor(pathBasename(paths[idx]));
+            ok = gzipCompressFileToFile(paths[idx], scratch) && uploadFileToWigle(scratch);
+            SD.remove(scratch);
+          } else {
+            ok = uploadFileToWigle(paths[idx]);
+          }
+          if (ok) { markServiceDone(pathBasename(paths[idx]), UploadService::Wigle); states[idx].wigleDone = true; }
+          else uploadFailedFiles++;
+          touchFile(idx);
+          if (n + 1 < pendingIdx.size()) delay(1500);
+        }
       }
-
-      f = root.openNextFile();
     }
-    root.close();
   }
 
-  // Now upload + move with no directory handle open
+  // ---- Phase 2: WDGoWars (per file -- cannot accept an archive) ----
+  if (cfg.wdgwarsApiKey.length() >= 8) {
+    for (size_t i = 0; i < paths.size(); i++) {
+      if (states[i].wdgwDone) continue;
+      uploadTargetName = "WDGW UL";
+      uploadCurrentFile = paths[i];
+      updateOLED(0);
+      Serial.printf("[WDGWars] %s (heap free: %u bytes)\n", pathBasename(paths[i]).c_str(), (unsigned)ESP.getFreeHeap());
+
+      bool ok;
+      if (cfg.gzipUploads) {
+        String scratch = gzScratchPathFor(pathBasename(paths[i]));
+        ok = gzipCompressFileToFile(paths[i], scratch) && uploadFileToWdgwars(scratch);
+        SD.remove(scratch);
+      } else {
+        ok = uploadFileToWdgwars(paths[i]);
+      }
+      if (ok) { markServiceDone(pathBasename(paths[i]), UploadService::Wdgw); states[i].wdgwDone = true; }
+      else uploadFailedFiles++;
+      touchFile(i);
+      updateOLED(0);
+
+      bool morePending = (i + 1 < paths.size());
+      if (morePending) delay(1500);
+    }
+  }
+
+  // ---- Phase 3: Wardrift (per file -- cannot accept an archive) ----
+  if (cfg.wardriftApiKey.length() >= 8) {
+    for (size_t i = 0; i < paths.size(); i++) {
+      if (states[i].wardriftDone) continue;
+      uploadTargetName = "Wardrift UL";
+      uploadCurrentFile = paths[i];
+      updateOLED(0);
+      Serial.printf("[Wardrift] %s (heap free: %u bytes)\n", pathBasename(paths[i]).c_str(), (unsigned)ESP.getFreeHeap());
+
+      // Always sent uncompressed -- Wardrift's /v1/ingest/signals endpoint
+      // does not honor Content-Encoding: gzip (confirmed in the field: every
+      // gzip-compressed upload came back HTTP 400 "file did not contain
+      // supported signal rows" -- it was trying to parse the raw gzip bytes
+      // as CSV text -- even though the identical file succeeded against
+      // WDGoWars, which does support gzip). Ignore cfg.gzipUploads here.
+      bool ok = uploadFileToWardrift(paths[i]);
+      if (ok) { markServiceDone(pathBasename(paths[i]), UploadService::Wardrift); states[i].wardriftDone = true; }
+      else uploadFailedFiles++;
+      touchFile(i);
+      updateOLED(0);
+
+      bool morePending = (i + 1 < paths.size());
+      if (morePending) delay(1500);
+    }
+  }
+
+  // ---- Finalize: move fully-done files to /uploaded/ ----
   uint32_t okCount = 0;
   for (size_t i = 0; i < paths.size(); i++) {
-    uploadCurrentFile = paths[i];
-    updateOLED(0);
-    Serial.printf("[UPLOAD] File %u/%u: %s (heap free: %u bytes)\n",
-                  (unsigned)(i + 1), (unsigned)paths.size(),
-                  pathBasename(paths[i]).c_str(), (unsigned)ESP.getFreeHeap());
-
-    // Guard: skip and delete header-only files (no scan data worth uploading)
-    {
-      uint32_t emptySz = 0;
-      if (!csvHasDataRows(paths[i], &emptySz)) {
-        Serial.printf("[UPLOAD] Empty CSV (%u bytes, no data rows), deleting: %s\n",
-                      (unsigned)emptySz, pathBasename(paths[i]).c_str());
-        if (!SD.remove(paths[i])) {
-          Serial.printf("[UPLOAD] WARNING: SD.remove failed for %s -- file left in place\n", pathBasename(paths[i]).c_str());
-        }
-        uploadDoneFiles++;
-        updateOLED(0);
-        continue;
-      }
-    }
-
-    // Step 1: WDGoWars first (if API key configured)
-    bool wdgOk = false;
-    if (cfg.wdgwarsApiKey.length() >= 8) {
-      uploadTargetName = "WDGW UL";
-      updateOLED(0);
-      wdgOk = uploadFileToWdgwars(paths[i]);
-      if (!wdgOk) uploadFailedFiles++;
-      Serial.printf("[WDGWars] %s -> %s\n",
-                    pathBasename(paths[i]).c_str(), wdgOk ? "OK" : "FAIL");
-      if (i < paths.size() - 1 || cfg.wardriftApiKey.length() >= 8 || cfg.wigleBasicToken.length() >= 8)
-        delay(1500);  // brief settle between TLS sessions
-    }
-
-    // Step 2: Wardrift (if session token configured)
-    bool wardriftOk = false;
-    if (cfg.wardriftApiKey.length() >= 8) {
-      uploadTargetName = "Wardrift UL";
-      updateOLED(0);
-      wardriftOk = uploadFileToWardrift(paths[i]);
-      if (!wardriftOk) uploadFailedFiles++;
-      Serial.printf("[Wardrift] %s -> %s\n",
-                    pathBasename(paths[i]).c_str(), wardriftOk ? "OK" : "FAIL");
-      if (i < paths.size() - 1 || cfg.wigleBasicToken.length() >= 8)
-        delay(1500);  // brief settle between TLS sessions
-    }
-
-    // Step 3: WiGLE (if token configured)
-    bool wigleOk = false;
-    if (cfg.wigleBasicToken.length() >= 8) {
-      uploadTargetName = "WiGLE UL";
-      updateOLED(0);
-      wigleOk = uploadFileToWigle(paths[i]);
-      if (!wigleOk) uploadFailedFiles++;
-    }
-
-    // Move the file once at least one upload succeeded
-    if (wigleOk || wdgOk || wardriftOk) {
+    if (allConfiguredServicesDone(states[i])) {
       okCount++;
-      moveToUploaded(paths[i]);
-    }
-
-    uploadDoneFiles++;
-    updateOLED(0);
-
-    // Give TLS stack time to fully clean up between uploads
-    if (i < paths.size() - 1) {  // Don't delay after last file
-      delay(2000);
+      // Only clear the ledger entry once the move actually succeeds. Every
+      // configured service already succeeded for this file at this point --
+      // clearing the ledger unconditionally here (even when moveToUploaded()
+      // itself failed, e.g. a transient SD hiccup) made that look identical
+      // to "never uploaded" on the next run, which re-sent it to every
+      // service all over again. Leaving the entry intact just retries the
+      // move next time, with no re-upload.
+      if (moveToUploaded(paths[i])) {
+        clearUploadState(pathBasename(paths[i]));
+      } else {
+        Serial.printf("[UPLOAD] WARNING: moveToUploaded failed for %s -- file stays in /logs, ledger kept so it won't be re-uploaded\n",
+                      pathBasename(paths[i]).c_str());
+      }
     }
   }
 
@@ -1241,14 +1511,20 @@ uint32_t uploadAllCsvsToWigle(int maxFiles) {
   uploadTargetName = "";
   scanningEnabled = uploadPausedScanWasEnabled;
   uploadCurrentFile = "";
+  uploadDoneFiles = uploadTotalFiles;  // guarantee the OLED/UI see a finished progress bar
   updateOLED(0);
 
-  uploadLastResult = "Uploaded " + String(okCount) + "/" + String(uploadTotalFiles);
+  // uploadTotalFiles is the attempts-based progress denominator above, not
+  // the distinct file count -- use paths.size() here so this summary reads
+  // naturally ("Uploaded 23/25" rather than counting every per-service try).
+  uploadLastResult = "Uploaded " + String(okCount) + "/" + String(paths.size());
   return okCount;
 }
 
 // ---- WDGoWars-only batch upload (called from web UI button) ----
-// Uploads all completed CSVs to WDGoWars only, then moves them.
+// Uploads every file still pending for WDGoWars (gzip per file, same as
+// the combined orchestrator's Phase 2), then moves any file that now has
+// every *configured* service done -- not just WDGoWars -- to /uploaded/.
 
 uint32_t uploadAllCsvsToWdgwars(int maxFiles) {
   if (!sdOk) { uploadLastResult = "SD not OK"; return 0; }
@@ -1264,75 +1540,50 @@ uint32_t uploadAllCsvsToWdgwars(int maxFiles) {
   uploadCurrentFile = "";
   updateOLED(0);
 
-  // Count eligible files
-  File root = SD.open("/logs");
-  if (root) {
-    File f = root.openNextFile();
-    while (f) {
-      String name = normalizeSdPath("/logs", f.name());
-      if (name.endsWith(".csv") && !(currentCsvPath.length() && name == currentCsvPath))
-        uploadTotalFiles++;
-      f.close(); f = root.openNextFile();
-    }
-    root.close();
-  }
+  std::vector<String> paths = collectEligibleCsvs(maxFiles);
+  uploadTotalFiles = (uint32_t)paths.size();
 
-  if (uploadTotalFiles == 0) {
+  if (paths.empty()) {
     uploading = false; uploadTargetName = "";
     scanningEnabled = uploadPausedScanWasEnabled;
     uploadLastResult = "No CSVs to upload";
     return 0;
   }
 
-  uint32_t filesToUpload = uploadTotalFiles;
-  if (maxFiles > 0 && (uint32_t)maxFiles < uploadTotalFiles)
-    filesToUpload = (uint32_t)maxFiles;
-
-  std::vector<String> paths;
-  paths.reserve(filesToUpload + 2);
-  root = SD.open("/logs");
-  if (root) {
-    File f = root.openNextFile();
-    while (f) {
-      String path = normalizeSdPath("/logs", f.name());
-      bool isCsv = path.endsWith(".csv");
-      bool isCurrent = (currentCsvPath.length() && path == currentCsvPath);
-      f.close();
-      if (isCsv && !isCurrent) {
-        paths.push_back(path);
-        if (maxFiles > 0 && paths.size() >= filesToUpload) break;
-      }
-      f = root.openNextFile();
-    }
-    root.close();
-  }
+  ensureGzScratchDir();
 
   uint32_t okCount = 0;
   for (size_t i = 0; i < paths.size(); i++) {
     uploadCurrentFile = paths[i];
     updateOLED(0);
-    Serial.printf("[UPLOAD] File %u/%u: %s (heap free: %u bytes)\n",
-                  (unsigned)(i + 1), (unsigned)paths.size(),
-                  pathBasename(paths[i]).c_str(), (unsigned)ESP.getFreeHeap());
 
-    // Guard: skip and delete header-only files
-    {
-      uint32_t emptySz = 0;
-      if (!csvHasDataRows(paths[i], &emptySz)) {
-        Serial.printf("[UPLOAD] Empty CSV (%u bytes, no data rows), deleting: %s\n",
-                      (unsigned)emptySz, pathBasename(paths[i]).c_str());
-        if (!SD.remove(paths[i])) {
-          Serial.printf("[UPLOAD] WARNING: SD.remove failed for %s -- file left in place\n", pathBasename(paths[i]).c_str());
-        }
-        uploadDoneFiles++;
-        updateOLED(0);
-        continue;
+    String basename = pathBasename(paths[i]);
+    FileUploadState st = loadUploadState(basename);
+    if (!st.wdgwDone) {
+      Serial.printf("[UPLOAD] File %u/%u: %s (heap free: %u bytes)\n",
+                    (unsigned)(i + 1), (unsigned)paths.size(), basename.c_str(), (unsigned)ESP.getFreeHeap());
+      bool ok;
+      if (cfg.gzipUploads) {
+        String scratch = gzScratchPathFor(basename);
+        ok = gzipCompressFileToFile(paths[i], scratch) && uploadFileToWdgwars(scratch);
+        SD.remove(scratch);
+      } else {
+        ok = uploadFileToWdgwars(paths[i]);
       }
+      if (ok) { markServiceDone(basename, UploadService::Wdgw); st.wdgwDone = true; }
+      else uploadFailedFiles++;
     }
 
-    bool ok = uploadFileToWdgwars(paths[i]);
-    if (ok) { okCount++; moveToUploaded(paths[i]); }
-    else    { uploadFailedFiles++; }
+    if (allConfiguredServicesDone(st)) {
+      okCount++;
+      // See the matching comment in uploadAllPending()'s finalize loop --
+      // only clear the ledger once the move actually succeeds.
+      if (moveToUploaded(paths[i])) {
+        clearUploadState(basename);
+      } else {
+        Serial.printf("[UPLOAD] WARNING: moveToUploaded failed for %s -- file stays in /logs, ledger kept\n", basename.c_str());
+      }
+    }
     uploadDoneFiles++;
     updateOLED(0);
     if (i < paths.size() - 1) delay(1500);
@@ -1349,7 +1600,7 @@ uint32_t uploadAllCsvsToWdgwars(int maxFiles) {
 }
 
 // ---- Wardrift-only batch upload (called from web UI button) ----
-// Uploads all completed CSVs to Wardrift only, then moves them.
+// Same shape as uploadAllCsvsToWdgwars() above, for Wardrift.
 
 uint32_t uploadAllCsvsToWardrift(int maxFiles) {
   if (!sdOk) { uploadLastResult = "SD not OK"; return 0; }
@@ -1365,73 +1616,46 @@ uint32_t uploadAllCsvsToWardrift(int maxFiles) {
   uploadCurrentFile = "";
   updateOLED(0);
 
-  File root = SD.open("/logs");
-  if (root) {
-    File f = root.openNextFile();
-    while (f) {
-      String name = normalizeSdPath("/logs", f.name());
-      if (name.endsWith(".csv") && !(currentCsvPath.length() && name == currentCsvPath))
-        uploadTotalFiles++;
-      f.close(); f = root.openNextFile();
-    }
-    root.close();
-  }
+  std::vector<String> paths = collectEligibleCsvs(maxFiles);
+  uploadTotalFiles = (uint32_t)paths.size();
 
-  if (uploadTotalFiles == 0) {
+  if (paths.empty()) {
     uploading = false; uploadTargetName = "";
     scanningEnabled = uploadPausedScanWasEnabled;
     uploadLastResult = "No CSVs to upload";
     return 0;
   }
 
-  uint32_t filesToUpload = uploadTotalFiles;
-  if (maxFiles > 0 && (uint32_t)maxFiles < uploadTotalFiles)
-    filesToUpload = (uint32_t)maxFiles;
-
-  std::vector<String> paths;
-  paths.reserve(filesToUpload + 2);
-  root = SD.open("/logs");
-  if (root) {
-    File f = root.openNextFile();
-    while (f) {
-      String path = normalizeSdPath("/logs", f.name());
-      bool isCsv = path.endsWith(".csv");
-      bool isCurrent = (currentCsvPath.length() && path == currentCsvPath);
-      f.close();
-      if (isCsv && !isCurrent) {
-        paths.push_back(path);
-        if (maxFiles > 0 && paths.size() >= filesToUpload) break;
-      }
-      f = root.openNextFile();
-    }
-    root.close();
-  }
+  ensureGzScratchDir();
 
   uint32_t okCount = 0;
   for (size_t i = 0; i < paths.size(); i++) {
     uploadCurrentFile = paths[i];
     updateOLED(0);
-    Serial.printf("[UPLOAD] File %u/%u: %s (heap free: %u bytes)\n",
-                  (unsigned)(i + 1), (unsigned)paths.size(),
-                  pathBasename(paths[i]).c_str(), (unsigned)ESP.getFreeHeap());
 
-    {
-      uint32_t emptySz = 0;
-      if (!csvHasDataRows(paths[i], &emptySz)) {
-        Serial.printf("[UPLOAD] Empty CSV (%u bytes, no data rows), deleting: %s\n",
-                      (unsigned)emptySz, pathBasename(paths[i]).c_str());
-        if (!SD.remove(paths[i])) {
-          Serial.printf("[UPLOAD] WARNING: SD.remove failed for %s -- file left in place\n", pathBasename(paths[i]).c_str());
-        }
-        uploadDoneFiles++;
-        updateOLED(0);
-        continue;
-      }
+    String basename = pathBasename(paths[i]);
+    FileUploadState st = loadUploadState(basename);
+    if (!st.wardriftDone) {
+      Serial.printf("[UPLOAD] File %u/%u: %s (heap free: %u bytes)\n",
+                    (unsigned)(i + 1), (unsigned)paths.size(), basename.c_str(), (unsigned)ESP.getFreeHeap());
+      // Always sent uncompressed -- see the matching comment in
+      // uploadAllPending()'s Phase 3 for why (Wardrift doesn't honor
+      // Content-Encoding: gzip on this endpoint).
+      bool ok = uploadFileToWardrift(paths[i]);
+      if (ok) { markServiceDone(basename, UploadService::Wardrift); st.wardriftDone = true; }
+      else uploadFailedFiles++;
     }
 
-    bool ok = uploadFileToWardrift(paths[i]);
-    if (ok) { okCount++; moveToUploaded(paths[i]); }
-    else    { uploadFailedFiles++; }
+    if (allConfiguredServicesDone(st)) {
+      okCount++;
+      // See the matching comment in uploadAllPending()'s finalize loop --
+      // only clear the ledger once the move actually succeeds.
+      if (moveToUploaded(paths[i])) {
+        clearUploadState(basename);
+      } else {
+        Serial.printf("[UPLOAD] WARNING: moveToUploaded failed for %s -- file stays in /logs, ledger kept\n", basename.c_str());
+      }
+    }
     uploadDoneFiles++;
     updateOLED(0);
     if (i < paths.size() - 1) delay(1500);

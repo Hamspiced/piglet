@@ -3,7 +3,11 @@
 
 bool     wigleTestToken();
 bool     uploadFileToWigle(const String& path);
-uint32_t uploadAllCsvsToWigle(int maxFiles = -1);  // -1 = no limit
+// Combined, service-major batch upload: WiGLE (merged + gzip archive) ->
+// WDGoWars (gzip per file) -> Wardrift (gzip per file), tracking per-file
+// per-service completion so a failure against one service never blocks or
+// re-triggers the others for that file. -1 = no file-count limit.
+uint32_t uploadAllPending(int maxFiles = -1);
 void     deleteEmptyCsvs();  // scan /logs and delete header-only files
 
 // WDGoWars upload (wdgwars.pl) — uses X-API-Key header, /api/upload-csv

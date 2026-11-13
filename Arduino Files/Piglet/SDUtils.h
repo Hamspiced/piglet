@@ -14,6 +14,14 @@ String pathBasename(const String& p);
 bool   isAllowedDataPath(const String& p);
 bool   moveToUploaded(const String& srcPath);
 
+// True for dot-prefixed entries (e.g. "/logs/.gzscratch", "/logs/.upload_state.cfg")
+// -- internal housekeeping, never user wardriving data. Both the upload path
+// (collectEligibleCsvs()) and "Delete All" (handleDeleteAll()) use this so
+// neither one ever reads, uploads, or deletes the gzip scratch directory or
+// the per-file upload-ledger, regardless of what extension (if any) a future
+// housekeeping file ends up using.
+bool isHiddenSdEntry(const String& basename);
+
 // Negotiates the fastest working SD-over-SPI clock: tries a descending
 // ladder of speeds (capped by cfg.sdMaxSpiHz) via SD.begin(csPin, SPI, hz)
 // and stops at the first one that mounts successfully. Assumes SPI.begin()

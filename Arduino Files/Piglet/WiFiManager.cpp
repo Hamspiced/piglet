@@ -21,7 +21,16 @@ void handleStaTransitions() {
     WiFi.persistent(false);
     // Soft disconnect to stop any in-progress reconnect attempt.
     // eraseap=false preserves NVS credentials for next boot.
-    WiFi.disconnect(true, false);
+    // wifioff MUST be false here: true calls STA.end(), which tears down
+    // the STA network interface while the WebServer (server.handleClient()
+    // runs every loop() iteration and never stops) may still have a client
+    // connected through it. That previously crashed with a Guru Meditation
+    // Instruction access fault (MEPC=0) inside esp_pbuf_free() ->
+    // esp_netif_free_rx_buffer() -- lwIP freeing a receive buffer that
+    // referenced the just-destroyed interface. Disconnecting without the
+    // radio-off still achieves "idle STA, ready for scanning" together with
+    // setAutoReconnect(false) above.
+    WiFi.disconnect(false, false);
     delay(50);
     WiFi.mode(WIFI_STA);  // clean idle STA state ready for scanning
 
@@ -217,10 +226,13 @@ void stopAPIfAllowed() {
     apExtended = false;
     apForceClose = false;
 
-    // After AP shuts down, ensure STA is NOT trying to reconnect to home WiFi
+    // After AP shuts down, ensure STA is NOT trying to reconnect to home WiFi.
+    // wifioff=false -- see the matching comment in handleStaTransitions()
+    // above for why tearing down the STA netif here can crash the
+    // still-running WebServer.
     WiFi.setAutoReconnect(false);
     WiFi.persistent(false);
-    WiFi.disconnect(true, true);
+    WiFi.disconnect(false, true);
     delay(50);
 
     // If STA is not connected, keep WiFi in STA-only mode
@@ -287,7 +299,10 @@ void checkHomeNetworkReturn() {
     Serial.println("[WIFI] Home network connect failed -- resuming wardriving");
     WiFi.setAutoReconnect(false);
     WiFi.persistent(false);
-    WiFi.disconnect(true, false);  // eraseap=false keeps NVS credentials
+    // wifioff=false -- see the matching comment in handleStaTransitions()
+    // for why tearing down the STA netif here can crash the still-running
+    // WebServer.
+    WiFi.disconnect(false, false);  // eraseap=false keeps NVS credentials
     delay(50);
     WiFi.mode(WIFI_STA);           // idle STA ready for scanning
     return;
@@ -304,7 +319,7 @@ void checkHomeNetworkReturn() {
     if (hasWdg)   Serial.print("WDGoWars ");
     if (hasWigle) Serial.print("WiGLE ");
     Serial.println();
-    uint32_t uploaded = uploadAllCsvsToWigle(cfg.maxBootUploads);
+    uint32_t uploaded = uploadAllPending(cfg.maxBootUploads);
     Serial.printf("[UPLOAD] Done: %d files moved\n", uploaded);
   } else {
     Serial.println("[UPLOAD] Skipped (SD not ready, no tokens set, or maxBootUploads=0)");

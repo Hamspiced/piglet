@@ -1,5 +1,6 @@
 #include "SDUtils.h"
 #include "Globals.h"
+#include "GPS.h"
 
 // ---- Path helpers ----
 
@@ -49,6 +50,10 @@ String normalizeSdPath(const char* dir, const char* nameIn) {
 
 bool isAllowedDataPath(const String& p) {
   return p.startsWith("/logs/") || p.startsWith("/uploaded/");
+}
+
+bool isHiddenSdEntry(const String& basename) {
+  return basename.length() > 0 && basename[0] == '.';
 }
 
 // ---- SD clock negotiation ----
@@ -323,6 +328,17 @@ bool appendWigleRow(const String& mac, const String& ssid, const String& auth,
                     const String& firstSeen, int channel, int rssi,
                     double lat, double lon, double altM, double accM) {
   if (!sdOk || !logFile) return false;
+
+  // Final backstop: never persist Null Island (0,0), an out-of-range
+  // coordinate, or a non-finite value from corrupted GPS data -- regardless
+  // of what any caller already thinks it validated. See gpsCoordIsValid()
+  // (GPS.cpp). Scanner.cpp's processScanResults() is expected to already
+  // skip calling this at all when it has no trustworthy position, so this
+  // firing is itself a signal something upstream needs a look.
+  if (!gpsCoordIsValid(lat, lon)) {
+    Serial.printf("[SD] appendWigleRow: rejected invalid coordinate (%.6f, %.6f) -- row not written\n", lat, lon);
+    return false;
+  }
 
   // Network whitelist: skip logging any SSID the user has explicitly listed
   // (e.g. their own home/work network). Exact, case-sensitive match against
