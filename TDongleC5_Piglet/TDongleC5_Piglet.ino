@@ -103,7 +103,7 @@ struct FileUploadState {
 };
 
 // Firmware version
-#define FIRMWARE_VERSION "v3.03"
+#define FIRMWARE_VERSION "v3.04"
 
 // ---------------- Pins (T-DONGLE C5) ----------------
 struct PinMap {
@@ -2485,6 +2485,12 @@ static const char* pickSplashSlogan() {
 static void tftDrawCentered(int y, const char* txt, int textSize) {
   if (!txt) return;
   tft.setTextSize(textSize);
+  // Text wrap defaults to on in Adafruit_GFX -- a string wider than the
+  // panel (easy to hit on this 80px-wide portrait screen) would otherwise
+  // wrap onto the lines below instead of just running off the right edge,
+  // directly colliding with whatever text another fixed-Y tftDrawCentered()
+  // call already placed there.
+  tft.setTextWrap(false);
   int tw = tftTextWidth(txt, textSize);
   int x = (tft.width() - tw) / 2;
   if (x < 0) x = 0;
@@ -7995,12 +8001,22 @@ static void pollButton() {
 static void runFirmwareUpdateBootMode() {
   Serial.println("[BOOT] Pending download found -- entering dedicated download-only boot mode");
 
+  // Each line gets its own fixed Y position with generous spacing and is
+  // truncated to what actually fits in this 80px-wide portrait panel at
+  // text size 1 (13 chars) -- fwDownloadStage in particular can run well
+  // past that (e.g. "Waiting for memory to free up (29s)..."), and letting
+  // it wrap (tftDrawCentered() now disables wrap too, as a second layer of
+  // protection) used to run straight into the line below.
   auto showMsg = [&](const String& l1, const String& l2 = "", const String& l3 = "") {
+    auto trunc = [](String s) -> String {
+      if (s.length() > 13) s = s.substring(0, 13);
+      return s;
+    };
     tft.fillScreen(BLACK);
     tft.setTextColor(WHITE, BLACK);
-    tftDrawCentered(20, l1.c_str(), 1);
-    tftDrawCentered(35, l2.c_str(), 1);
-    tftDrawCentered(50, l3.c_str(), 1);
+    tftDrawCentered(20, trunc(l1).c_str(), 1);
+    tftDrawCentered(40, trunc(l2).c_str(), 1);
+    tftDrawCentered(60, trunc(l3).c_str(), 1);
   };
 
   showMsg("Connecting to WiFi", "for firmware update...");
@@ -8030,9 +8046,10 @@ static void runFirmwareUpdateBootMode() {
       lastDisp = millis();
       String pct = "";
       if (fwDownloadTotalBytes > 0) {
-        pct = String((int)(((uint64_t)fwDownloadedBytes * 100) / fwDownloadTotalBytes)) + "%";
+        int p = (int)(((uint64_t)fwDownloadedBytes * 100) / fwDownloadTotalBytes);
+        pct = String(p) + "%";  // screen is too narrow for the byte counts too -- see Serial for those
       }
-      showMsg("Updating firmware...", fwDownloadStage, pct);
+      showMsg("Updating...", fwDownloadStage, pct);
     }
 
     if (fwDownloaded) {

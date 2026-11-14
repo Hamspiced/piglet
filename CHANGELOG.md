@@ -1,5 +1,20 @@
 # Changelog
 
+## v3.04 (2026-11-14)
+
+### New Features
+- **Self-update now runs as a dedicated, memory-optimized boot mode** -- pressing the on-device "Download & Install" button no longer downloads firmware in the current session. Instead it saves the resolved release asset URL to the SD card and reboots into a dedicated download-only boot mode that skips GPS, the boot-upload flow, mesh preload, and the normal Web UI entirely, so the download's HTTPS connection is the very first (and only) TLS operation of that boot -- giving it the healthiest possible slice of the ESP32-C5's narrow DMA-capable heap instead of inheriting whatever the version-check's own TLS call already used up earlier in the session. Live progress (stage + percentage) is shown on the OLED/TFT throughout; the device installs and reboots automatically on success, or falls back to a normal boot if it ultimately can't connect.
+- **Firmware downloads wait for memory to settle and retry automatically** -- before attempting the HTTPS connection, the device now pauses WiFi scanning, WDGoWars background job polling, and GPS diagnostic serial logging (all confirmed to compete for the same narrow `MALLOC_CAP_DMA` heap pool), and waits up to 30 seconds for that pool to recover before connecting. If an attempt still fails, it now automatically retries the whole sequence (up to 12 attempts, 8 seconds apart) instead of giving up on the first error -- important since the on-device boot-mode flow has nobody watching a browser to click "try again".
+- **GPS coordinates are validated before being cached or logged** -- exact 0,0 ("Null Island", a real location in the Gulf of Guinea and almost certainly a GPS-less placeholder for this device), out-of-range, and non-finite values are now rejected at three layers (the position cache, scan logging, and a final backstop in the CSV writer), so a bad or missing fix can never end up written as a bogus location.
+- **"Delete Staged Firmware Files" Web UI button** -- clears a stuck or partial download from `/Firmware/` on the SD card without needing to pull the card, via a new `/update/clearFirmware` endpoint.
+
+### Bug Fixes
+- **On-device update screen text could overlap and hide the download percentage** -- the download-only boot mode's OLED/TFT status text chained lines with auto-advancing cursors (OLED) or let long status strings word-wrap into the line below (T-Dongle C5's narrower screen), so a long stage message (e.g. "Waiting for memory to free up (29s)...") could push the percentage line off-screen or draw directly over it. Each line now has its own fixed position, is truncated to what actually fits the screen width, and disables text wrap, so the layout stays stable and the live download percentage (plus KB counts on the main Piglet's larger OLED) is always visible, matching the detail already shown on the Serial console.
+
+Applied to both the main Piglet firmware and the T-Dongle C5 standalone firmware.
+
+---
+
 ## v3.03 (2026-11-05)
 
 ### Bug Fixes

@@ -279,15 +279,25 @@ static void pollButton() {
 static void runFirmwareUpdateBootMode(bool lcdOk) {
   Serial.println("[BOOT] Pending download found -- entering dedicated download-only boot mode");
 
+  // Each line gets its own fixed Y position (not chained println() calls)
+  // and is truncated to what actually fits in 128px at text size 1 (21
+  // chars) with wrap explicitly disabled -- fwDownloadStage in particular
+  // can run well past that (e.g. "Waiting for memory to free up (29s)..."),
+  // and letting it wrap pushed later lines down/off-screen and made the
+  // whole layout look like it was overlapping.
   auto showMsg = [&](const String& l1, const String& l2 = "", const String& l3 = "") {
     if (!lcdOk) return;
+    auto trunc = [](String s) -> String {
+      if (s.length() > 21) s = s.substring(0, 21);
+      return s;
+    };
     display.clearDisplay();
     display.setTextColor(SSD1306_WHITE);
     display.setTextSize(1);
-    display.setCursor(0, 10);
-    display.println(l1);
-    display.println(l2);
-    display.println(l3);
+    display.setTextWrap(false);
+    display.setCursor(0, 8);  display.print(trunc(l1));
+    display.setCursor(0, 28); display.print(trunc(l2));
+    display.setCursor(0, 48); display.print(trunc(l3));
     display.display();
   };
 
@@ -318,7 +328,10 @@ static void runFirmwareUpdateBootMode(bool lcdOk) {
       lastDisp = millis();
       String pct = "";
       if (fwDownloadTotalBytes > 0) {
-        pct = String((int)(((uint64_t)fwDownloadedBytes * 100) / fwDownloadTotalBytes)) + "%";
+        int p = (int)(((uint64_t)fwDownloadedBytes * 100) / fwDownloadTotalBytes);
+        // Mirrors the Serial log's "Downloaded NN% (x / y bytes)" line, just
+        // compacted to KB so it fits the screen.
+        pct = String(p) + "%  " + String(fwDownloadedBytes / 1024) + "/" + String(fwDownloadTotalBytes / 1024) + "KB";
       }
       showMsg("Updating firmware...", fwDownloadStage, pct);
     }
