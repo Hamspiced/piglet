@@ -6763,6 +6763,63 @@ static void fwDownloadCancel() {
   fwDl.phase      = FwDlPhase::Idle;
 }
 
+// ---- Dedicated reboot-into-download-mode ----
+// fwCheckForUpdate()'s own TLS call to the GitHub API permanently degrades
+// this boot's MALLOC_CAP_DMA heap pool the moment it runs, so any download
+// attempted later *in the same boot* always inherits that already-degraded
+// pool, no matter how long after boot it runs. The only way to give the
+// download a genuinely fresh pool is to make it the first TLS operation of
+// a *different* boot. The status page's button press saves the already-
+// resolved asset URL/version here and reboots instead of downloading
+// in-session; a dedicated boot-time check (see setup()'s
+// runFirmwareUpdateBootMode()) resumes it before anything else touches TLS.
+// Kept at SD root, not inside /Firmware/, so it's never confused with a
+// staged release-asset binary.
+static const char* FW_PENDING_DL_PATH = "/otapending.cfg";
+
+static bool fwHasPendingDownload() {
+  return sdOk && SD.exists(FW_PENDING_DL_PATH);
+}
+
+static void fwSavePendingDownload() {
+  if (!sdOk || fwOwnAssetUrl.length() == 0) return;
+  if (SD.exists(FW_PENDING_DL_PATH)) SD.remove(FW_PENDING_DL_PATH);
+  File f = SD.open(FW_PENDING_DL_PATH, FILE_WRITE);
+  if (!f) return;
+  f.print("url="); f.println(fwOwnAssetUrl);
+  f.print("ver="); f.println(fwAvailableVersion);
+  f.flush();
+  f.close();
+}
+
+static void fwClearPendingDownload() {
+  if (sdOk && SD.exists(FW_PENDING_DL_PATH)) SD.remove(FW_PENDING_DL_PATH);
+}
+
+static bool fwResumePendingDownload() {
+  if (!sdOk || !SD.exists(FW_PENDING_DL_PATH)) return false;
+
+  File f = SD.open(FW_PENDING_DL_PATH, FILE_READ);
+  if (!f) return false;
+
+  String url, ver;
+  while (f.available()) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if (line.startsWith("url=")) url = line.substring(4);
+    else if (line.startsWith("ver=")) ver = line.substring(4);
+  }
+  f.close();
+
+  if (url.length() == 0) return false;
+
+  fwOwnAssetUrl      = url;
+  fwAvailableVersion = ver;
+  fwUpdateAvailable  = true;
+  fwDownloadStart();
+  return fwDownloading;
+}
+
 // Deletes every file in /Firmware/ on the SD card -- this board's own
 // downloaded-but-not-yet-installed image, plus anything staged for the mesh
 // Core-push engine. Lets the operator clear out a stuck/partial download (or
@@ -7896,13 +7953,22 @@ static void pollButton() {
       Serial.println("[BTN] Press -> restarting to install firmware update");
       ESP.restart();
     } else if (currentPage == 0 && fwUpdateAvailable && !fwDownloading && !fwDownloaded && !fwInstalling) {
-      // Status page is showing the "Firmware update available" banner --
-      // a single press starts the on-device download instead of advancing
-      // pages. Driven entirely from the TFT/button, no Web UI involved, so
-      // there's no browser polling traffic competing with the download's
-      // TLS session for the same narrow DMA-capable heap pool.
-      Serial.println("[BTN] Press -> starting on-device firmware download");
-      fwDownloadStart();
+      // Status page is showing the "Firmware update available" banner.
+      // Rather than download in-session, save the already-resolved asset
+      // URL and reboot into a dedicated download-only boot mode (see
+      // runFirmwareUpdateBootMode()) -- fwCheckForUpdate() already spent
+      // this boot's pristine DMA-capable heap pool on the version check, so
+      // any in-session download would inherit that already-degraded pool
+      // no matter how long after boot it ran. A fresh boot gives the
+      // download its own untouched pool instead.
+      Serial.println("[BTN] Press -> saving pending update and rebooting into download mode");
+      fwSavePendingDownload();
+      tft.fillScreen(BLACK);
+      tft.setTextColor(WHITE, BLACK);
+      tftDrawCentered(30, "Rebooting to", 1);
+      tftDrawCentered(45, "download update...", 1);
+      delay(500);
+      ESP.restart();
     } else {
       // Single (or unrecognised multi) press -> advance page
       advancePage();
@@ -7912,6 +7978,90 @@ static void pollButton() {
   }
 }
 
+
+// ================================================================
+//  Dedicated download-only boot mode
+//  Entered instead of the normal rest of setup()/loop() when a pending-
+//  download marker is found on the SD card (saved by the status page's
+//  button press -- see pollButton()). Skips fwCheckForUpdate(), GPS, the
+//  normal boot-upload flow, mesh preload, and the normal Web UI entirely,
+//  so the download's TLS session is the very first (and only) TLS
+//  operation this boot performs, giving it the healthiest possible
+//  MALLOC_CAP_DMA heap pool instead of inheriting whatever a Check-for-
+//  Update call already left behind. Never returns: every path ends in
+//  ESP.restart(), either into the newly installed firmware on success, or
+//  back to a normal boot on failure/giving up.
+// ================================================================
+static void runFirmwareUpdateBootMode() {
+  Serial.println("[BOOT] Pending download found -- entering dedicated download-only boot mode");
+
+  auto showMsg = [&](const String& l1, const String& l2 = "", const String& l3 = "") {
+    tft.fillScreen(BLACK);
+    tft.setTextColor(WHITE, BLACK);
+    tftDrawCentered(20, l1.c_str(), 1);
+    tftDrawCentered(35, l2.c_str(), 1);
+    tftDrawCentered(50, l3.c_str(), 1);
+  };
+
+  showMsg("Connecting to WiFi", "for firmware update...");
+
+  WiFi.mode(WIFI_STA);
+  bool staOk = connectSTA(15000);
+  if (!staOk) {
+    Serial.println("[BOOT] Download mode: STA connect failed -- returning to normal boot");
+    showMsg("WiFi connect failed.", "Returning to normal", "boot...");
+    fwClearPendingDownload();
+    delay(2000);
+    ESP.restart();
+  }
+
+  if (!fwResumePendingDownload()) {
+    Serial.println("[BOOT] Download mode: could not resume pending download -- returning to normal boot");
+    fwClearPendingDownload();
+    delay(1000);
+    ESP.restart();
+  }
+
+  uint32_t lastDisp = 0;
+  while (true) {
+    fwDownloadTick();
+
+    if (millis() - lastDisp > 300) {
+      lastDisp = millis();
+      String pct = "";
+      if (fwDownloadTotalBytes > 0) {
+        pct = String((int)(((uint64_t)fwDownloadedBytes * 100) / fwDownloadTotalBytes)) + "%";
+      }
+      showMsg("Updating firmware...", fwDownloadStage, pct);
+    }
+
+    if (fwDownloaded) {
+      Serial.println("[BOOT] Download mode: download complete -- installing");
+      showMsg("Download complete.", "Installing...", "Do not power off.");
+      // Clear the pending-download marker before attempting the install --
+      // if the install itself fails or is interrupted, the normal boot's
+      // own staged-install check (which deletes a bad file on failure)
+      // takes over from here instead of this mode re-downloading from
+      // scratch.
+      fwClearPendingDownload();
+      fwInstallFromSD();  // restarts on success; only returns on failure
+      Serial.printf("[BOOT] Download mode: install failed: %s -- returning to normal boot\n", fwInstallError.c_str());
+      showMsg("Install failed.", "Returning to normal", "boot...");
+      delay(2000);
+      ESP.restart();
+    }
+
+    if (!fwDownloading && fwDownloadError.length() > 0) {
+      Serial.printf("[BOOT] Download mode: gave up -- %s -- returning to normal boot\n", fwDownloadError.c_str());
+      showMsg("Update failed:", fwDownloadError, "Returning to normal boot");
+      fwClearPendingDownload();
+      delay(3000);
+      ESP.restart();
+    }
+
+    delay(10);
+  }
+}
 
 // ================================================================
 //  setup()
@@ -7991,6 +8141,15 @@ void setup() {
     File test = SD.open("/logs");
     if (test) test.close();
     else { sdOk = false; ledRed(); }
+  }
+
+  // Dedicated download-only boot mode: the status page's button press now
+  // saves the resolved asset URL and reboots instead of downloading
+  // in-session (see pollButton()), so this check must run before anything
+  // else gets a chance to use TLS (including the normal fwCheckForUpdate()
+  // call further down). Never returns if taken.
+  if (fwHasPendingDownload()) {
+    runFirmwareUpdateBootMode();
   }
 
   // Resume an on-device firmware update staged by a previous session: the

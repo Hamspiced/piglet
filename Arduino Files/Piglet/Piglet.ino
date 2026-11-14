@@ -217,13 +217,25 @@ static void pollButton() {
       Serial.println("[BTN] Press -> restarting to install firmware update");
       ESP.restart();
     } else if (currentPage == 0 && fwUpdateAvailable && !fwDownloading && !fwDownloaded && !fwInstalling) {
-      // Status page is showing the "Firmware update available" banner --
-      // a single press starts the on-device download instead of cycling
-      // pages. Driven entirely from the OLED/button, no Web UI involved, so
-      // there's no browser polling traffic competing with the download's
-      // TLS session for the same narrow DMA-capable heap pool.
-      Serial.println("[BTN] Press -> starting on-device firmware download");
-      fwDownloadStart();
+      // Status page is showing the "Firmware update available" banner.
+      // Rather than download in-session, save the already-resolved asset
+      // URL and reboot into a dedicated download-only boot mode (see
+      // runFirmwareUpdateBootMode()) -- fwCheckForUpdate() already spent
+      // this boot's pristine DMA-capable heap pool on the version check, so
+      // any in-session download would inherit that already-degraded pool
+      // no matter how long after boot it ran. A fresh boot gives the
+      // download its own untouched pool instead.
+      Serial.println("[BTN] Press -> saving pending update and rebooting into download mode");
+      fwSavePendingDownload();
+      display.clearDisplay();
+      display.setTextColor(SSD1306_WHITE);
+      display.setTextSize(1);
+      display.setCursor(0, 20);
+      display.println("Rebooting to");
+      display.println("download update...");
+      display.display();
+      delay(500);
+      ESP.restart();
     } else if (clickCount >= 2 && currentPage == 5) {
       // Double press on Mesh Node/Core page -> toggle the Wardrive Go BLE
       // bridge immediately (mesh mode is already active on this page) and
@@ -248,6 +260,94 @@ static void pollButton() {
       onPageChange(oldPage, currentPage);
     }
     clickCount = 0;
+  }
+}
+
+// ================================================================
+//  Dedicated download-only boot mode
+//  Entered instead of the normal rest of setup()/loop() when a pending-
+//  download marker is found on the SD card (saved by the status page's
+//  button press -- see pollButton()). Skips fwCheckForUpdate(), GPS, the
+//  normal boot-upload flow, mesh preload, and the normal Web UI entirely,
+//  so the download's TLS session is the very first (and only) TLS
+//  operation this boot performs, giving it the healthiest possible
+//  MALLOC_CAP_DMA heap pool instead of inheriting whatever a Check-for-
+//  Update call already left behind. Never returns: every path ends in
+//  ESP.restart(), either into the newly installed firmware on success, or
+//  back to a normal boot on failure/giving up.
+// ================================================================
+static void runFirmwareUpdateBootMode(bool lcdOk) {
+  Serial.println("[BOOT] Pending download found -- entering dedicated download-only boot mode");
+
+  auto showMsg = [&](const String& l1, const String& l2 = "", const String& l3 = "") {
+    if (!lcdOk) return;
+    display.clearDisplay();
+    display.setTextColor(SSD1306_WHITE);
+    display.setTextSize(1);
+    display.setCursor(0, 10);
+    display.println(l1);
+    display.println(l2);
+    display.println(l3);
+    display.display();
+  };
+
+  showMsg("Connecting to WiFi", "for firmware update...");
+
+  WiFi.mode(WIFI_STA);
+  bool staOk = connectSTA(15000);
+  if (!staOk) {
+    Serial.println("[BOOT] Download mode: STA connect failed -- returning to normal boot");
+    showMsg("WiFi connect failed.", "Returning to normal", "boot...");
+    fwClearPendingDownload();
+    delay(2000);
+    ESP.restart();
+  }
+
+  if (!fwResumePendingDownload()) {
+    Serial.println("[BOOT] Download mode: could not resume pending download -- returning to normal boot");
+    fwClearPendingDownload();
+    delay(1000);
+    ESP.restart();
+  }
+
+  uint32_t lastDisp = 0;
+  while (true) {
+    fwDownloadTick();
+
+    if (millis() - lastDisp > 300) {
+      lastDisp = millis();
+      String pct = "";
+      if (fwDownloadTotalBytes > 0) {
+        pct = String((int)(((uint64_t)fwDownloadedBytes * 100) / fwDownloadTotalBytes)) + "%";
+      }
+      showMsg("Updating firmware...", fwDownloadStage, pct);
+    }
+
+    if (fwDownloaded) {
+      Serial.println("[BOOT] Download mode: download complete -- installing");
+      showMsg("Download complete.", "Installing...", "Do not power off.");
+      // Clear the pending-download marker before attempting the install --
+      // if the install itself fails or is interrupted, the normal boot's
+      // own staged-install check (which deletes a bad file on failure)
+      // takes over from here instead of this mode re-downloading from
+      // scratch.
+      fwClearPendingDownload();
+      fwInstallFromSD();  // restarts on success; only returns on failure
+      Serial.printf("[BOOT] Download mode: install failed: %s -- returning to normal boot\n", fwInstallError.c_str());
+      showMsg("Install failed.", "Returning to normal", "boot...");
+      delay(2000);
+      ESP.restart();
+    }
+
+    if (!fwDownloading && fwDownloadError.length() > 0) {
+      Serial.printf("[BOOT] Download mode: gave up -- %s -- returning to normal boot\n", fwDownloadError.c_str());
+      showMsg("Update failed:", fwDownloadError, "Returning to normal boot");
+      fwClearPendingDownload();
+      delay(3000);
+      ESP.restart();
+    }
+
+    delay(10);
   }
 }
 
@@ -420,6 +520,15 @@ void setup() {
     showSplashScreen();
   } else {
     Serial.println("[LCD] SSD1306 init FAIL at 0x3C and 0x3D");
+  }
+
+  // Dedicated download-only boot mode: the status page's button press now
+  // saves the resolved asset URL and reboots instead of downloading
+  // in-session (see pollButton()), so this check must run before anything
+  // else gets a chance to use TLS (including the normal fwCheckForUpdate()
+  // call further down). Never returns if taken.
+  if (fwHasPendingDownload()) {
+    runFirmwareUpdateBootMode(lcdOk);
   }
 
   // Resume an on-device firmware update staged by a previous session: the

@@ -53,6 +53,35 @@ bool fwClearFirmwareFolder();
 // the exact filename (kept private to FirmwareUpdate.cpp otherwise).
 String fwOwnAssetPath();
 
+// ---- Dedicated reboot-into-download-mode ----
+// fwCheckForUpdate()'s own TLS call to the GitHub API permanently degrades
+// this boot's MALLOC_CAP_DMA heap pool the moment it runs, so any download
+// attempted later *in the same boot* -- no matter how long after, or how
+// many background tasks are paused for it -- always inherits that already-
+// degraded pool. The only way to give the download a genuinely fresh pool
+// is to make it the first TLS operation of a *different* boot. The
+// on-device status-page button now saves the already-resolved asset URL/
+// version here and reboots instead of downloading in-session; a dedicated
+// boot-time check (see Piglet.ino's runFirmwareUpdateBootMode()) resumes it
+// before fwCheckForUpdate() or anything else gets a chance to touch TLS.
+
+// True if a pending-download marker is waiting on the SD card.
+bool fwHasPendingDownload();
+
+// Persists this board's already-resolved own-asset URL/version (from the
+// most recent fwCheckForUpdate()) to SD, so a dedicated download-only boot
+// can resume it without re-running the check. No-op if nothing's resolved.
+void fwSavePendingDownload();
+
+// Deletes the pending-download marker, if any.
+void fwClearPendingDownload();
+
+// Reads the pending-download marker (if present), primes fwOwnAssetUrl/
+// fwAvailableVersion/fwUpdateAvailable from it, and starts the download via
+// fwDownloadStart(). Returns false if there was no marker or the download
+// could not start (caller should fall back to a normal boot in that case).
+bool fwResumePendingDownload();
+
 // Web UI-triggered (POST /update/installFromSD): reads the already-
 // downloaded /Firmware/<OwnAsset>.ota.bin back off the SD card and flashes
 // it via Update.h, restarting on success. Purely local (no network), so

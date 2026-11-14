@@ -598,6 +598,54 @@ String fwOwnAssetPath() {
   return String("/Firmware/") + FW_OWN_ASSET;
 }
 
+// Kept at SD root, not inside /Firmware/, so it's never confused with a
+// staged release-asset binary -- that directory's "a file is present"
+// convention is relied on elsewhere (fwOwnAssetPath(), coreOtaPreload()).
+static const char* FW_PENDING_DL_PATH = "/otapending.cfg";
+
+bool fwHasPendingDownload() {
+  return sdOk && SD.exists(FW_PENDING_DL_PATH);
+}
+
+void fwSavePendingDownload() {
+  if (!sdOk || fwOwnAssetUrl.length() == 0) return;
+  if (SD.exists(FW_PENDING_DL_PATH)) SD.remove(FW_PENDING_DL_PATH);
+  File f = SD.open(FW_PENDING_DL_PATH, FILE_WRITE);
+  if (!f) return;
+  f.print("url="); f.println(fwOwnAssetUrl);
+  f.print("ver="); f.println(fwAvailableVersion);
+  f.flush();
+  f.close();
+}
+
+void fwClearPendingDownload() {
+  if (sdOk && SD.exists(FW_PENDING_DL_PATH)) SD.remove(FW_PENDING_DL_PATH);
+}
+
+bool fwResumePendingDownload() {
+  if (!sdOk || !SD.exists(FW_PENDING_DL_PATH)) return false;
+
+  File f = SD.open(FW_PENDING_DL_PATH, FILE_READ);
+  if (!f) return false;
+
+  String url, ver;
+  while (f.available()) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if (line.startsWith("url=")) url = line.substring(4);
+    else if (line.startsWith("ver=")) ver = line.substring(4);
+  }
+  f.close();
+
+  if (url.length() == 0) return false;
+
+  fwOwnAssetUrl      = url;
+  fwAvailableVersion = ver;
+  fwUpdateAvailable  = true;
+  fwDownloadStart();
+  return fwDownloading;
+}
+
 // Deletes every file in /Firmware/ on the SD card -- this board's own
 // downloaded-but-not-yet-installed image, plus anything staged for the mesh
 // Core-push engine. Lets the operator clear out a stuck/partial download (or
