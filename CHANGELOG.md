@@ -1,5 +1,12 @@
 # Changelog
 
+## v3.05 (2026-11-15)
+
+### New Features
+- **Boot now pauses for an on-device "Update available" prompt** -- when `fwCheckForUpdate()` finds a newer release at boot, the device immediately shows the "Update!" banner with a live 20-second countdown, pausing the rest of the boot sequence (GPS init, boot uploads, Web UI start, scanning). Pressing the button during that window saves the pending-download marker and reboots straight into the dedicated download-only boot mode, the same action already available from the status page. If the countdown elapses with no press, the prompt is dismissed and the boot sequence continues normally -- the status page keeps showing the same banner for the rest of the session, so the update can still be started later. Applied to both the main Piglet firmware and the T-Dongle C5 standalone firmware.
+
+---
+
 ## v3.04 (2026-11-14)
 
 ### New Features

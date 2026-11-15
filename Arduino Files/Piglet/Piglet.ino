@@ -365,6 +365,84 @@ static void runFirmwareUpdateBootMode(bool lcdOk) {
 }
 
 // ================================================================
+//  Boot-time "update available" prompt
+//  Shown immediately when fwCheckForUpdate() finds a newer release --
+//  pauses the rest of the boot sequence (GPS init, boot uploads, Web UI
+//  start, scanning) for a short window so someone standing at the device
+//  can press the button right away to start the download, instead of
+//  having to first find the status page once normal operation begins.
+//  A press here does the same thing as the status page's single-press
+//  action for this banner (see pollButton()): save the pending-download
+//  marker and reboot into runFirmwareUpdateBootMode(). If the window
+//  elapses with no press, the prompt is dismissed and the boot sequence
+//  continues untouched -- fwUpdateAvailable stays true, so the status
+//  page keeps showing the same banner for the rest of this session (see
+//  drawPageStatus()).
+// ================================================================
+static const uint32_t FW_BOOT_PROMPT_MS = 20000;
+
+static void waitForUpdatePromptOrTimeout(bool lcdOk) {
+  if (pins.btn < 0) return;  // no button on this board -- nothing to wait on
+
+  Serial.println("[BOOT] Firmware update available -- pausing boot for button press...");
+
+  uint32_t start        = millis();
+  int      lastRaw      = digitalRead(pins.btn);
+  uint32_t lastChangeMs = start;
+  uint32_t lastDrawnSec = 0xFFFFFFFF;  // force an immediate first draw
+
+  while (millis() - start < FW_BOOT_PROMPT_MS) {
+    uint32_t elapsed  = millis() - start;
+    uint32_t secsLeft = (FW_BOOT_PROMPT_MS - elapsed + 999) / 1000;
+
+    if (secsLeft != lastDrawnSec && lcdOk) {
+      lastDrawnSec = secsLeft;
+      display.clearDisplay();
+      display.setTextColor(SSD1306_WHITE);
+      display.setTextSize(2);
+      display.setCursor(0, 0);
+      display.print("Update!");
+      display.setTextSize(1);
+      display.drawFastHLine(0, OLED_YELLOW_H - 1, OLED_W, SSD1306_WHITE);
+      display.setCursor(0, OLED_YELLOW_H + 2);
+      display.print("New version: ");
+      display.println(fwAvailableVersion);
+      display.println();
+      display.print("Press btn to dl (");
+      display.print(secsLeft);
+      display.println("s)");
+      display.display();
+    }
+
+    int raw = digitalRead(pins.btn);
+    if (raw != lastRaw) {
+      lastRaw      = raw;
+      lastChangeMs = millis();
+    } else if (raw == LOW && (millis() - lastChangeMs) > 40) {
+      // Debounced press -- same action as the status page's single-press
+      // handler for this banner (see pollButton()).
+      Serial.println("[BOOT] Button pressed during update prompt -- saving pending download and rebooting");
+      fwSavePendingDownload();
+      if (lcdOk) {
+        display.clearDisplay();
+        display.setTextColor(SSD1306_WHITE);
+        display.setTextSize(1);
+        display.setCursor(0, 20);
+        display.println("Rebooting to");
+        display.println("download update...");
+        display.display();
+      }
+      delay(500);
+      ESP.restart();
+    }
+
+    delay(10);
+  }
+
+  Serial.println("[BOOT] Update prompt timed out -- continuing normal boot");
+}
+
+// ================================================================
 //  setup()
 // ================================================================
 void setup() {
@@ -675,6 +753,10 @@ void setup() {
                   (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
                   (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
                   (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+
+    if (fwUpdateAvailable) {
+      waitForUpdatePromptOrTimeout(lcdOk);
+    }
   }
 
   // Boot upload: WDGoWars first (if key set), then WiGLE (if token set),

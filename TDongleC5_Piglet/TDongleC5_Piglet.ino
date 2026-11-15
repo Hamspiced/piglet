@@ -103,7 +103,7 @@ struct FileUploadState {
 };
 
 // Firmware version
-#define FIRMWARE_VERSION "v3.04"
+#define FIRMWARE_VERSION "v3.05"
 
 // ---------------- Pins (T-DONGLE C5) ----------------
 struct PinMap {
@@ -8081,6 +8081,75 @@ static void runFirmwareUpdateBootMode() {
 }
 
 // ================================================================
+//  Boot-time "update available" prompt
+//  Shown immediately when fwCheckForUpdate() finds a newer release --
+//  pauses the rest of the boot sequence (GPS init, boot uploads, scanning)
+//  for a short window so someone standing at the device can press the
+//  button right away to start the download, instead of having to first
+//  find the status page once normal operation begins. A press here does
+//  the same thing as the status page's single-press action for this
+//  banner (see pollButton()): save the pending-download marker and
+//  reboot into runFirmwareUpdateBootMode(). If the window elapses with
+//  no press, the prompt is dismissed and the boot sequence continues
+//  untouched -- fwUpdateAvailable stays true, so the status page keeps
+//  showing the same banner for the rest of this session (see
+//  updateTFT()).
+// ================================================================
+static const uint32_t FW_BOOT_PROMPT_MS = 20000;
+
+static void waitForUpdatePromptOrTimeout() {
+  if (PINS.btn < 0) return;  // no button on this board -- nothing to wait on
+
+  Serial.println("[BOOT] Firmware update available -- pausing boot for button press...");
+
+  uint32_t start        = millis();
+  int      lastRaw      = digitalRead(PINS.btn);
+  uint32_t lastChangeMs = start;
+  uint32_t lastDrawnSec = 0xFFFFFFFF;  // force an immediate first draw
+
+  while (millis() - start < FW_BOOT_PROMPT_MS) {
+    uint32_t elapsed  = millis() - start;
+    uint32_t secsLeft = (FW_BOOT_PROMPT_MS - elapsed + 999) / 1000;
+
+    if (secsLeft != lastDrawnSec) {
+      lastDrawnSec = secsLeft;
+      tft.fillScreen(BLACK);
+      tft.setTextColor(WHITE, BLACK);
+      tftDrawCentered(10, "Update!", 2);
+      int y = 40;
+      tftDrawCentered(y, fwAvailableVersion.c_str(), 1); y += 16;
+      tftDrawCentered(y, "Press button to", 1); y += 12;
+      tftDrawCentered(y, "download", 1); y += 16;
+      char buf[16];
+      snprintf(buf, sizeof(buf), "(%lus)", (unsigned long)secsLeft);
+      tftDrawCentered(y, buf, 1);
+    }
+
+    int raw = digitalRead(PINS.btn);
+    if (raw != lastRaw) {
+      lastRaw      = raw;
+      lastChangeMs = millis();
+    } else if (raw == LOW && (millis() - lastChangeMs) > 40) {
+      // Debounced press -- same action as the status page's single-press
+      // handler for this banner (see pollButton()).
+      Serial.println("[BOOT] Button pressed during update prompt -- saving pending download and rebooting");
+      fwSavePendingDownload();
+      tft.fillScreen(BLACK);
+      tft.setTextColor(WHITE, BLACK);
+      tftDrawCentered(30, "Rebooting to", 1);
+      tftDrawCentered(45, "download update...", 1);
+      delay(500);
+      ESP.restart();
+    }
+
+    delay(10);
+  }
+
+  Serial.println("[BOOT] Update prompt timed out -- continuing normal boot");
+  uiFirstDraw = true;  // force a clean full redraw once loop() resumes drawing
+}
+
+// ================================================================
 //  setup()
 // ================================================================
 void setup() {
@@ -8278,6 +8347,9 @@ void setup() {
   // seen" auto-upload path. Silent/non-fatal if offline.
   if (staOk) {
     fwCheckForUpdate();
+    if (fwUpdateAvailable) {
+      waitForUpdatePromptOrTimeout();
+    }
   }
 
   if (staOk) {
