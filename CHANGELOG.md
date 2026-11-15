@@ -1,5 +1,12 @@
 # Changelog
 
+## v3.06 (2026-11-15)
+
+### Bug Fixes
+- **Self-update re-flashed the same firmware on every single boot** -- `fwInstallFromSD()` flashed the staged `/Firmware/<board>.ota.bin` image via `Update.h` and rebooted on success, but never deleted that file from the SD card. Boot's staged-install check only looks at whether the file still exists, so it kept finding the same already-installed image on every subsequent boot and re-flashing it again, forever. The staged file is now deleted immediately after a successful flash, before the reboot. Applied to both the main Piglet firmware and the T-Dongle C5 standalone firmware.
+
+---
+
 ## v3.05 (2026-11-15)
 
 ### New Features

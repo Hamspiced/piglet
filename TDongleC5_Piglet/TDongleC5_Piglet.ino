@@ -103,7 +103,7 @@ struct FileUploadState {
 };
 
 // Firmware version
-#define FIRMWARE_VERSION "v3.05"
+#define FIRMWARE_VERSION "v3.06"
 
 // ---------------- Pins (T-DONGLE C5) ----------------
 struct PinMap {
@@ -7162,6 +7162,13 @@ static bool fwInstallFromSD() {
     fwInstalling = false;
     return false;
   }
+
+  // Delete the staged image now that it's been successfully flashed --
+  // otherwise the boot-time staged-install check in setup() (which only
+  // looks at whether this file exists on SD) would find the same file
+  // still present on every subsequent boot and re-flash the identical
+  // image forever instead of booting normally into it.
+  SD.remove(path);
 
   fwLogAppend("Flash OK -- rebooting");
   Serial.println("[FWUPD] Flash OK -- restarting");

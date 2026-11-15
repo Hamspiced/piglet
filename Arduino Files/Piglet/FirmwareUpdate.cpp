@@ -984,6 +984,13 @@ bool fwInstallFromSD() {
     return false;
   }
 
+  // Delete the staged image now that it's been successfully flashed --
+  // otherwise the boot-time staged-install check in setup() (which only
+  // looks at whether this file exists on SD) would find the same file
+  // still present on every subsequent boot and re-flash the identical
+  // image forever instead of booting normally into it.
+  SD.remove(path);
+
   fwLogAppend("Flash OK -- rebooting");
   Serial.println("[FWUPD] Flash OK -- restarting");
   delay(500);
