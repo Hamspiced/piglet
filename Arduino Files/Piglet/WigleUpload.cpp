@@ -80,128 +80,134 @@ bool wigleTestToken() {
     return false;
   }
 
-  const char* pathsToTry[] = {
-    "/api/v2/profile",
-    "/api/v2/stats/user",
-    "/api/v2/user/profile"
-  };
+  // WiGLE's documented "get user profile" endpoint -- confirmed live against
+  // api.wigle.net. This used to try 2 other paths first ("/api/v2/profile"
+  // and "/api/v2/user/profile"), both of which always 404 regardless of
+  // token validity -- they don't exist. That wasted up to 2 extra full TLS
+  // handshakes on guaranteed-dead endpoints before ever reaching this real
+  // one, and on this chip's narrow MALLOC_CAP_DMA heap pool, every
+  // additional back-to-back TLS session meaningfully raised the odds of the
+  // whole check failing with "esp-aes: Failed to allocate memory" well
+  // before a real pass/fail answer was ever reached -- i.e. the check
+  // "constantly" errored out even with a perfectly valid token. One
+  // correct endpoint means one TLS session instead of up to three.
+  static const char* WIGLE_PROFILE_PATH = "/api/v2/profile/user";
 
-  for (size_t i = 0; i < sizeof(pathsToTry)/sizeof(pathsToTry[0]); i++) {
+  WiFiClientSecure client;
+  client.setInsecure();
+  client.setTimeout(15000);
 
-    WiFiClientSecure client;
-    client.setInsecure();
-    client.setTimeout(15000);
+  // Optional debug
+  Serial.printf("[NET] status=%d ssid=%s rssi=%d\n",
+                (int)WiFi.status(),
+                WiFi.SSID().c_str(),
+                WiFi.RSSI());
+  Serial.printf("[NET] ip=%s gw=%s dns=%s\n",
+                WiFi.localIP().toString().c_str(),
+                WiFi.gatewayIP().toString().c_str(),
+                WiFi.dnsIP().toString().c_str());
 
-    // Optional debug
-    Serial.printf("[NET] status=%d ssid=%s rssi=%d\n",
-                  (int)WiFi.status(),
-                  WiFi.SSID().c_str(),
-                  WiFi.RSSI());
-    Serial.printf("[NET] ip=%s gw=%s dns=%s\n",
-                  WiFi.localIP().toString().c_str(),
-                  WiFi.gatewayIP().toString().c_str(),
-                  WiFi.dnsIP().toString().c_str());
-
-    IPAddress ip;
-    if (!WiFi.hostByName(WIGLE_HOST, ip)) {
-      Serial.println("[NET] DNS FAIL for api.wigle.net");
-    } else {
-      Serial.print("[NET] api.wigle.net -> ");
-      Serial.println(ip);
-    }
-
-    // Retry TLS connect -- transient esp-aes/DMA-descriptor allocation
-    // failures (logged as "esp-aes: Failed to allocate memory") can make a
-    // single connect() attempt fail even though overall free heap looks
-    // fine; the AES driver needs a small allocation from the separate
-    // MALLOC_CAP_DMA pool, which a short retry gives a chance to free up.
-    // Same pattern already used by the upload functions below.
-    bool connected = false;
-    for (int attempt = 1; attempt <= 3; attempt++) {
-      if (client.connect(WIGLE_HOST, WIGLE_PORT)) { connected = true; break; }
-      char errBuf[100];
-      int sslErr = client.lastError(errBuf, sizeof(errBuf));
-      Serial.printf("[WiGLE] Test token TLS connect failed (attempt %d/3): error %d: %s\n", attempt, sslErr, errBuf);
-      logDmaHeap("WiGLE test token connect fail");
-      client.stop();
-      delay(500);
-      yield();
-    }
-    if (!connected) {
-      uploadLastResult = "TLS connect fail";
-      wigleTokenStatus = -1;
-      return false;
-    }
-
-    String req =
-      String("GET ") + pathsToTry[i] + " HTTP/1.1\r\n" +
-      "Host: " + WIGLE_HOST + "\r\n" +
-      "Authorization: Basic " + cfg.wigleBasicToken + "\r\n" +
-      "Connection: close\r\n\r\n";
-
-    client.print(req);
-
-    // Track AP clients (unchanged behavior)
-    if (apWindowActive) {
-      wifi_mode_t m = WiFi.getMode();
-      if (m == WIFI_AP || m == WIFI_AP_STA) {
-        if (WiFi.softAPgetStationNum() > 0) {
-          if (!apClientSeen) Serial.println("[WIFI] AP client connected");
-          apClientSeen = true;
-        }
-      }
-    }
-
-    // Wait for response
-    uint32_t waitStart = millis();
-    while (!client.available() && client.connected() && (millis() - waitStart) < 15000) {
-      delay(10);
-      yield();
-    }
-
-    // Read status line FIRST
-    String status = client.readStringUntil('\n');
-    status.trim();
-
-    // Drain headers quickly
-    while (client.connected()) {
-      String line = client.readStringUntil('\n');
-      if (line == "\r" || line.length() == 0) break;
-    }
-
-    client.stop();
-
-    int code = 0;
-    if (status.startsWith("HTTP/")) {
-      int sp1 = status.indexOf(' ');
-      if (sp1 > 0) {
-        int sp2 = status.indexOf(' ', sp1 + 1);
-        if (sp2 > sp1) code = status.substring(sp1 + 1, sp2).toInt();
-      }
-    }
-
-    wigleLastHttpCode = code;
-
-    // 200 means token valid
-    if (code == 200) {
-      wigleTokenStatus = 1;
-      uploadLastResult = "Token valid (200)";
-      return true;
-    }
-
-    // 401/403 means definitely invalid
-    if (code == 401 || code == 403) {
-      wigleTokenStatus = -1;
-      uploadLastResult = "Token invalid (" + String(code) + ")";
-      return false;
-    }
-
-    // 404 / other codes: try next endpoint
+  IPAddress ip;
+  if (!WiFi.hostByName(WIGLE_HOST, ip)) {
+    Serial.println("[NET] DNS FAIL for api.wigle.net");
+  } else {
+    Serial.print("[NET] api.wigle.net -> ");
+    Serial.println(ip);
   }
 
-  // If none of the endpoints worked, we can't be sure.
+  // Retry TLS connect -- transient esp-aes/DMA-descriptor allocation
+  // failures (logged as "esp-aes: Failed to allocate memory") can make a
+  // single connect() attempt fail even though overall free heap looks
+  // fine; the AES driver needs a small allocation from the separate
+  // MALLOC_CAP_DMA pool, which a short retry gives a chance to free up.
+  // Same pattern already used by the upload functions below.
+  bool connected = false;
+  for (int attempt = 1; attempt <= 3; attempt++) {
+    if (client.connect(WIGLE_HOST, WIGLE_PORT)) { connected = true; break; }
+    char errBuf[100];
+    int sslErr = client.lastError(errBuf, sizeof(errBuf));
+    Serial.printf("[WiGLE] Test token TLS connect failed (attempt %d/3): error %d: %s\n", attempt, sslErr, errBuf);
+    logDmaHeap("WiGLE test token connect fail");
+    client.stop();
+    delay(500);
+    yield();
+  }
+  if (!connected) {
+    // A connect failure is inconclusive, not evidence the token itself is
+    // bad -- report "unknown" rather than falsely flipping the Web UI's
+    // pill to "Invalid" over what's usually a transient memory/network hiccup.
+    uploadLastResult = "TLS connect fail";
+    wigleTokenStatus = 0;
+    return false;
+  }
+
+  String req =
+    String("GET ") + WIGLE_PROFILE_PATH + " HTTP/1.1\r\n" +
+    "Host: " + WIGLE_HOST + "\r\n" +
+    "Authorization: Basic " + cfg.wigleBasicToken + "\r\n" +
+    "Connection: close\r\n\r\n";
+
+  client.print(req);
+
+  // Track AP clients (unchanged behavior)
+  if (apWindowActive) {
+    wifi_mode_t m = WiFi.getMode();
+    if (m == WIFI_AP || m == WIFI_AP_STA) {
+      if (WiFi.softAPgetStationNum() > 0) {
+        if (!apClientSeen) Serial.println("[WIFI] AP client connected");
+        apClientSeen = true;
+      }
+    }
+  }
+
+  // Wait for response
+  uint32_t waitStart = millis();
+  while (!client.available() && client.connected() && (millis() - waitStart) < 15000) {
+    delay(10);
+    yield();
+  }
+
+  // Read status line FIRST
+  String status = client.readStringUntil('\n');
+  status.trim();
+
+  // Drain headers quickly
+  while (client.connected()) {
+    String line = client.readStringUntil('\n');
+    if (line == "\r" || line.length() == 0) break;
+  }
+
+  client.stop();
+
+  int code = 0;
+  if (status.startsWith("HTTP/")) {
+    int sp1 = status.indexOf(' ');
+    if (sp1 > 0) {
+      int sp2 = status.indexOf(' ', sp1 + 1);
+      if (sp2 > sp1) code = status.substring(sp1 + 1, sp2).toInt();
+    }
+  }
+
+  wigleLastHttpCode = code;
+
+  // 200 means token valid
+  if (code == 200) {
+    wigleTokenStatus = 1;
+    uploadLastResult = "Token valid (200)";
+    return true;
+  }
+
+  // 401/403 means definitely invalid
+  if (code == 401 || code == 403) {
+    wigleTokenStatus = -1;
+    uploadLastResult = "Token invalid (" + String(code) + ")";
+    return false;
+  }
+
+  // Anything else (e.g. 429 rate-limited, 5xx) is inconclusive, not a
+  // definite invalid token.
   wigleTokenStatus = 0;
-  uploadLastResult = "Token test inconclusive (" + String(wigleLastHttpCode) + ")";
+  uploadLastResult = "Token test inconclusive (" + String(code) + ")";
   return false;
 }
 
@@ -480,8 +486,11 @@ bool wdgwarsTestKey() {
 }
 
 // ---- WDGoWars single-file upload ----
-// Auth: X-API-Key header  |  Endpoint: POST /api/upload-csv
-// Wire format identical to WiGLE (multipart/form-data, field "file").
+// Auth: X-API-Key header  |  Endpoint: POST /api/v2/upload-csv (the async,
+// job-queued variant -- WDGoWars also has a simpler synchronous
+// /api/upload-csv, but this board uses v2 since it already expects a 202 +
+// job_id response below). Wire format identical to WiGLE (multipart/
+// form-data, field "file").
 
 bool uploadFileToWdgwars(const String& path) {
   Serial.print("[WDGWars] uploadFileToWdgwars: ");
@@ -1003,89 +1012,40 @@ bool uploadFileToWardrift(const String& path) {
 }
 
 // ---- WDGoWars background job status check ----
-// Does the actual work of checking a single pending job: one short-lived
-// HTTPS GET, no retries. Removes the job from the queue once it resolves
-// (done/failed) or once it has been pending longer than
-// WDGWARS_JOB_MAX_AGE_MS. Returns true if it made a network attempt (or
-// gave up on an aged-out job), so callers can pace successive checks.
+// WDGoWars's async upload (POST /api/v2/upload-csv) returns a job_id, which
+// implies the import result could be checked later -- but there is no
+// working per-job status API. This used to poll GET /api/v2/upload-job/<id>
+// with the X-API-Key header, but that path does not accept that header at
+// all: confirmed live, it unconditionally 302-redirects to /login/
+// regardless of auth, i.e. it's a web-session-only route, not a machine API
+// endpoint. Every poll was therefore a guaranteed-dead TLS connection (the
+// response body is an HTML login page, never containing "done"/"failed"),
+// while still spending a full handshake doing it -- exactly the kind of
+// unnecessary back-to-back TLS session that strains this chip's narrow
+// MALLOC_CAP_DMA heap pool elsewhere in this file. The only documented way
+// to see past upload outcomes is GET /api/upload-history, which returns a
+// *list* of uploads rather than a single job lookup by ID; reliably
+// matching a specific queued job back to one of its rows isn't something
+// that can be done safely without a confirmed, stable response shape to
+// parse, which WDGoWars does not currently publish. Until it does, a
+// submitted job is simply dropped, unconfirmed, once it ages out below --
+// the upload itself already succeeded by the time it's queued here (this
+// bookkeeping only ever existed to report the *import* outcome after the
+// fact, not the upload's own pass/fail result).
 static bool wdgwarsCheckOnePendingJob() {
   if (wdgwarsPendingJobs.empty()) return false;
-  if (WiFi.status() != WL_CONNECTED) return false;
 
   uint32_t nowMs = millis();
-
-  // Find the least-recently-checked job that's due for a check, using each
-  // job's own (growing) backoff interval rather than a fixed one.
-  int idx = -1;
   for (size_t i = 0; i < wdgwarsPendingJobs.size(); i++) {
-    if (nowMs - wdgwarsPendingJobs[i].lastCheckMs >= wdgwarsPendingJobs[i].nextDelayMs) {
-      idx = (int)i;
-      break;
+    if (nowMs - wdgwarsPendingJobs[i].queuedAtMs > WDGWARS_JOB_MAX_AGE_MS) {
+      Serial.printf("[WDGWars] Job %d (%s): no working status API -- dropping unconfirmed after %lus\n",
+                    wdgwarsPendingJobs[i].jobId, wdgwarsPendingJobs[i].filename.c_str(),
+                    (unsigned long)(WDGWARS_JOB_MAX_AGE_MS / 1000));
+      wdgwarsPendingJobs.erase(wdgwarsPendingJobs.begin() + i);
+      return true;
     }
   }
-  if (idx < 0) return false;
-
-  WdgwarsPendingJob job = wdgwarsPendingJobs[idx];
-
-  // Give up on jobs that have been pending too long
-  if (nowMs - job.queuedAtMs > WDGWARS_JOB_MAX_AGE_MS) {
-    Serial.printf("[WDGWars] Job %d (%s): giving up after %lus with no result\n",
-                  job.jobId, job.filename.c_str(),
-                  (unsigned long)(WDGWARS_JOB_MAX_AGE_MS / 1000));
-    wdgwarsPendingJobs.erase(wdgwarsPendingJobs.begin() + idx);
-    return true;
-  }
-
-  wdgwarsPendingJobs[idx].lastCheckMs = nowMs;
-  // Double the wait before the next check on this job (capped), whether
-  // this attempt connects or not -- a resolving check erases the entry
-  // anyway, so only the "still processing"/connect-fail paths ever see the
-  // larger gap take effect.
-  wdgwarsPendingJobs[idx].nextDelayMs =
-    (job.nextDelayMs > WDGWARS_JOB_CHECK_MAX_MS / 2) ? WDGWARS_JOB_CHECK_MAX_MS : job.nextDelayMs * 2;
-
-  WiFiClientSecure pc;
-  pc.setInsecure();
-  pc.setTimeout(8000);
-  if (!pc.connect(WDGWARS_HOST, WDGWARS_PORT)) {
-    logDmaHeap("WDGWars job-poll connect fail");
-    return true;
-  }
-
-  String jobPath = String("/api/v2/upload-job/") + String(job.jobId);
-  pc.print("GET " + jobPath + " HTTP/1.0\r\n");
-  pc.print(String("Host: ") + WDGWARS_HOST + "\r\n");
-  pc.print(String("X-API-Key: ") + cfg.wdgwarsApiKey + "\r\n");
-  pc.print("Connection: close\r\n\r\n");
-
-  uint32_t pw = millis();
-  while (!pc.available() && pc.connected() && (millis() - pw) < 6000) { delay(50); yield(); }
-  if (!pc.available()) { pc.stop(); return true; }
-
-  pc.readStringUntil('\n');  // skip HTTP status line
-  String pb = ""; bool pInBody = false;
-  while (pc.connected() || pc.available()) {
-    String ln = pc.readStringUntil('\n'); ln.trim();
-    if (!pInBody) { if (ln.length() == 0) pInBody = true; }
-    else { pb += ln; if (pb.length() > 512) break; }
-  }
-  pc.stop();
-
-  if (pb.indexOf("\"done\"") >= 0) {
-    int imp = 0;
-    int ii = pb.indexOf("\"imported\":");
-    if (ii >= 0) imp = pb.substring(ii + 11).toInt();
-    Serial.printf("[WDGWars] Job %d (%s) done — imported: %d\n",
-                  job.jobId, job.filename.c_str(), imp);
-    wdgwarsPendingJobs.erase(wdgwarsPendingJobs.begin() + idx);
-  } else if (pb.indexOf("\"failed\"") >= 0) {
-    Serial.printf("[WDGWars] Job %d (%s) FAILED server-side\n",
-                  job.jobId, job.filename.c_str());
-    wdgwarsPendingJobs.erase(wdgwarsPendingJobs.begin() + idx);
-  }
-  // else still "processing" — leave queued, checked again later
-
-  return true;
+  return false;
 }
 
 // Call periodically from loop(). Internally rate-limited so it never does

@@ -1,5 +1,13 @@
 # Changelog
 
+## v3.07 (2026-11-15)
+
+### Bug Fixes
+- **WiGLE "Test Token" could fail constantly even with a valid token** -- the check tried 3 candidate endpoint paths in sequence, but 2 of them (`/api/v2/profile`, `/api/v2/user/profile`) don't exist on WiGLE's API and always 404 regardless of token validity, confirmed live against `api.wigle.net`. Every check wasted a full extra TLS handshake (sometimes two) on these guaranteed-dead endpoints before ever reaching the one real path -- on this chip's narrow `MALLOC_CAP_DMA` heap pool, each additional back-to-back TLS session meaningfully raised the odds the whole check would fail with a memory/connect error before a real pass/fail answer was ever reached. Now hits WiGLE's documented `/api/v2/profile/user` endpoint directly -- one TLS session instead of up to three. A TLS connect failure also no longer falsely reports the token as "Invalid"; it's now reported as "Unknown," since a dropped connection isn't evidence the token itself is bad.
+- **WDGoWars upload-status polling connected to a dead endpoint on every pending job, every few seconds, for up to 5 minutes** -- the background job-status check polled `GET /api/v2/upload-job/<id>` with the device's API key, but that path doesn't accept API-key auth at all: confirmed live, it unconditionally redirects to a login page regardless of the header, since it's a web-session-only route rather than a machine API endpoint. Every poll was therefore a guaranteed-dead TLS connection that could never resolve a real result, adding unnecessary TLS/memory pressure on top of the self-update and upload paths already competing for the same narrow heap pool. The upload itself was never affected by this (success/failure is already known from the initial upload response) -- only the later "did the import finish OK" confirmation was. Pending jobs are no longer polled over the network; they're tracked for a few minutes for logging purposes only and dropped once that window elapses, same as before but without the wasted connections. Applied to both the main Piglet firmware and the T-Dongle C5 standalone firmware.
+
+---
+
 ## v3.06 (2026-11-15)
 
 ### Bug Fixes
