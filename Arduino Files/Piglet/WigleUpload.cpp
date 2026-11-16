@@ -37,33 +37,6 @@ static void logDmaHeap(const char* tag) {
                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
 }
 
-// ---- WDGoWars async job tracking ----
-// A 202 response only means the CSV was received and queued for import —
-// it does NOT mean the server has finished processing it. Blocking the
-// upload loop for up to 45 s per file waiting on that made both WDGoWars
-// and WiGLE uploads (which run right after it, for the same file) look
-// hung even though the file had already reached the server. Instead, the
-// job is queued here and checked opportunistically from loop() via
-// wdgwarsServicePendingJobs(), without blocking anything.
-struct WdgwarsPendingJob {
-  int      jobId;
-  String   filename;
-  uint32_t queuedAtMs;
-  uint32_t lastCheckMs;
-  // Exponential backoff per job (see WDGWARS_JOB_CHECK_INTERVAL_MS below) --
-  // starts at the base interval and doubles (capped) each inconclusive
-  // check, instead of hammering a fresh TLS connection every 4s for up to
-  // 5 minutes straight. That steady background TLS churn was a prime
-  // suspect for the AES/DMA-pool exhaustion behind repeated, sustained
-  // (not just momentary) "esp-aes: Failed to allocate memory" failures
-  // seen on foreground Test Token/Key TLS attempts during the same window.
-  uint32_t nextDelayMs;
-};
-static std::vector<WdgwarsPendingJob> wdgwarsPendingJobs;
-static const uint32_t WDGWARS_JOB_CHECK_INTERVAL_MS = 4000;            // base/min gap between checks
-static const uint32_t WDGWARS_JOB_CHECK_MAX_MS      = 60000;           // backoff ceiling per job
-static const uint32_t WDGWARS_JOB_MAX_AGE_MS        = 5UL * 60UL * 1000UL; // give up after 5 min
-
 // ---- Token test ----
 
 bool wigleTestToken() {
@@ -660,26 +633,18 @@ bool uploadFileToWdgwars(const String& path) {
 
   Serial.printf("[WDGWars] HTTP %d  body: %s\n", code, body.substring(0, 100).c_str());
 
-  // V2 API: HTTP 202 Accepted — file received and queued for processing.
-  // Report success immediately instead of blocking here for up to 45 s;
-  // the job result is checked later in the background (see
-  // wdgwarsServicePendingJobs() / wdgwarsDrainPendingJobs() below).
+  // V2 API: HTTP 202 Accepted — file received and queued for import. This
+  // is the upload's own success result; WDGoWars has no working API to
+  // check the later import outcome (see the removed job-polling code this
+  // replaced -- GET /api/v2/upload-job/<id> doesn't accept API-key auth at
+  // all), so the response's job_id is just logged for manual lookup rather
+  // than tracked for a background check that could never resolve.
   if (code == 202) {
-    // Extract job_id from {"ok":true,"job_id":42,...}
     int jobId = 0;
     int ji = body.indexOf("\"job_id\":");
     if (ji >= 0) jobId = body.substring(ji + 9).toInt();
-    if (jobId <= 0) {
-      uploadLastResult = "WDGW: no job_id in 202";
-      Serial.println("[WDGWars] 202 but no job_id in response");
-      return false;
-    }
-
-    uint32_t nowMs = millis();
-    wdgwarsPendingJobs.push_back({ jobId, filename, nowMs, nowMs, WDGWARS_JOB_CHECK_INTERVAL_MS });
-    uploadLastResult = "WDGW: queued (job " + String(jobId) + ")";
-    Serial.printf("[WDGWars] Job %d submitted for %s — result will be checked in background\n",
-                  jobId, filename.c_str());
+    uploadLastResult = (jobId > 0) ? ("Accepted (job " + String(jobId) + ")") : "Accepted";
+    Serial.printf("[WDGWars] Accepted for import (job_id=%d)\n", jobId);
     return true;
   }
 
@@ -1009,76 +974,6 @@ bool uploadFileToWardrift(const String& path) {
   uploadLastResult = msg.length() ? ("Upload failed (" + String(code) + "): " + msg) : ("Upload failed (" + String(code) + ")");
   Serial.printf("[Wardrift] Upload FAILED HTTP %d: %s\n", code, body.c_str());
   return false;
-}
-
-// ---- WDGoWars background job status check ----
-// WDGoWars's async upload (POST /api/v2/upload-csv) returns a job_id, which
-// implies the import result could be checked later -- but there is no
-// working per-job status API. This used to poll GET /api/v2/upload-job/<id>
-// with the X-API-Key header, but that path does not accept that header at
-// all: confirmed live, it unconditionally 302-redirects to /login/
-// regardless of auth, i.e. it's a web-session-only route, not a machine API
-// endpoint. Every poll was therefore a guaranteed-dead TLS connection (the
-// response body is an HTML login page, never containing "done"/"failed"),
-// while still spending a full handshake doing it -- exactly the kind of
-// unnecessary back-to-back TLS session that strains this chip's narrow
-// MALLOC_CAP_DMA heap pool elsewhere in this file. The only documented way
-// to see past upload outcomes is GET /api/upload-history, which returns a
-// *list* of uploads rather than a single job lookup by ID; reliably
-// matching a specific queued job back to one of its rows isn't something
-// that can be done safely without a confirmed, stable response shape to
-// parse, which WDGoWars does not currently publish. Until it does, a
-// submitted job is simply dropped, unconfirmed, once it ages out below --
-// the upload itself already succeeded by the time it's queued here (this
-// bookkeeping only ever existed to report the *import* outcome after the
-// fact, not the upload's own pass/fail result).
-static bool wdgwarsCheckOnePendingJob() {
-  if (wdgwarsPendingJobs.empty()) return false;
-
-  uint32_t nowMs = millis();
-  for (size_t i = 0; i < wdgwarsPendingJobs.size(); i++) {
-    if (nowMs - wdgwarsPendingJobs[i].queuedAtMs > WDGWARS_JOB_MAX_AGE_MS) {
-      Serial.printf("[WDGWars] Job %d (%s): no working status API -- dropping unconfirmed after %lus\n",
-                    wdgwarsPendingJobs[i].jobId, wdgwarsPendingJobs[i].filename.c_str(),
-                    (unsigned long)(WDGWARS_JOB_MAX_AGE_MS / 1000));
-      wdgwarsPendingJobs.erase(wdgwarsPendingJobs.begin() + i);
-      return true;
-    }
-  }
-  return false;
-}
-
-// Call periodically from loop(). Internally rate-limited so it never does
-// more than one short network round-trip per call.
-void wdgwarsServicePendingJobs() {
-  static uint32_t lastRunMs = 0;
-  uint32_t nowMs = millis();
-  if (nowMs - lastRunMs < WDGWARS_JOB_CHECK_INTERVAL_MS) return;
-  lastRunMs = nowMs;
-  wdgwarsCheckOnePendingJob();
-}
-
-// Best-effort: keep checking pending jobs back-to-back for up to budgetMs.
-// Intended to be called right before intentionally dropping the STA
-// connection (e.g. autoStartAfterUpload or entering mesh Core mode) so
-// quick jobs still get confirmed instead of being silently abandoned.
-void wdgwarsDrainPendingJobs(uint32_t budgetMs) {
-  if (wdgwarsPendingJobs.empty()) return;
-
-  // Force every queued job to be immediately eligible for a check.
-  for (auto& j : wdgwarsPendingJobs) j.lastCheckMs = 0;
-
-  uint32_t start = millis();
-  while (!wdgwarsPendingJobs.empty() && (millis() - start) < budgetMs) {
-    if (!wdgwarsCheckOnePendingJob()) break;  // WiFi down or nothing due yet
-    delay(200);
-    yield();
-  }
-
-  if (!wdgwarsPendingJobs.empty()) {
-    Serial.printf("[WDGWars] %u job(s) still pending — will not be confirmed (STA disconnecting)\n",
-                  (unsigned)wdgwarsPendingJobs.size());
-  }
 }
 
 // ---- Empty-file guard ----

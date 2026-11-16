@@ -803,10 +803,6 @@ void setup() {
     String mm = cfg.meshModeOnBoot; mm.toLowerCase();
     bool meshBoot = (mm == "core" || mm == "node");
     if (cfg.autoStartAfterUpload && staOk && !meshBoot) {
-      // Give any WDGoWars jobs queued during boot upload a brief chance to
-      // resolve before we drop the STA connection they'd need to check on.
-      wdgwarsDrainPendingJobs(5000);
-
       Serial.println("[BOOT] autoStartAfterUpload: disconnecting STA — wardriving begins now");
       WiFi.setAutoReconnect(false);
       WiFi.persistent(false);
@@ -869,10 +865,6 @@ void setup() {
       // (if any) was only needed for auto-upload and must not remain active
       // or ESP-Now channel control will conflict with the STA home channel.
       if (WiFi.status() == WL_CONNECTED || WiFi.getMode() != WIFI_OFF) {
-        // Give any WDGoWars jobs queued during boot upload a brief chance to
-        // resolve before we drop the STA connection they'd need to check on.
-        wdgwarsDrainPendingJobs(5000);
-
         Serial.println("[BOOT] Tearing down STA before Core mode");
         WiFi.disconnect(true, true);
         WiFi.mode(WIFI_OFF);
@@ -1032,14 +1024,6 @@ void loop() {
     handleStaTransitions();
     checkHomeNetworkReturn();
   }
-
-  // Check on any WDGoWars jobs queued during the last upload batch. This is
-  // rate-limited internally to at most one short network round-trip per
-  // call, so it never blocks scanning, GPS, or the display. Skipped while a
-  // firmware download is in flight -- its own HTTPS connection would
-  // otherwise compete with the download's TLS session for the same narrow
-  // DMA-capable heap pool.
-  if (!fwDownloading) wdgwarsServicePendingJobs();
 
   // Drive an in-progress firmware download one bounded step at a time. A
   // no-op unless the Web UI's "Download & Install Firmware" modal has

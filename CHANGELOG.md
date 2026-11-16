@@ -1,5 +1,12 @@
 # Changelog
 
+## v3.08 (2026-11-16)
+
+### Technical Changes
+- **Removed the WDGoWars background job-tracking system entirely** -- following up v3.07's fix (which stopped polling the dead `/api/v2/upload-job/<id>` status endpoint but still kept jobs queued for up to 5 minutes before silently dropping them unconfirmed), there was no remaining reason to track submitted jobs at all: WDGoWars has no working API to check an import's outcome after the fact. A successful upload (HTTP 202) is now simply reported as accepted immediately, with its `job_id` logged for manual reference; nothing is queued or checked in the background anymore. Applied to both the main Piglet firmware and the T-Dongle C5 standalone firmware.
+
+---
+
 ## v3.07 (2026-11-15)
 
 ### Bug Fixes
