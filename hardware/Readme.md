@@ -97,3 +97,4 @@ When you shut off your vehicle, the XIAO 5V pin drops to 0V and D1 stops C1 from
 Assembly Tip
 
 If you use a standard electrolytic capacitor for C1, choose a reputable low-leakage brand (like Nichicon or Panasonic) so internal capacitor leakage doesn't shorten your 4-minute timer window. Ceramic capacitors (220µF MLCC) lose significant capacitance under DC bias, so stick with electrolytic or tantalum for C1.
+
