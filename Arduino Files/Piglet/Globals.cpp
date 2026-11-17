@@ -4,7 +4,7 @@
 // ---- Global objects ----
 PinMap pins = PINS_C6; // default until detected/configured
 Config cfg;
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1, 800000UL, 100000UL);
 TinyGPSPlus gps;
 HardwareSerial GPSSerial(1);
 WebServer server(80);

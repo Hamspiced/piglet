@@ -31,6 +31,7 @@
 #include "GPS.h"
 #include "SDUtils.h"
 #include "Display.h"
+#include "PigWorld.h"
 #include "WiFiManager.h"
 #include "Scanner.h"
 #include "WigleUpload.h"
@@ -97,13 +98,6 @@ static void onPageChange(uint8_t oldPage, uint8_t newPage) {
   if (oldPage == 0 && statusPagePaused) {
     statusPagePaused = false;
     Serial.println("[PAGE] Left status page -> status pause cleared");
-  }
-
-  // Entering pig page -> reset animation position
-  if (newPage == 4) {
-    pig.x = 0;
-    pig.dx = 1;
-    pig.phase = 0;
   }
 
   // Mesh node page lifecycle — always enter as Node; long-press activates Core
@@ -203,7 +197,7 @@ static void pollButton() {
     if (clickCount >= 3 && currentPage == 4) {
       sasquatchStart();
     } else if (clickCount == 2 && currentPage == 4) {
-      pigTwerkStart();
+      pigWorldCelebrate();
     } else if (clickCount >= 2 && currentPage == 0) {
       // Double press on status page -> toggle scan pause
       statusPagePaused = !statusPagePaused;
@@ -1011,7 +1005,7 @@ void loop() {
   // OLED refresh
   static uint32_t lastOled = 0;
   if (currentPage == 4) {
-    // Pig page: animation runs at its own framerate (~90ms)
+    // Pig page: PigWorld runs at its own framerate (20 fps)
     pigAnimTick();
   } else if (millis() - lastOled > 500) {
     lastOled = millis();
