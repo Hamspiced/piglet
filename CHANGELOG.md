@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### New Features
+- **Pig page is now PigWorld** -- the Pig page (page 4) shows a scrolling cartoon world instead of the old walking pig: a sprite pig trots across rolling ground with far hills, trees, drifting clouds, birds, a butterfly by day and fireflies by night, and now and then stops to sniff around or dig up a truffle. The yellow band is the sky, with the sun or the moon (with its real phase) and stars placed by local solar time from the GPS position and GPS time; before GPS time is known the time of day is picked at random. GPS speed turns the trot into a gallop (dust from 12 km/h, speed lines from 50 km/h). Runs at 20 fps.
+- **Pig page taps** -- double tap launches fireworks and a happy hop (replaces the twerk); triple tap still sends the sasquatch walking across, now through the world.
+
+### Technical Changes
+- OLED frame pushes run the I2C bus at 800 kHz (display transfers only; the bus returns to 100 kHz afterwards) so the 20 fps animation fits; at 100 kHz one 1 KB frame takes ~100 ms.
+- New files: `PigWorld.cpp`/`PigWorld.h` (engine) and `pig_sprites.h` (generated sprite art). The old procedural pig, twerk and `PigAnim` state are removed from `Display.cpp`/`Display.h`.
+
+---
+
 ## v3.08 (2026-11-16)
 
 ### Technical Changes
