@@ -67,7 +67,7 @@ All components are common, inexpensive surface-mount (SOT-23 / 0805) or through-
 
 3. Wiring Schematic
 
-text
+```text
 "  XIAO 5V Pin ────[ R3: 100Ω ]────|>|────┬───────────────────┐
 "  (VBUS / USB)                     D1     │                   │
 "                                 1N4148   │                   │
