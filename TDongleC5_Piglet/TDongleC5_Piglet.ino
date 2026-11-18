@@ -103,7 +103,7 @@ struct FileUploadState {
 };
 
 // Firmware version
-#define FIRMWARE_VERSION "v3.09"
+#define FIRMWARE_VERSION "v3.10"
 
 // ---------------- Pins (T-DONGLE C5) ----------------
 struct PinMap {
@@ -1126,31 +1126,50 @@ bool gzCompressStream(GzipSink& sink, const std::function<int(uint8_t*, size_t)>
 // Compresses srcPath into a valid gzip file at dstPath. Returns false on
 // any allocation/SD/compression failure; dstPath is removed in that case.
 static bool gzipCompressFileToFile(const String& srcPath, const String& dstPath) {
-  File in = SD.open(srcPath, FILE_READ);
-  if (!in) {
-    // The SD/SPI bus wedging after sustained heavy I/O (large batch uploads)
-    // is a known, already-handled condition elsewhere -- every raw upload
-    // function (uploadFileToWdgwars/Wardrift) retries its own SD.open() via
-    // sdTryRecover() for exactly this reason. This gzip helper used to skip
-    // that retry entirely, so whenever gzipUploads was enabled (the
-    // default), a single mid-batch SD hiccup silently failed every
-    // remaining file in the batch instead of self-healing like the non-gzip
-    // path did.
-    Serial.printf("[GZIP] Cannot open source %s -- attempting SD recovery\n", srcPath.c_str());
-    if (sdTryRecover()) in = SD.open(srcPath, FILE_READ);
-  }
-  if (!in) { Serial.printf("[GZIP] Cannot open source %s\n", srcPath.c_str()); return false; }
-  if (SD.exists(dstPath)) SD.remove(dstPath);
-  File out = SD.open(dstPath, FILE_WRITE);
-  if (!out) { Serial.printf("[GZIP] Cannot create %s\n", dstPath.c_str()); in.close(); return false; }
+  // The SD/SPI bus wedging after sustained heavy I/O (large batch uploads)
+  // is a known, already-handled condition elsewhere -- every raw upload
+  // function (uploadFileToWdgwars/Wardrift) retries its own SD.open() via
+  // sdTryRecover() for exactly this reason. This whole function retries
+  // once (recovering SD first) if ANY step fails, not just the initial
+  // open: a recovery triggered by one file's open failure (or by an earlier
+  // unrelated gzip call) can leave a file opened *after* it -- e.g. this
+  // call's own freshly-opened `out` -- in a card state that still isn't
+  // fully settled, so the write itself can fail even though the open
+  // succeeded. That failure used to be completely silent (gzCompressStream()
+  // logs nothing on a write failure) and fatal: gzipCompressFileToFile()
+  // just returned false, short-circuiting the caller's `&&` before
+  // uploadFileToWdgwars() ever ran, with zero trace in the log of why that
+  // file was skipped.
+  for (int attempt = 1; attempt <= 2; attempt++) {
+    File in = SD.open(srcPath, FILE_READ);
+    if (!in) {
+      Serial.printf("[GZIP] Cannot open source %s (attempt %d/2)\n", srcPath.c_str(), attempt);
+      if (attempt < 2 && sdTryRecover()) continue;
+      return false;
+    }
+    if (SD.exists(dstPath)) SD.remove(dstPath);
+    File out = SD.open(dstPath, FILE_WRITE);
+    if (!out) {
+      Serial.printf("[GZIP] Cannot create %s (attempt %d/2)\n", dstPath.c_str(), attempt);
+      in.close();
+      if (attempt < 2 && sdTryRecover()) continue;
+      return false;
+    }
 
-  GzipSink sink;
-  sink.out = out;
-  bool ok = gzCompressStream(sink, [&](uint8_t* buf, size_t cap) -> int { return in.read(buf, cap); });
-  in.close();
-  out.close();
-  if (!ok) SD.remove(dstPath);
-  return ok;
+    GzipSink sink;
+    sink.out = out;
+    bool ok = gzCompressStream(sink, [&](uint8_t* buf, size_t cap) -> int { return in.read(buf, cap); });
+    in.close();
+    out.close();
+    if (!ok) {
+      SD.remove(dstPath);
+      Serial.printf("[GZIP] Compression failed for %s (attempt %d/2) -- attempting SD recovery\n", srcPath.c_str(), attempt);
+      if (attempt < 2 && sdTryRecover()) continue;
+      return false;
+    }
+    return true;
+  }
+  return false;
 }
 
 // Merges multiple WiGLE CSVs into one gzip-compressed archive: the first
@@ -1159,46 +1178,66 @@ static bool gzipCompressFileToFile(const String& srcPath, const String& dstPath)
 // to open are skipped.
 static bool gzipCompressMergedFilesToFile(const std::vector<String>& srcPaths, const String& dstPath) {
   if (srcPaths.empty()) return false;
-  if (SD.exists(dstPath)) SD.remove(dstPath);
-  File out = SD.open(dstPath, FILE_WRITE);
-  if (!out) { Serial.printf("[GZIP] Cannot create %s\n", dstPath.c_str()); return false; }
 
-  GzipSink sink;
-  sink.out = out;
-
-  size_t nextIdx = 0;
-  File cur;
-  bool headerWritten = false;  // set once the merged output has its first byte
-
-  bool ok = gzCompressStream(sink, [&](uint8_t* buf, size_t cap) -> int {
-    for (;;) {
-      if (cur) {
-        int n = cur.read(buf, cap);
-        if (n > 0) { headerWritten = true; return n; }
-        cur.close();
-      }
-      if (nextIdx >= srcPaths.size()) return 0;
-      cur = SD.open(srcPaths[nextIdx], FILE_READ);
-      if (!cur) {
-        // Same SD-bus-recovery rationale as gzipCompressFileToFile() above --
-        // without this, one wedged-bus moment mid-batch silently skipped
-        // every remaining file instead of recovering and continuing.
-        Serial.printf("[GZIP] Cannot open %s -- attempting SD recovery\n", srcPaths[nextIdx].c_str());
-        if (sdTryRecover()) cur = SD.open(srcPaths[nextIdx], FILE_READ);
-      }
-      nextIdx++;
-      if (!cur) continue;  // skip a file that still fails to open, try the next one
-      if (headerWritten) {
-        if (cur.available()) cur.readStringUntil('\n');
-        if (cur.available()) cur.readStringUntil('\n');
-      }
+  // Retries the whole merge (fresh `out`, restarting from the first source
+  // file) once if the overall compression fails for any reason -- see the
+  // matching comment in gzipCompressFileToFile() for why a per-file-open
+  // recovery alone isn't enough: `out` is opened once, up front, for the
+  // entire merge, so a recovery triggered mid-merge by one file's open
+  // failure can leave that already-open `out` handle invalidated by the
+  // SD.end()/remount underneath it, failing every write for the rest of
+  // the merge even though the per-file open itself was successfully
+  // recovered.
+  for (int attempt = 1; attempt <= 2; attempt++) {
+    if (SD.exists(dstPath)) SD.remove(dstPath);
+    File out = SD.open(dstPath, FILE_WRITE);
+    if (!out) {
+      Serial.printf("[GZIP] Cannot create %s (attempt %d/2)\n", dstPath.c_str(), attempt);
+      if (attempt < 2 && sdTryRecover()) continue;
+      return false;
     }
-  });
 
-  if (cur) cur.close();
-  out.close();
-  if (!ok) SD.remove(dstPath);
-  return ok;
+    GzipSink sink;
+    sink.out = out;
+
+    size_t nextIdx = 0;
+    File cur;
+    bool headerWritten = false;  // set once the merged output has its first byte
+
+    bool ok = gzCompressStream(sink, [&](uint8_t* buf, size_t cap) -> int {
+      for (;;) {
+        if (cur) {
+          int n = cur.read(buf, cap);
+          if (n > 0) { headerWritten = true; return n; }
+          cur.close();
+        }
+        if (nextIdx >= srcPaths.size()) return 0;
+        cur = SD.open(srcPaths[nextIdx], FILE_READ);
+        if (!cur) {
+          // Same SD-bus-recovery rationale as gzipCompressFileToFile() above.
+          Serial.printf("[GZIP] Cannot open %s -- attempting SD recovery\n", srcPaths[nextIdx].c_str());
+          if (sdTryRecover()) cur = SD.open(srcPaths[nextIdx], FILE_READ);
+        }
+        nextIdx++;
+        if (!cur) continue;  // skip a file that still fails to open, try the next one
+        if (headerWritten) {
+          if (cur.available()) cur.readStringUntil('\n');
+          if (cur.available()) cur.readStringUntil('\n');
+        }
+      }
+    });
+
+    if (cur) cur.close();
+    out.close();
+    if (!ok) {
+      SD.remove(dstPath);
+      Serial.printf("[GZIP] Merged compression failed (attempt %d/2) -- attempting SD recovery\n", attempt);
+      if (attempt < 2 && sdTryRecover()) continue;
+      return false;
+    }
+    return true;
+  }
+  return false;
 }
 
 // ================================================================

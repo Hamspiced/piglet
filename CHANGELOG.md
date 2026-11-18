@@ -1,5 +1,12 @@
 # Changelog
 
+## v3.10 (2026-11-18)
+
+### Bug Fixes
+- **WiGLE's merged-archive upload and some WDGoWars files could still fail silently after v3.09's SD-recovery fix** -- `sdTryRecover()` does a full SD unmount/remount, which invalidates every *other* already-open file handle on the card, not just the one being retried. `gzipCompressMergedFilesToFile()` opens its output file once, up front, before iterating source files; if a recovery fired mid-merge to fix one source file's open failure, that already-open output handle was left stale by the remount underneath it, so every subsequent write to it failed -- the merge kept failing even when the per-file recovery it logged had reported success. The same silent-write-failure mode could also skip a WDGWars file with no log line at all right after a prior recovery, since a write failure inside the gzip compressor was never logged to begin with. Since WiGLE never succeeded, no file could ever satisfy "every configured service done," so batches kept reporting 0 files moved even when WDGoWars/Wardrift uploads were individually succeeding. `gzipCompressFileToFile()` and `gzipCompressMergedFilesToFile()` now retry the *entire* compression (fresh output file included) once via `sdTryRecover()` if it fails for any reason, and every failure path now logs instead of failing silently. Applied to both the main Piglet firmware and the T-Dongle C5 standalone firmware.
+
+---
+
 ## v3.09 (2026-11-18)
 
 ### Bug Fixes
