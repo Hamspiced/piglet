@@ -1,5 +1,15 @@
 # Changelog
 
+## v3.09 (2026-11-18)
+
+### Bug Fixes
+- **A single SD-bus hiccup mid-batch could fail every remaining file in a large upload batch** -- after sustained heavy SD I/O (e.g. a batch of 15+ pending CSVs), the SD/SPI bus can transiently wedge, a known condition already self-healed elsewhere via a full unmount/remount (`sdTryRecover()`): every raw upload function (WiGLE/WDGoWars/Wardrift) already retries through it. The gzip-compression helpers (`gzipCompressFileToFile()`, used for WDGoWars; `gzipCompressMergedFilesToFile()`, used for WiGLE's merged archive) and the upload-status ledger writer never did, so whenever gzip uploads were enabled (the default), one wedged-bus moment could silently fail the WiGLE archive and every subsequent WDGoWars file for the rest of that boot's batch, and could also lose a just-succeeded upload's ledger entry (causing a needless re-upload next boot). All three now retry once via the same SD recovery path as the rest of the upload pipeline. Applied to both the main Piglet firmware and the T-Dongle C5 standalone firmware.
+
+### Technical Changes
+- **Repository cleanup** -- removed ~150MB of compiled build artifacts (`.elf`/`.map`/`.bin`/etc.) that had been accidentally committed across all three sketches' `build/` output directories; `build/` is now gitignored so this can't recur. Removed a leftover debug block from `wigleTestToken()` that dumped WiFi/DNS internals on every check. Refreshed several stale comments (the top-of-file header in `Piglet.ino`, which still described a single-board WiGLE-only version of the firmware; the battery-test feature's "uncomment to enable" comments, which haven't reflected reality since it became runtime-gated via the `batteryTest` config key). No functional changes from this section.
+
+---
+
 ## v3.08 (2026-11-16)
 
 ### Technical Changes

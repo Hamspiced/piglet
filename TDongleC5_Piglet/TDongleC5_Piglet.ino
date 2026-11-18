@@ -103,7 +103,7 @@ struct FileUploadState {
 };
 
 // Firmware version
-#define FIRMWARE_VERSION "v3.08"
+#define FIRMWARE_VERSION "v3.09"
 
 // ---------------- Pins (T-DONGLE C5) ----------------
 struct PinMap {
@@ -1127,6 +1127,18 @@ bool gzCompressStream(GzipSink& sink, const std::function<int(uint8_t*, size_t)>
 // any allocation/SD/compression failure; dstPath is removed in that case.
 static bool gzipCompressFileToFile(const String& srcPath, const String& dstPath) {
   File in = SD.open(srcPath, FILE_READ);
+  if (!in) {
+    // The SD/SPI bus wedging after sustained heavy I/O (large batch uploads)
+    // is a known, already-handled condition elsewhere -- every raw upload
+    // function (uploadFileToWdgwars/Wardrift) retries its own SD.open() via
+    // sdTryRecover() for exactly this reason. This gzip helper used to skip
+    // that retry entirely, so whenever gzipUploads was enabled (the
+    // default), a single mid-batch SD hiccup silently failed every
+    // remaining file in the batch instead of self-healing like the non-gzip
+    // path did.
+    Serial.printf("[GZIP] Cannot open source %s -- attempting SD recovery\n", srcPath.c_str());
+    if (sdTryRecover()) in = SD.open(srcPath, FILE_READ);
+  }
   if (!in) { Serial.printf("[GZIP] Cannot open source %s\n", srcPath.c_str()); return false; }
   if (SD.exists(dstPath)) SD.remove(dstPath);
   File out = SD.open(dstPath, FILE_WRITE);
@@ -1167,8 +1179,15 @@ static bool gzipCompressMergedFilesToFile(const std::vector<String>& srcPaths, c
       }
       if (nextIdx >= srcPaths.size()) return 0;
       cur = SD.open(srcPaths[nextIdx], FILE_READ);
+      if (!cur) {
+        // Same SD-bus-recovery rationale as gzipCompressFileToFile() above --
+        // without this, one wedged-bus moment mid-batch silently skipped
+        // every remaining file instead of recovering and continuing.
+        Serial.printf("[GZIP] Cannot open %s -- attempting SD recovery\n", srcPaths[nextIdx].c_str());
+        if (sdTryRecover()) cur = SD.open(srcPaths[nextIdx], FILE_READ);
+      }
       nextIdx++;
-      if (!cur) continue;
+      if (!cur) continue;  // skip a file that still fails to open, try the next one
       if (headerWritten) {
         if (cur.available()) cur.readStringUntil('\n');
         if (cur.available()) cur.readStringUntil('\n');
@@ -1230,6 +1249,16 @@ bool writeUploadLedger(const std::vector<UploadLedgerEntry>& entries) {
   if (SD.exists(UPLOAD_STATE_PATH)) SD.remove(UPLOAD_STATE_PATH);
   if (entries.empty()) return true;
   File f = SD.open(UPLOAD_STATE_PATH, FILE_WRITE);
+  if (!f) {
+    // Same SD-bus-recovery rationale as the gzip helpers above: a wedged bus
+    // after a large batch's heavy I/O can make this write fail even though
+    // the card is otherwise fine. Without this retry, the just-succeeded
+    // upload this call is recording would silently lose its ledger entry,
+    // making the file look never-uploaded to that service on the next boot
+    // (and get needlessly re-sent).
+    Serial.println("[UPLOADSTATE] Failed to open ledger for write -- attempting SD recovery");
+    if (sdTryRecover()) f = SD.open(UPLOAD_STATE_PATH, FILE_WRITE);
+  }
   if (!f) { Serial.println("[UPLOADSTATE] Failed to open ledger for write"); return false; }
   for (const auto& e : entries) {
     f.print(e.filename); f.print('|');

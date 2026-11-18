@@ -1,5 +1,6 @@
 #include "UploadState.h"
 #include "Globals.h"
+#include "SDUtils.h"
 #include <SD.h>
 #include <vector>
 
@@ -50,6 +51,16 @@ bool writeLedger(const std::vector<LedgerEntry>& entries) {
   if (entries.empty()) return true;
 
   File f = SD.open(STATE_PATH, FILE_WRITE);
+  if (!f) {
+    // Same SD-bus-recovery rationale as the gzip helpers in GzipDeflate.cpp:
+    // a wedged bus after a large batch's heavy I/O can make this write fail
+    // even though the card is otherwise fine. Without this retry, the
+    // just-succeeded upload this call is recording would silently lose its
+    // ledger entry, making the file look never-uploaded to that service on
+    // the next boot (and get needlessly re-sent).
+    Serial.println("[UPLOADSTATE] Failed to open ledger for write -- attempting SD recovery");
+    if (sdTryRecover()) f = SD.open(STATE_PATH, FILE_WRITE);
+  }
   if (!f) {
     Serial.println("[UPLOADSTATE] Failed to open ledger for write");
     return false;

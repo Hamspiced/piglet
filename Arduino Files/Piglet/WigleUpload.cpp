@@ -70,24 +70,6 @@ bool wigleTestToken() {
   client.setInsecure();
   client.setTimeout(15000);
 
-  // Optional debug
-  Serial.printf("[NET] status=%d ssid=%s rssi=%d\n",
-                (int)WiFi.status(),
-                WiFi.SSID().c_str(),
-                WiFi.RSSI());
-  Serial.printf("[NET] ip=%s gw=%s dns=%s\n",
-                WiFi.localIP().toString().c_str(),
-                WiFi.gatewayIP().toString().c_str(),
-                WiFi.dnsIP().toString().c_str());
-
-  IPAddress ip;
-  if (!WiFi.hostByName(WIGLE_HOST, ip)) {
-    Serial.println("[NET] DNS FAIL for api.wigle.net");
-  } else {
-    Serial.print("[NET] api.wigle.net -> ");
-    Serial.println(ip);
-  }
-
   // Retry TLS connect -- transient esp-aes/DMA-descriptor allocation
   // failures (logged as "esp-aes: Failed to allocate memory") can make a
   // single connect() attempt fail even though overall free heap looks

@@ -1,18 +1,20 @@
 /*
- * XIAO ESP32S3 2.4GHz Wardriver (WiGLE CSV + GPS + SD + OLED + Web UI)
+ * Piglet Wardriver -- Seeed XIAO ESP32-S3/C5/C6 (SSD1306 OLED + Web UI)
  *
- * Features:
- * - 2.4GHz WiFi scan -> WiGLE CSV on SD (append GPS per row)
- * - SSD1306 OLED status
- * - User button toggles scanning on/off
- * - Boot: start SoftAP (192.168.4.1), attempt STA to home WiFi
- * - If STA connects: upload previous CSV files to WiGLE using Basic token
- * - Web UI: browse/download/delete files, edit config (saved to SD)
- * - SoftAP only lasts 60 seconds; then wardrive begins
+ * WiFi scan (2.4GHz, plus 5GHz on the dual-band ESP32-C5) -> WiGLE-format
+ * CSV on SD, GPS-tagged per row. Uploads pending CSVs to WiGLE, WDGoWars,
+ * and/or Wardrift over HTTPS, whichever services have credentials
+ * configured. Self-updates from GitHub Releases and can push firmware to
+ * ESP-Now mesh nodes while acting as a mesh Core. Boots SoftAP (192.168.4.1)
+ * for initial config / Web UI access if no home WiFi is configured or
+ * reachable; otherwise connects STA, runs boot uploads, then wardrives.
  *
- * NOTES:
- * - Pins below are for XIAO ESP32-S3 WITHOUT Sense expansion.
- * - WiGLE CSV format: WigleWifi-1.4 header + standard columns.
+ * Pin mapping is board-specific and auto-detected by chip model at boot
+ * (overridable via the `board` config key) -- see PinMapDefs.h.
+ *
+ * This is the primary multi-board sketch; TDongleC5_Piglet/ and
+ * PigletNode/ are separate single-file ports for other hardware and do
+ * not share code with this sketch.
  */
 
 #include <Arduino.h>
@@ -40,7 +42,9 @@
 #include "WardriveGoBLE.h"
 #include "FirmwareUpdate.h"
 
-// -------- Battery Test (uncomment to enable) --------
+// -------- Battery Test --------
+// Always compiled in; actually enabled/disabled at runtime via the
+// `batteryTest` config key -- see battery_test.h.
 #include "battery_test.h"
 
 // ---------------- Deep Sleep ----------------
@@ -1066,7 +1070,7 @@ void loop() {
     }
   }
 
-  // Battery test tick (uncomment to enable)
+  // Battery test tick -- no-op unless cfg.batteryTest enabled it in setup()
   batteryTestTick();
 
   delay(10);

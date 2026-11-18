@@ -2,6 +2,7 @@
 #include <SD.h>
 #include <functional>
 #include "esp_heap_caps.h"
+#include "SDUtils.h"
 
 // ---- Trimmed ROM miniz declarations ----
 // The ESP32-C5 boot ROM links Espressif's miniz tdefl_* compressor at fixed
@@ -218,6 +219,17 @@ bool compressStream(GzipSink& sink, const std::function<int(uint8_t*, size_t)>& 
 bool gzipCompressFileToFile(const String& srcPath, const String& dstPath) {
   File in = SD.open(srcPath, FILE_READ);
   if (!in) {
+    // The SD/SPI bus wedging after sustained heavy I/O (large batch uploads)
+    // is a known, already-handled condition elsewhere -- every raw upload
+    // function (uploadFileToWigle/Wdgwars/Wardrift) retries its own SD.open()
+    // via sdTryRecover() for exactly this reason. This gzip helper used to
+    // skip that retry entirely, so whenever gzipUploads was enabled (the
+    // default), a single mid-batch SD hiccup silently failed every remaining
+    // file in the batch instead of self-healing like the non-gzip path did.
+    Serial.printf("[GZIP] Cannot open source %s -- attempting SD recovery\n", srcPath.c_str());
+    if (sdTryRecover()) in = SD.open(srcPath, FILE_READ);
+  }
+  if (!in) {
     Serial.printf("[GZIP] Cannot open source %s\n", srcPath.c_str());
     return false;
   }
@@ -268,8 +280,15 @@ bool gzipCompressMergedFilesToFile(const std::vector<String>& srcPaths, const St
       }
       if (nextIdx >= srcPaths.size()) return 0;
       cur = SD.open(srcPaths[nextIdx], FILE_READ);
+      if (!cur) {
+        // Same SD-bus-recovery rationale as gzipCompressFileToFile() above --
+        // without this, one wedged-bus moment mid-batch silently skipped
+        // every remaining file instead of recovering and continuing.
+        Serial.printf("[GZIP] Cannot open %s -- attempting SD recovery\n", srcPaths[nextIdx].c_str());
+        if (sdTryRecover()) cur = SD.open(srcPaths[nextIdx], FILE_READ);
+      }
       nextIdx++;
-      if (!cur) continue;  // skip a file that fails to open, try the next one
+      if (!cur) continue;  // skip a file that still fails to open, try the next one
       if (headerWritten) {
         if (cur.available()) cur.readStringUntil('\n');
         if (cur.available()) cur.readStringUntil('\n');
