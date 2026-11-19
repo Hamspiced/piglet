@@ -383,7 +383,7 @@ static void runFirmwareUpdateBootMode(bool lcdOk) {
 //  page keeps showing the same banner for the rest of this session (see
 //  drawPageStatus()).
 // ================================================================
-static const uint32_t FW_BOOT_PROMPT_MS = 20000;
+static const uint32_t FW_BOOT_PROMPT_MS = 10000;
 
 static void waitForUpdatePromptOrTimeout(bool lcdOk) {
   if (pins.btn < 0) return;  // no button on this board -- nothing to wait on

@@ -235,7 +235,15 @@ bool gzipCompressFileToFile(const String& srcPath, const String& dstPath) {
     File in = SD.open(srcPath, FILE_READ);
     if (!in) {
       Serial.printf("[GZIP] Cannot open source %s (attempt %d/2)\n", srcPath.c_str(), attempt);
-      if (attempt < 2 && sdTryRecover()) continue;
+      // Call sdTryRecover() for its side effect (attempts a real remount
+      // unless rate-limited) but don't gate the retry on its return value --
+      // a `false` here just as often means "skipped, already recovered a
+      // moment ago by an earlier caller" as "a real recovery just failed",
+      // and treating the former as a reason to give up was silently
+      // defeating this exact retry the first time a nearby caller (e.g. the
+      // per-file-open retry inside gzipCompressMergedFilesToFile()) had
+      // already consumed the 4s cooldown moments earlier.
+      if (attempt < 2) { sdTryRecover(); continue; }
       return false;
     }
     if (SD.exists(dstPath)) SD.remove(dstPath);
@@ -243,7 +251,7 @@ bool gzipCompressFileToFile(const String& srcPath, const String& dstPath) {
     if (!out) {
       Serial.printf("[GZIP] Cannot create %s (attempt %d/2)\n", dstPath.c_str(), attempt);
       in.close();
-      if (attempt < 2 && sdTryRecover()) continue;
+      if (attempt < 2) { sdTryRecover(); continue; }
       return false;
     }
 
@@ -256,8 +264,8 @@ bool gzipCompressFileToFile(const String& srcPath, const String& dstPath) {
     out.close();
     if (!ok) {
       SD.remove(dstPath);
-      Serial.printf("[GZIP] Compression failed for %s (attempt %d/2) -- attempting SD recovery\n", srcPath.c_str(), attempt);
-      if (attempt < 2 && sdTryRecover()) continue;
+      Serial.printf("[GZIP] Compression failed for %s (attempt %d/2)\n", srcPath.c_str(), attempt);
+      if (attempt < 2) { sdTryRecover(); continue; }
       return false;
     }
     return true;
@@ -284,7 +292,9 @@ bool gzipCompressMergedFilesToFile(const std::vector<String>& srcPaths, const St
     File out = SD.open(dstPath, FILE_WRITE);
     if (!out) {
       Serial.printf("[GZIP] Cannot create %s (attempt %d/2)\n", dstPath.c_str(), attempt);
-      if (attempt < 2 && sdTryRecover()) continue;
+      // See the matching comment in gzipCompressFileToFile() for why the
+      // retry isn't gated on sdTryRecover()'s return value.
+      if (attempt < 2) { sdTryRecover(); continue; }
       return false;
     }
 
@@ -308,9 +318,13 @@ bool gzipCompressMergedFilesToFile(const std::vector<String>& srcPaths, const St
         if (nextIdx >= srcPaths.size()) return 0;
         cur = SD.open(srcPaths[nextIdx], FILE_READ);
         if (!cur) {
-          // Same SD-bus-recovery rationale as gzipCompressFileToFile() above.
+          // Same SD-bus-recovery rationale as gzipCompressFileToFile() above
+          // -- always retry the open after calling sdTryRecover(), regardless
+          // of whether it was rate-limited (the card may already be fine from
+          // a just-prior recovery elsewhere).
           Serial.printf("[GZIP] Cannot open %s -- attempting SD recovery\n", srcPaths[nextIdx].c_str());
-          if (sdTryRecover()) cur = SD.open(srcPaths[nextIdx], FILE_READ);
+          sdTryRecover();
+          cur = SD.open(srcPaths[nextIdx], FILE_READ);
         }
         nextIdx++;
         if (!cur) continue;  // skip a file that still fails to open, try the next one
@@ -325,8 +339,8 @@ bool gzipCompressMergedFilesToFile(const std::vector<String>& srcPaths, const St
     out.close();
     if (!ok) {
       SD.remove(dstPath);
-      Serial.printf("[GZIP] Merged compression failed (attempt %d/2) -- attempting SD recovery\n", attempt);
-      if (attempt < 2 && sdTryRecover()) continue;
+      Serial.printf("[GZIP] Merged compression failed (attempt %d/2)\n", attempt);
+      if (attempt < 2) { sdTryRecover(); continue; }
       return false;
     }
     return true;

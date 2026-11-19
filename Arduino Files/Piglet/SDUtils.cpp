@@ -97,7 +97,18 @@ bool sdBeginBestClock(uint8_t csPin) {
 static uint32_t sdLastRecoverMs = 0;
 bool sdTryRecover() {
   uint32_t now = millis();
-  if (now - sdLastRecoverMs < 4000) return false;
+  if (now - sdLastRecoverMs < 4000) {
+    // Silently returning false here used to be indistinguishable in the log
+    // from "recovery ran and failed" -- a caller chaining a second recovery
+    // attempt moments after a successful first one (e.g. gzipCompress*ToFile()
+    // retrying its own open-then-compress sequence) would see this as "recovery
+    // failed" and give up, even though the card was already healthy from that
+    // first recovery. Logging the skip makes that distinction visible instead
+    // of looking like an unexplained dead end.
+    Serial.printf("[SD] Recovery skipped (rate-limited, %lums since last attempt)\n",
+                  (unsigned long)(now - sdLastRecoverMs));
+    return false;
+  }
   sdLastRecoverMs = now;
 
   Serial.println("[SD] Attempting SD bus recovery (SD.end + reinit)...");

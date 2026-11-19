@@ -630,6 +630,26 @@ bool uploadFileToWdgwars(const String& path) {
     return true;
   }
 
+  // WDGoWars's genuine duplicate signal is HTTP 409 with "error":"duplicate_upload"
+  // in the body -- it means this exact file (same byte-for-byte content) was
+  // already uploaded previously. Treat it as a successful/already-synced
+  // outcome so markServiceDone() still runs for WDGoWars; otherwise this file
+  // is retried on every subsequent boot forever. (Not the same signal shape as
+  // Wardrift's duplicate marker -- that's HTTP 200 with "duplicate":true.)
+  if (code == 409 && body.indexOf("\"duplicate_upload\"") >= 0) {
+    String when = "";
+    int dIdx = body.indexOf("\"duplicate_at\":");
+    if (dIdx >= 0) {
+      int q1 = body.indexOf('"', dIdx + 16);
+      int q2 = (q1 >= 0) ? body.indexOf('"', q1 + 1) : -1;
+      if (q1 >= 0 && q2 > q1) when = body.substring(q1 + 1, q2);
+    }
+    uploadLastResult = when.length() ? ("Already uploaded (" + when + ")") : "Already uploaded (duplicate)";
+    Serial.printf("[WDGWars] Duplicate upload -- already synced%s%s\n",
+                  when.length() ? ": " : "", when.c_str());
+    return true;
+  }
+
   uploadLastResult = "WDGW fail (" + String(code) + ")";
   Serial.printf("[WDGWars] Upload FAILED HTTP %d: %s\n", code, body.c_str());
   return false;

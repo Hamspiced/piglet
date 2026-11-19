@@ -103,7 +103,7 @@ struct FileUploadState {
 };
 
 // Firmware version
-#define FIRMWARE_VERSION "v3.10"
+#define FIRMWARE_VERSION "v3.11"
 
 // ---------------- Pins (T-DONGLE C5) ----------------
 struct PinMap {
@@ -1144,7 +1144,11 @@ static bool gzipCompressFileToFile(const String& srcPath, const String& dstPath)
     File in = SD.open(srcPath, FILE_READ);
     if (!in) {
       Serial.printf("[GZIP] Cannot open source %s (attempt %d/2)\n", srcPath.c_str(), attempt);
-      if (attempt < 2 && sdTryRecover()) continue;
+      // Call sdTryRecover() for its side effect (attempts a real remount
+      // unless rate-limited) but don't gate the retry on its return value --
+      // a `false` here just as often means "skipped, already recovered a
+      // moment ago by an earlier caller" as "a real recovery just failed".
+      if (attempt < 2) { sdTryRecover(); continue; }
       return false;
     }
     if (SD.exists(dstPath)) SD.remove(dstPath);
@@ -1152,7 +1156,7 @@ static bool gzipCompressFileToFile(const String& srcPath, const String& dstPath)
     if (!out) {
       Serial.printf("[GZIP] Cannot create %s (attempt %d/2)\n", dstPath.c_str(), attempt);
       in.close();
-      if (attempt < 2 && sdTryRecover()) continue;
+      if (attempt < 2) { sdTryRecover(); continue; }
       return false;
     }
 
@@ -1163,8 +1167,8 @@ static bool gzipCompressFileToFile(const String& srcPath, const String& dstPath)
     out.close();
     if (!ok) {
       SD.remove(dstPath);
-      Serial.printf("[GZIP] Compression failed for %s (attempt %d/2) -- attempting SD recovery\n", srcPath.c_str(), attempt);
-      if (attempt < 2 && sdTryRecover()) continue;
+      Serial.printf("[GZIP] Compression failed for %s (attempt %d/2)\n", srcPath.c_str(), attempt);
+      if (attempt < 2) { sdTryRecover(); continue; }
       return false;
     }
     return true;
@@ -1193,7 +1197,9 @@ static bool gzipCompressMergedFilesToFile(const std::vector<String>& srcPaths, c
     File out = SD.open(dstPath, FILE_WRITE);
     if (!out) {
       Serial.printf("[GZIP] Cannot create %s (attempt %d/2)\n", dstPath.c_str(), attempt);
-      if (attempt < 2 && sdTryRecover()) continue;
+      // See the matching comment in gzipCompressFileToFile() for why the
+      // retry isn't gated on sdTryRecover()'s return value.
+      if (attempt < 2) { sdTryRecover(); continue; }
       return false;
     }
 
@@ -1214,9 +1220,12 @@ static bool gzipCompressMergedFilesToFile(const std::vector<String>& srcPaths, c
         if (nextIdx >= srcPaths.size()) return 0;
         cur = SD.open(srcPaths[nextIdx], FILE_READ);
         if (!cur) {
-          // Same SD-bus-recovery rationale as gzipCompressFileToFile() above.
+          // Same SD-bus-recovery rationale as gzipCompressFileToFile() above
+          // -- always retry the open after calling sdTryRecover(), regardless
+          // of whether it was rate-limited.
           Serial.printf("[GZIP] Cannot open %s -- attempting SD recovery\n", srcPaths[nextIdx].c_str());
-          if (sdTryRecover()) cur = SD.open(srcPaths[nextIdx], FILE_READ);
+          sdTryRecover();
+          cur = SD.open(srcPaths[nextIdx], FILE_READ);
         }
         nextIdx++;
         if (!cur) continue;  // skip a file that still fails to open, try the next one
@@ -1231,8 +1240,8 @@ static bool gzipCompressMergedFilesToFile(const std::vector<String>& srcPaths, c
     out.close();
     if (!ok) {
       SD.remove(dstPath);
-      Serial.printf("[GZIP] Merged compression failed (attempt %d/2) -- attempting SD recovery\n", attempt);
-      if (attempt < 2 && sdTryRecover()) continue;
+      Serial.printf("[GZIP] Merged compression failed (attempt %d/2)\n", attempt);
+      if (attempt < 2) { sdTryRecover(); continue; }
       return false;
     }
     return true;
@@ -1559,6 +1568,25 @@ static bool uploadFileToWdgwars(const String& path) {
     Serial.printf("[WDGWars] Accepted for import (job_id=%d)\n", jobId);
     return true;
   }
+  // WDGoWars's genuine duplicate signal is HTTP 409 with "error":"duplicate_upload"
+  // in the body -- it means this exact file (same byte-for-byte content) was
+  // already uploaded previously. Treat it as a successful/already-synced
+  // outcome so markServiceDone() still runs for WDGoWars; otherwise this file
+  // is retried on every subsequent boot forever. (Not the same signal shape as
+  // Wardrift's duplicate marker -- that's HTTP 200 with "duplicate":true.)
+  if (code == 409 && body.indexOf("\"duplicate_upload\"") >= 0) {
+    String when = "";
+    int dIdx = body.indexOf("\"duplicate_at\":");
+    if (dIdx >= 0) {
+      int q1 = body.indexOf('"', dIdx + 16);
+      int q2 = (q1 >= 0) ? body.indexOf('"', q1 + 1) : -1;
+      if (q1 >= 0 && q2 > q1) when = body.substring(q1 + 1, q2);
+    }
+    uploadLastResult = when.length() ? ("Already uploaded (" + when + ")") : "Already uploaded (duplicate)";
+    Serial.printf("[WDGWars] Duplicate upload -- already synced%s%s\n",
+                  when.length() ? ": " : "", when.c_str());
+    return true;
+  }
   uploadLastResult = "WDGW fail (" + String(code) + ")";
   Serial.printf("[WDGWars] Upload FAILED HTTP %d: %s\n", code, body.c_str());
   return false;
@@ -1786,7 +1814,18 @@ static bool uploadFileToWardrift(const String& path) {
 static uint32_t sdLastRecoverMs = 0;
 static bool sdTryRecover() {
   uint32_t now = millis();
-  if (now - sdLastRecoverMs < 4000) return false;
+  if (now - sdLastRecoverMs < 4000) {
+    // Silently returning false here used to be indistinguishable in the log
+    // from "recovery ran and failed" -- a caller chaining a second recovery
+    // attempt moments after a successful first one (e.g. gzipCompress*ToFile()
+    // retrying its own open-then-compress sequence) would see this as "recovery
+    // failed" and give up, even though the card was already healthy from that
+    // first recovery. Logging the skip makes that distinction visible instead
+    // of looking like an unexplained dead end.
+    Serial.printf("[SD] Recovery skipped (rate-limited, %lums since last attempt)\n",
+                  (unsigned long)(now - sdLastRecoverMs));
+    return false;
+  }
   sdLastRecoverMs = now;
 
   Serial.println("[SD] Attempting SD bus recovery (full re-init)...");
@@ -8042,7 +8081,7 @@ static void runFirmwareUpdateBootMode() {
 //  showing the same banner for the rest of this session (see
 //  updateTFT()).
 // ================================================================
-static const uint32_t FW_BOOT_PROMPT_MS = 20000;
+static const uint32_t FW_BOOT_PROMPT_MS = 10000;
 
 static void waitForUpdatePromptOrTimeout() {
   if (PINS.btn < 0) return;  // no button on this board -- nothing to wait on

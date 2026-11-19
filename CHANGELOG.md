@@ -1,5 +1,16 @@
 # Changelog
 
+## v3.11 (2026-11-18)
+
+### Bug Fixes
+- **v3.10's gzip SD-recovery retry could still silently give up after a single successful recovery** -- `sdTryRecover()` is rate-limited to one real recovery attempt per 4 seconds; calling it again sooner silently returned `false` with no log output, indistinguishable from "recovery ran and failed." In the field, a per-file-open recovery inside a merge would succeed, but the outer retry's own call to `sdTryRecover()` moments later landed inside that same 4-second window and was silently rate-limited -- so the gated `if (attempt < 2 && sdTryRecover()) continue;` retry logic never fired a second attempt, even though the card was already healthy. `sdTryRecover()` now logs when a call is skipped for being rate-limited, and the gzip retry paths in `GzipDeflate.cpp` (and TDongle's inline copy) always retry once regardless of that return value, since a rate-limited skip doesn't mean the card is actually broken. Applied to both the main Piglet firmware and the T-Dongle C5 standalone firmware.
+- **Files already uploaded to WDGoWars kept retrying forever** -- WDGoWars' real duplicate-upload signal is HTTP `409` with `"error":"duplicate_upload"` in the body (meaning this exact file, byte-for-byte, was already uploaded), but `uploadFileToWdgwars()` only ever treated HTTP `202` as success; a `409` fell through to the generic failure path. Since `markServiceDone()` is only called on success, the file's WDGoWars ledger entry was never marked done, so it was resubmitted -- and rejected as a duplicate again -- on every subsequent boot indefinitely. A `409` with the `duplicate_upload` error is now treated as a successful/already-synced outcome. (This is a different signal shape than Wardrift's duplicate marker, which is HTTP `200` with `"duplicate":true` -- not confused with it.) Applied to both the main Piglet firmware and the T-Dongle C5 standalone firmware.
+
+### Technical Changes
+- **Boot-time "Update available" prompt countdown shortened from 20 seconds to 10 seconds** -- confirmed the countdown itself never runs scanning, uploads, or the web server (all begin strictly after it elapses or the device reboots into download mode on a button press), so this only shortens how long boot pauses waiting for a press. Applied to both the main Piglet firmware and the T-Dongle C5 standalone firmware.
+
+---
+
 ## v3.10 (2026-11-18)
 
 ### Bug Fixes
