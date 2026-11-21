@@ -1,0 +1,30 @@
+# PlatformIO / Arduino build output
+.pio/
+.pioenvs/
+.piolibdeps/
+build/
+*.o
+*.a
+*.elf
+*.bin
+*.map
+*.ino.cpp
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
+
+# Local bench scratch, captures, and SD exports
+work/
+.upstream-piglet/
+logs/
+uploaded/
+captures/
+*.log
+__pycache__/
+*.pyc
+.env
+.env.*
+!.env.example

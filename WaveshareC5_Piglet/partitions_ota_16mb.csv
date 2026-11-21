@@ -1,0 +1,20 @@
+# Two-slot OTA partition table for the 16 MB ESP32-C5.
+#
+# nvs and otadata keep the standard offsets/sizes (0x9000/0x5000 and
+# 0xe000/0x2000) so saved settings survive a table change. App slots are 6 MB
+# each against a ~1.5 MB image -- the C5 build links large (Arduino core 3 /
+# IDF 5.5) and the 16 MB part has the room.
+#
+#   0x009000   20 KB  nvs
+#   0x00E000    8 KB  otadata     which slot the bootloader should run
+#   0x010000    6 MB  app0
+#   0x610000    6 MB  app1
+#   0xC10000   64 KB  coredump
+#   0xC20000  ~3.9 MB (free)      unassigned
+#
+# Name,   Type, SubType, Offset,    Size,     Flags
+nvs,      data, nvs,     0x9000,    0x5000,
+otadata,  data, ota,     0xe000,    0x2000,
+app0,     app,  ota_0,   0x10000,   0x600000,
+app1,     app,  ota_1,   0x610000,  0x600000,
+coredump, data, coredump,0xC10000,  0x10000,
