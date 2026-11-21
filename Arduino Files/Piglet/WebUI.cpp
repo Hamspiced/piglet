@@ -1439,7 +1439,14 @@ static void handleStatus() {
   // string fields (each up to a full 32-byte SSID) added to "config".
   JsonDocument doc(psramJsonAllocator());
 
-  bool allowScan = scanningEnabled && sdOk && (userScanOverride || !autoPaused);
+  // Reuse the same allowScanForOled global the OLED's Status page icon
+  // draws from (see the matching comment in Display.cpp's drawPageStatus())
+  // instead of recomputing a separate local copy here. A prior local copy
+  // of this formula omitted statusPagePaused entirely, so double-pressing
+  // the button to pause scanning on the device left this endpoint (and the
+  // Web UI's "Scan: ACTIVE/PAUSED" pill) reporting ACTIVE forever, even
+  // though the OLED's own icon had already been fixed to show PAUSED.
+  bool allowScan = allowScanForOled;
   doc["scanningEnabled"] = scanningEnabled;
   doc["allowScan"] = allowScan;
   doc["userScanOverride"] = userScanOverride;
