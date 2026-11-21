@@ -969,6 +969,7 @@ void updateOLED(float speedValue) {
     case 3:  drawPagePaused();               break;
     case 4:  /* pig handled by pigAnimTick in loop() */ break;
     case 5:  drawPageMeshNode();             break;
+    case 6:  /* PigWorld handled by pigWorldTick() in loop() */ break;
     default: drawPageStatus(speedValue);     break;
   }
 }

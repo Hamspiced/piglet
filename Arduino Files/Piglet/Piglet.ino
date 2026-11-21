@@ -33,6 +33,7 @@
 #include "GPS.h"
 #include "SDUtils.h"
 #include "Display.h"
+#include "PigWorld.h"
 #include "WiFiManager.h"
 #include "Scanner.h"
 #include "WigleUpload.h"
@@ -110,9 +111,13 @@ static void onPageChange(uint8_t oldPage, uint8_t newPage) {
     pig.phase = 0;
   }
 
-  // Mesh node page lifecycle — always enter as Node; long-press activates Core
+  // Mesh node page lifecycle — always enter as Node; long-press activates Core.
+  // Page 6 (PigWorld) is a passive companion page right after Mesh -- pages 5
+  // and 6 together form one "mesh zone" so the session only tears down when
+  // actually leaving both of them, not when hopping from 5 to 6 to view it.
   if (newPage == 5) enterNodeMode();
-  if (oldPage == 5) {
+  bool leavingMeshZone = (oldPage == 5 || oldPage == 6) && (newPage != 5 && newPage != 6);
+  if (leavingMeshZone) {
     if (meshCoreActive) exitCoreMode();
     else                exitNodeMode();
   }
@@ -208,6 +213,9 @@ static void pollButton() {
       sasquatchStart();
     } else if (clickCount == 2 && currentPage == 4) {
       pigTwerkStart();
+    } else if (clickCount == 2 && currentPage == 6) {
+      // Double press on the PigWorld companion page -> fireworks + happy hop
+      pigWorldCelebrate();
     } else if (clickCount >= 2 && currentPage == 0) {
       // Double press on status page -> toggle scan pause
       statusPagePaused = !statusPagePaused;
@@ -1017,6 +1025,9 @@ void loop() {
   if (currentPage == 4) {
     // Pig page: animation runs at its own framerate (~90ms)
     pigAnimTick();
+  } else if (currentPage == 6) {
+    // PigWorld companion page: self-paced to 20 fps; pushes its own frame
+    if (pigWorldTick()) display.display();
   } else if (millis() - lastOled > 500) {
     lastOled = millis();
     updateOLED(speedDisplay);  // also dispatches page 5 (mesh node)
@@ -1035,8 +1046,12 @@ void loop() {
   fwDownloadTick();
 
   // Scanning – page-aware logic
-  // Mesh node page handles its own scan via nodeModeTick(); skip normal path.
-  if (currentPage == 5) {
+  // Mesh node page (and its PigWorld companion page, 6) handles its own
+  // scan via nodeModeTick()/coreModeTick(); skip normal path. The mesh
+  // session must keep ticking while page 6 is on screen too, or it would
+  // stop processing ESP-Now traffic/heartbeats/timeouts despite still
+  // being "active" per onPageChange()'s mesh-zone handling above.
+  if (currentPage == 5 || currentPage == 6) {
     if (meshCoreActive) coreModeTick();
     else                nodeModeTick();
   } else {
